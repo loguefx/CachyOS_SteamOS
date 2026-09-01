@@ -7,7 +7,7 @@
 # back out of, not a different way to boot the machine.
 #
 #   cachy-console              start console mode
-#   cachy-console settings     pick the display gamescope should always use
+#   cachy-console settings     pick the display and audio console mode uses
 #   cachy-console setup        same, from a terminal
 #   cachy-console exit         leave console mode, back to the desktop
 #   cachy-console status       check the setup and show what would run
@@ -41,6 +41,7 @@ CFG_REFRESH=auto
 CFG_HDR=off
 CFG_VRR=on
 CFG_TRACKPAD_FIX=on
+CFG_AUDIO_DEVICE=""
 CFG_EXTRA_GAMESCOPE_ARGS=""
 
 DRY_RUN=0
@@ -93,7 +94,7 @@ load_config() {
         value="${value%\"}"; value="${value#\"}"
         value="${value%\'}"; value="${value#\'}"
         case "$key" in
-            DISPLAY|DISPLAY_MODEL|RESOLUTION|REFRESH|HDR|VRR|TRACKPAD_FIX|EXTRA_GAMESCOPE_ARGS)
+            DISPLAY|DISPLAY_MODEL|RESOLUTION|REFRESH|HDR|VRR|TRACKPAD_FIX|EXTRA_GAMESCOPE_ARGS|AUDIO_DEVICE)
                 printf -v "CFG_$key" '%s' "$value" ;;
             STEAM_BUTTON|AUDIO_FOCUS) ;;   # read by the services, not by us
             "") ;;
@@ -344,6 +345,11 @@ STEAM_BUTTON=on
 # With two or more games running, mute every game except the one you are
 # looking at. Read by cachy-console-audio.service.
 AUDIO_FOCUS=on
+
+# Audio output inside console mode. An HDMI monitor name (Optoma UHD) or
+# a device name (RODECaster Duo). Empty follows the saved display.
+# Change it with: cachy-console settings
+AUDIO_DEVICE=$CFG_AUDIO_DEVICE
 
 # Extra arguments passed straight to gamescope, for anything not covered above.
 # For example: EXTRA_GAMESCOPE_ARGS=--mangoapp

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HDMI audio must follow the saved gamescope display, not the primary monitor.
+"""HDMI audio must follow the saved output, not the primary monitor.
 
 AMD (and most GPU) HDMI audio exposes one stereo profile at a time. Steam's
 output list is that profile plus USB devices, so the projector never appears
@@ -214,6 +214,66 @@ check("a USB headset does not match the GPU card",
       cd._sink_matches({"name": "alsa_output.usb-RODE_RODECaster_Duo.analog-stereo",
                         "properties": {"node.nick": "RODECaster Duo"}}, target),
       False)
+
+
+print()
+print("saved AUDIO_DEVICE:")
+
+cd.hdmi_ports = lambda: [dict(p) for p in HDMI_PORTS]
+cd._sinks = lambda: [{
+    "name": "alsa_output.usb-RODE_RODECaster_Duo.analog-stereo",
+    "properties": {"node.nick": "RODECaster Duo",
+                   "node.description": "RODECaster Duo"},
+}]
+cd.read_config = lambda: {
+    "AUDIO_DEVICE": "Optoma UHD", "DISPLAY": "HDMI-1",
+    "DISPLAY_MODEL": "Optoma Corporation",
+}
+hit = cd.match_audio()
+check("saved Optoma UHD is used",
+      (hit.get("port"), hit.get("kind")) if hit else None,
+      ("hdmi-output-3", "hdmi"))
+
+cd.read_config = lambda: {
+    "AUDIO_DEVICE": "Odyssey G93SC", "DISPLAY": "HDMI-1",
+    "DISPLAY_MODEL": "Optoma Corporation",
+}
+hit = cd.match_audio()
+check("saved Samsung is used even though the display is the Optoma",
+      (hit.get("port"), hit.get("eld")) if hit else None,
+      ("hdmi-output-0", "Odyssey G93SC"))
+
+cd.read_config = lambda: {"AUDIO_DEVICE": "RODECaster Duo"}
+hit = cd.match_audio()
+check("a USB device is a sink, not an HDMI profile",
+      (hit.get("kind"), hit.get("sink")) if hit else None,
+      ("sink", "alsa_output.usb-RODE_RODECaster_Duo.analog-stereo"))
+
+cd.match_hdmi = lambda connector=None, model=None: dict(HDMI_PORTS[3])
+cd.read_config = lambda: {}
+hit = cd.match_audio()
+check("empty AUDIO_DEVICE follows the display",
+      hit.get("eld") if hit else None, "Optoma UHD")
+
+choices = cd.audio_choices()
+check("choices include the three available HDMI monitors",
+      [c["id"] for c in choices if c["kind"] == "hdmi"],
+      ["Odyssey G93SC", "ZOWIE XL LCD", "Optoma UHD"])
+check("choices include the USB device and not a duplicate GPU HDMI sink",
+      [c["id"] for c in choices if c["kind"] == "sink"],
+      ["RODECaster Duo"])
+
+cd.read_config = lambda: {"AUDIO_DEVICE": "RODECaster Duo"}
+commands.clear()
+cd._default_sink = lambda: "alsa_output.pci-0000_0c_00.1.hdmi-stereo"
+check("USB route does not switch the HDMI card profile",
+      cd.cmd_audio_route(types.SimpleNamespace(dry_run=False)), 0)
+check("USB route only sets the default sink",
+      [c for c in commands if c[:1] == ["set-card-profile"]], [])
+check("USB route points at the headset",
+      any(c[:2] == ["set-default-sink",
+                    "alsa_output.usb-RODE_RODECaster_Duo.analog-stereo"]
+          for c in commands), True)
 
 
 print()

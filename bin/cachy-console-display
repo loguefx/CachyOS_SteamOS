@@ -30,8 +30,9 @@ Subcommands:
   saved                 print the saved connector, even if it is currently off
   set CONNECTOR         save CONNECTOR as the only display console mode will use
   probe [--driver X]    raw SDL output, for when something looks wrong
-  audio-list            HDMI/DP audio ports and which one matches the saved display
-  audio-route           switch the GPU HDMI profile to that display (Steam's list)
+  audio-list            audio outputs and which one is saved for console mode
+  audio-set NAME        save the audio output console mode will use
+  audio-route           switch to the saved audio output (Steam's list)
   audio-restore         put the previous HDMI profile back after console mode
 """
 
@@ -500,6 +501,111 @@ def match_hdmi(connector=None, model=None):
     return best
 
 
+def saved_audio_device():
+    """The audio output the user saved, or None to follow the display."""
+    raw = (read_config().get("AUDIO_DEVICE") or "").strip()
+    return raw or None
+
+
+def _name_matches(wanted, *names):
+    w = (wanted or "").strip().lower()
+    if not w:
+        return False
+    for name in names:
+        n = (name or "").strip().lower()
+        if n and n == w:
+            return True
+    tokens = _tokens(wanted)
+    if not tokens:
+        return False
+    return any(tokens & _tokens(name) for name in names if name)
+
+
+def _sink_labels(sink):
+    props = sink.get("properties") or {}
+    return [x for x in (
+        sink.get("name"),
+        props.get("node.nick"),
+        props.get("node.description"),
+        props.get("device.description"),
+        props.get("device.product.name"),
+    ) if x]
+
+
+def audio_choices():
+    """HDMI monitors (by ELD) plus USB/analog sinks the user can save."""
+    choices = []
+    hdmi_cards = set()
+    for port in hdmi_ports():
+        card = port.get("card") or ""
+        if card:
+            hdmi_cards.add(card.replace("alsa_card.", "alsa_output.", 1))
+        if not port.get("available") or not port.get("profile"):
+            continue
+        label = (port.get("eld") or "").strip() or port["port"]
+        choices.append({
+            "id": label,
+            "label": label,
+            "kind": "hdmi",
+            "detail": "HDMI",
+            "port": port,
+        })
+    seen = {c["id"].lower() for c in choices}
+    for sink in _sinks():
+        name = sink.get("name") or ""
+        if any(name.startswith(prefix) for prefix in hdmi_cards):
+            continue
+        props = sink.get("properties") or {}
+        label = (props.get("node.nick") or props.get("node.description") or name)
+        if not label or label.lower() in seen:
+            continue
+        seen.add(label.lower())
+        choices.append({
+            "id": label,
+            "label": label,
+            "kind": "sink",
+            "detail": "device",
+            "sink": name,
+        })
+    return choices
+
+
+def match_saved_audio(wanted):
+    """Resolve a saved AUDIO_DEVICE name to an HDMI port or a Pulse sink."""
+    wanted = (wanted or "").strip()
+    if not wanted:
+        return None
+    for port in hdmi_ports():
+        if not port.get("available") or not port.get("profile"):
+            continue
+        if _name_matches(wanted, port.get("eld"), port.get("port")):
+            return dict(port, kind="hdmi")
+    for sink in _sinks():
+        if _name_matches(wanted, *_sink_labels(sink)):
+            props = sink.get("properties") or {}
+            return {
+                "kind": "sink",
+                "sink": sink.get("name"),
+                "eld": props.get("node.nick") or props.get("node.description") or wanted,
+            }
+    return None
+
+
+def match_audio():
+    """The audio output console mode should use.
+
+    A saved AUDIO_DEVICE wins and is not replaced by the display. If nothing
+    is saved, the HDMI port whose ELD matches the saved display is used.
+    """
+    wanted = saved_audio_device()
+    if wanted:
+        return match_saved_audio(wanted)
+    hit = match_hdmi()
+    if hit:
+        return dict(hit, kind="hdmi")
+    return None
+
+
 def _default_sink():
     out = _pactl("get-default-sink")
     return (out or "").strip() or None
@@ -614,6 +720,42 @@ def _label_sink(name, eld):
              "{ node.description = \"%s\" }" % safe])
 
 
+def _sink_inputs():
+    return _pactl_json("sink-inputs")
+
+
+def _move_sink_inputs(name):
+    """Existing streams stay on the old sink after a default change; move them."""
+    if not name:
+        return
+    for inp in _sink_inputs():
+        idx = inp.get("index")
+        if idx is None:
+            continue
+        _pactl("move-sink-input", str(idx), name)
+
+
+def _set_configured_sink(name):
+    if not name:
+        return
+    payload = '{"name":"%s"}' % name.replace("\\", "").replace('"', "")
+    _pw_run(["pw-metadata", "-n", "settings", "0",
+             "default.configured.audio.sink", payload])
+
+
+def _apply_named_sink(name, eld, rename=False):
+    if not name:
+        return None
+    _pactl("set-default-sink", name)
+    _move_sink_inputs(name)
+    _set_configured_sink(name)
+    if rename and eld:
+        _label_sink(name, eld)
+    print(f"SINK {name}")
+    print(f"audio -> {eld or name} ({name})")
+    return name
+
+
 def _apply_console_sink(target):
     """Make the saved display the default HDMI device and name it for Steam."""
     for _ in range(10):
@@ -623,6 +765,8 @@ def _apply_console_sink(target):
             name = sink.get("name") or ""
             eld = target.get("eld") or "Console display"
             _pactl("set-default-sink", name)
+            _move_sink_inputs(name)
+            _set_configured_sink(name)
             _label_sink(name, eld)
             print(f"SINK {name}")
             print(f"HDMI audio -> {eld} ({name})")
@@ -632,28 +776,89 @@ def _apply_console_sink(target):
 
 
 def cmd_audio_list(args):
+    cfg = read_config()
     saved = saved_connector() or ""
-    model = (read_config().get("DISPLAY_MODEL") or "").strip()
-    target = match_hdmi(saved, model)
+    model = (cfg.get("DISPLAY_MODEL") or "").strip()
+    saved_dev = saved_audio_device() or ""
+    target = match_audio()
     print(f"  saved display: {saved or '(none)'} {('('+model+')') if model else ''}")
+    print(f"  saved audio:   {saved_dev or '(follows display)'}")
+    print("  audio outputs:")
+    for choice in audio_choices():
+        mark = " "
+        if target and choice["kind"] == "hdmi":
+            port = choice.get("port") or {}
+            if (target.get("kind") != "sink"
+                    and port.get("port") == target.get("port")
+                    and port.get("card") == target.get("card")):
+                mark = "*"
+        elif target and choice["kind"] == "sink" and target.get("kind") == "sink":
+            if choice.get("sink") == target.get("sink"):
+                mark = "*"
+        extra = choice.get("detail") or ""
+        print(f"  {mark} {choice['label']:22} {extra}")
     print("  HDMI audio ports:")
     for port in hdmi_ports():
-        mark = "*" if target and port["port"] == target["port"] and port["card"] == target["card"] else " "
+        mark = "*" if (target and target.get("kind") != "sink"
+                       and port["port"] == target.get("port")
+                       and port["card"] == target.get("card")) else " "
         avail = "on" if port["available"] else "off"
         print(f"  {mark} {port['eld'] or '(no ELD)':22} {avail:3}  "
               f"{port['profile'] or '-':28} {port['port']}")
-    if saved and not target:
-        print("  no HDMI audio matched that display "
-              "(it may not expose audio, or the port is off).")
+    if not target:
+        if saved_dev:
+            print(f"  saved audio {saved_dev} is not available right now.")
+        elif saved:
+            print("  no HDMI audio matched that display "
+                  "(it may not expose audio, or the port is off).")
     return 0
 
 
-def cmd_audio_route(args):
-    """Point the GPU HDMI profile at the saved display so Steam can list it."""
-    target = match_hdmi()
-    if not target:
-        print("no HDMI audio for the saved display; leaving audio alone")
+def cmd_audio_set(args):
+    name = (args.device or "").strip()
+    if not name:
+        print("cachy-console-display: pick an audio output", file=sys.stderr)
+        return 2
+    update_config({"AUDIO_DEVICE": name})
+    print(f"saved audio: {name}")
+    return 0
+
+
+def _remember_restore_state(target):
+    previous_sink = _default_sink()
+    previous_profile = target.get("card_profile")
+    existing = _load_audio_state()
+    # A crashed session may already have switched the profile. Keep the
+    # original desktop device so the next restore still lands there.
+    if existing and existing.get("applied"):
+        if not target.get("card") or existing.get("card") == target.get("card"):
+            previous_profile = existing.get("previous_profile") or previous_profile
+            previous_sink = existing.get("previous_sink") or previous_sink
+    _save_audio_state({
+        "card": target.get("card"),
+        "previous_profile": previous_profile,
+        "previous_sink": previous_sink,
+        "applied": True,
+        "eld": target.get("eld"),
+        "profile": target.get("profile"),
+    })
+
+
+def _route_sink(args, target):
+    name = target.get("sink")
+    eld = target.get("eld") or name
+    if args.dry_run:
+        print(f"would set default sink to {name} ({eld})")
         return 0
+    _remember_restore_state(target)
+    if _apply_named_sink(name, eld, rename=False) is None:
+        print(f"could not switch audio to {eld}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _route_hdmi(args, target):
+    """Point the GPU HDMI profile at the saved output so Steam can list it."""
     if args.dry_run:
         if target["card_profile"] == target["profile"]:
             print(f"would keep {target['card']} on {target['profile']} "
@@ -668,23 +873,7 @@ def cmd_audio_route(args):
         _apply_console_sink(target)
         return 0
 
-    previous_sink = _default_sink()
-    previous_profile = target["card_profile"]
-    existing = _load_audio_state()
-    # A crashed session may already have switched the profile. Keep the
-    # original desktop device so the next restore still lands there.
-    if existing and existing.get("applied") and existing.get("card") == target["card"]:
-        previous_profile = existing.get("previous_profile") or previous_profile
-        previous_sink = existing.get("previous_sink") or previous_sink
-    state = {
-        "card": target["card"],
-        "previous_profile": previous_profile,
-        "previous_sink": previous_sink,
-        "applied": True,
-        "eld": target["eld"],
-        "profile": target["profile"],
-    }
-    _save_audio_state(state)
+    _remember_restore_state(target)
     # Name the node before it appears, so Steam never sees the GPU card name.
     _write_wp_rule(
         target["card"].replace("alsa_card.", "alsa_output.", 1)
@@ -696,6 +885,17 @@ def cmd_audio_route(args):
     if _apply_console_sink(target) is None:
         print(f"switched profile to {target['profile']}; default sink not found yet")
     return 0
+
+
+def cmd_audio_route(args):
+    """Point console-mode audio at the saved device, or the saved display."""
+    target = match_audio()
+    if not target:
+        print("no audio device matched; leaving audio alone")
+        return 0
+    if target.get("kind") == "sink" or not target.get("profile"):
+        return _route_sink(args, target)
+    return _route_hdmi(args, target)
 
 
 def cmd_audio_restore(args):
@@ -752,11 +952,16 @@ def main():
     p.add_argument("--driver")
     p.set_defaults(func=cmd_probe)
 
-    sub.add_parser("audio-list", help="HDMI audio ports and which one matches the saved display") \
+    sub.add_parser("audio-list", help="audio outputs and which one is saved") \
         .set_defaults(func=cmd_audio_list)
 
+    p = sub.add_parser("audio-set",
+                       help="save the audio output console mode will use")
+    p.add_argument("device")
+    p.set_defaults(func=cmd_audio_set)
+
     p = sub.add_parser("audio-route",
-                       help="switch HDMI audio to the saved display")
+                       help="switch audio to the saved output")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_audio_route)
 

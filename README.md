@@ -144,6 +144,7 @@ edit by hand:
 | `TRACKPAD_FIX` | `on` | Preload libextest so the trackpad stops asking permission |
 | `STEAM_BUTTON` | `on` | Let the Steam button open console mode |
 | `AUDIO_FOCUS` | `on` | Mute games you are not looking at |
+| `AUDIO_DEVICE` | *(follows display)* | HDMI monitor name (`Optoma UHD`) or device (`RODECaster Duo`). Kept until you change it in **Cachy Console** settings |
 | `EXTRA_GAMESCOPE_ARGS` | empty | Passed straight through, e.g. `--mangoapp` |
 
 ## How it works
@@ -173,10 +174,12 @@ gamescope, then restores the desktop client when the session ends.
 
 **HDMI audio.** GPU HDMI/DP audio exposes one stereo device at a time, and
 PipeWire names it after the graphics card (`Navi 31 HDMI/DP Audio`) even when
-that port is the TV. Console mode switches the profile to the saved display,
-renames that sink to the monitor's ELD (e.g. Optoma UHD), and points Steam at
-it with `PULSE_SINK`. Headset and other USB devices stay in the list. The
-desktop HDMI device comes back when you leave.
+that port is the TV. Settings save an `AUDIO_DEVICE` (the projector, a headset,
+or another HDMI monitor). Console mode switches the GPU profile to that output,
+moves already-playing streams onto it, renames the sink to the monitor's ELD
+(e.g. Optoma UHD), and points Steam at it with `PULSE_SINK`. The choice is
+kept until you pick a different one. Headset and other USB devices stay in the
+list. The desktop HDMI device comes back when you leave.
 
 **Per-game audio.** gamescope publishes which app it has focused; PipeWire can
 mute one stream. A stream is treated as a game's only when its process, or one
@@ -196,6 +199,11 @@ it returns on every restart. libextest implements those calls against
 **It opened on the wrong screen.** Search for **Cachy Console**, save the
 display you want, then if gamescope is already running exit and Steam-button
 twice so the next session uses it.
+
+**Audio is on the wrong monitor.** Search for **Cachy Console** and pick the
+audio output (the projector, a headset, or another HDMI screen). That choice
+is kept until you change it. If console mode is already running, Save switches
+audio immediately; a new session also uses it.
 
 **The refresh rate looks wrong.** `cachy-console-display probe` shows both SDL
 views separately. If they disagree, set `REFRESH` explicitly.

@@ -2,13 +2,13 @@
 Type=Application
 Name=Cachy Console
 GenericName=Steam console display
-Comment=Choose which display Steam console mode uses. Search for Cachy Console anytime to change it.
+Comment=Choose which display and audio Steam console mode uses. Search for Cachy Console anytime to change it.
 Exec=cachy-console settings
 TryExec=cachy-console-settings
 Icon=preferences-desktop-display
 Terminal=false
 Categories=Settings;Game;Utility;
-Keywords=cachy;cachyconsole;console;steam;bigpicture;gamescope;display;monitor;hdmi;projector;tv;
+Keywords=cachy;cachyconsole;console;steam;bigpicture;gamescope;display;monitor;hdmi;projector;tv;audio;speaker;
 StartupNotify=true
 StartupWMClass=io.cachyos.CachyConsole
 DBusActivatable=false
