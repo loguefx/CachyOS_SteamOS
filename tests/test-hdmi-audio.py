@@ -129,14 +129,16 @@ print("routing and restoring:")
 
 tmpdir = tempfile.mkdtemp()
 cd.AUDIO_STATE = os.path.join(tmpdir, "cachy-console-audio-route.json")
+cd.WP_RULE = os.path.join(tmpdir, "51-cachy-console-display.conf")
 cd.hdmi_ports = lambda: [dict(p) for p in HDMI_PORTS]
 cd.match_hdmi = lambda connector=None, model=None: dict(HDMI_PORTS[3])
 cd._default_sink = lambda: "alsa_output.pci-0000_0c_00.1.hdmi-stereo"
 commands = []
 cd._pactl = lambda *args: commands.append(list(args)) or ""
+cd._pw_run = lambda args, timeout=8: commands.append(list(args)) or ""
 cd._sinks = lambda: [{
     "name": "alsa_output.pci-0000_0c_00.1.hdmi-stereo-extra3",
-    "properties": {"node.nick": "Optoma UHD"},
+    "properties": {"node.nick": "Optoma UHD", "object.id": 40},
 }]
 cd.time.sleep = lambda _s: None
 
@@ -147,10 +149,14 @@ check("dry-run route does not call pactl",
 args = types.SimpleNamespace(dry_run=False)
 check("live route switches to extra3 and sets that sink as default",
       cd.cmd_audio_route(args), 0)
-check("pactl order is profile then default sink",
-      commands,
+check("pactl switches the profile, then the default sink",
+      commands[:2],
       [["set-card-profile", HDMI_CARD, "output:hdmi-stereo-extra3"],
        ["set-default-sink", "alsa_output.pci-0000_0c_00.1.hdmi-stereo-extra3"]])
+check("the sink is renamed so Steam shows Optoma, not the GPU card",
+      any(c[:1] == ["pw-metadata"] or (c and c[0] == "pw-cli") for c in commands), True)
+check("a wireplumber rule is written for this HDMI node",
+      os.path.exists(cd.WP_RULE), True)
 
 with open(cd.AUDIO_STATE) as fh:
     state = json.load(fh)
@@ -166,9 +172,16 @@ cd.hdmi_ports = lambda: [dict(p) for p in HDMI_PORTS_SWITCHED]
 cd.match_hdmi = lambda connector=None, model=None: {
     **HDMI_PORTS[3], "card_profile": "output:hdmi-stereo-extra3"}
 commands.clear()
-check("already on the projector is a no-op",
+check("already on the projector still points the default at it",
       cd.cmd_audio_route(args), 0)
-check("already-on does not rewrite pactl", commands, [])
+check("already-on does not switch the card profile again",
+      any(c[:1] == ["set-card-profile"] for c in commands), False)
+check("already-on does set the default sink and rename it",
+      (any(c[:2] == ["set-default-sink",
+                     "alsa_output.pci-0000_0c_00.1.hdmi-stereo-extra3"]
+           for c in commands),
+       any(c[:1] == ["pw-metadata"] for c in commands)),
+      (True, True))
 with open(cd.AUDIO_STATE) as fh:
     state = json.load(fh)
 check("crash-retry still restores to Odyssey, not extra3",
@@ -183,6 +196,8 @@ check("restore pactl order is profile then original sink",
        ["set-default-sink", "alsa_output.pci-0000_0c_00.1.hdmi-stereo"]])
 check("state file is removed after restore",
       os.path.exists(cd.AUDIO_STATE), False)
+check("the wireplumber rename rule is removed after restore",
+      os.path.exists(cd.WP_RULE), False)
 
 check("a second restore with no state is a no-op",
       (cd.cmd_audio_restore(types.SimpleNamespace(dry_run=False)), commands[2:]),

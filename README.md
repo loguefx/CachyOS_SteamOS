@@ -171,10 +171,12 @@ an open Big Picture cannot be moved into it. `cachy-console-watch` therefore
 watches for the Big Picture window appearing and relaunches Steam inside
 gamescope, then restores the desktop client when the session ends.
 
-**HDMI audio.** GPU HDMI/DP audio exposes one stereo device at a time, so Steam
-would otherwise list your primary monitor instead of the TV. Console mode
-switches that profile to the saved display on the way in, and puts it back when
-you leave.
+**HDMI audio.** GPU HDMI/DP audio exposes one stereo device at a time, and
+PipeWire names it after the graphics card (`Navi 31 HDMI/DP Audio`) even when
+that port is the TV. Console mode switches the profile to the saved display,
+renames that sink to the monitor's ELD (e.g. Optoma UHD), and points Steam at
+it with `PULSE_SINK`. Headset and other USB devices stay in the list. The
+desktop HDMI device comes back when you leave.
 
 **Per-game audio.** gamescope publishes which app it has focused; PipeWire can
 mute one stream. A stream is treated as a game's only when its process, or one

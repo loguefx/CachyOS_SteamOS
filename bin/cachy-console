@@ -257,17 +257,38 @@ It will not choose a screen for you."
     # profile plus USB devices, so without this the projector never appears.
     restore_hdmi_audio() { "$HELPER_DISPLAY" audio-restore || true; }
     trap restore_hdmi_audio EXIT
-    "$HELPER_DISPLAY" audio-route || warn "could not switch HDMI audio to $CONNECTOR"
+    local route_log sink
+    route_log="$("$HELPER_DISPLAY" audio-route 2>&1)" || warn "could not switch HDMI audio to $CONNECTOR"
+    say "$route_log"
+    sink="$(printf '%s\n' "$route_log" | awk '/^SINK /{print $2; exit}')"
+    # Steam and games inherit this, so they play on the TV even if the
+    # session default is still a headset.
+    [[ -n "$sink" ]] && export PULSE_SINK="$sink"
 
     export SDL_VIDEODRIVER=x11
     # Not exec: the EXIT trap has to run so the desktop HDMI device comes back.
-    # gamescope often forks to gamescope-wl and the parent exits; wait until
-    # that compositor is actually gone or HDMI audio would switch back early
-    # and `cachy-console exit` would look like a no-op.
-    "${argv[@]}" || true
-    local helper_exit
+    # gamescope often forks to gamescope-wl and the parent exits immediately.
+    # Wait until that compositor is *up*, then until it is gone — otherwise we
+    # restore Odyssey HDMI before Steam starts, and the list shows the monitor.
+    local helper_exit gs_pid i
     helper_exit="$(find_helper "$NAME-exit")"
-    while "$helper_exit" --running >/dev/null 2>&1; do
+    "${argv[@]}" &
+    gs_pid=$!
+    for i in $(seq 1 250); do
+        if "$helper_exit" --running; then
+            "$HELPER_DISPLAY" audio-route >/dev/null || true
+            break
+        fi
+        if ! kill -0 "$gs_pid" 2>/dev/null; then
+            sleep 0.6
+            "$helper_exit" --running && break
+            warn "gamescope exited before console mode came up"
+            break
+        fi
+        sleep 0.1
+    done
+    wait "$gs_pid" || true
+    while "$helper_exit" --running; do
         sleep 0.4
     done
 }

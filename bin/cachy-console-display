@@ -544,6 +544,93 @@ def _sink_matches(sink, target):
     return bool(eld and eld in nick.lower())
 
 
+def _pw_run(args, timeout=8):
+    return run(args, timeout=timeout)
+
+
+WP_RULE = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "wireplumber", "wireplumber.conf.d", "51-cachy-console-display.conf")
+
+
+def _write_wp_rule(sink_name, eld):
+    """So the next time this HDMI node is created it is already named
+    after the TV, not 'Navi 31 HDMI/DP Audio'."""
+    if not sink_name or not eld:
+        return
+    safe_eld = eld.replace("\\", "").replace('"', "")
+    safe_name = sink_name.replace("\\", "").replace('"', "")
+    body = (
+        "monitor.alsa.rules = [\n"
+        "  {\n"
+        "    matches = [\n"
+        "      { node.name = \"%s\" }\n"
+        "    ]\n"
+        "    actions = {\n"
+        "      update-props = {\n"
+        "        node.description = \"%s\"\n"
+        "        node.nick = \"%s\"\n"
+        "        device.description = \"%s\"\n"
+        "      }\n"
+        "    }\n"
+        "  }\n"
+        "]\n" % (safe_name, safe_eld, safe_eld, safe_eld)
+    )
+    try:
+        os.makedirs(os.path.dirname(WP_RULE), exist_ok=True)
+        with open(WP_RULE, "w") as fh:
+            fh.write(body)
+    except OSError:
+        pass
+
+
+def _drop_wp_rule():
+    try:
+        os.remove(WP_RULE)
+    except OSError:
+        pass
+
+
+def _label_sink(name, eld):
+    """Steam shows node.description, which PipeWire sets to the GPU card
+    ('Navi 31 HDMI/DP Audio') even when this port is the TV. Rename it."""
+    if not name or not eld:
+        return
+    _write_wp_rule(name, eld)
+    nid = None
+    for sink in _sinks():
+        if sink.get("name") == name:
+            props = sink.get("properties") or {}
+            nid = props.get("object.id")
+            break
+    if nid is None:
+        return
+    safe = eld.replace("\\", "").replace('"', "")
+    # PipeWire's pactl has no update-sink-proplist. Metadata + set-param
+    # are what actually change the name Steam reads.
+    _pw_run(["pw-metadata", str(nid), "node.description", safe])
+    _pw_run(["pw-metadata", str(nid), "device.description", safe])
+    _pw_run(["pw-cli", "set-param", str(nid), "Props",
+             "{ node.description = \"%s\" }" % safe])
+
+
+def _apply_console_sink(target):
+    """Make the saved display the default HDMI device and name it for Steam."""
+    for _ in range(10):
+        for sink in _sinks():
+            if not _sink_matches(sink, target):
+                continue
+            name = sink.get("name") or ""
+            eld = target.get("eld") or "Console display"
+            _pactl("set-default-sink", name)
+            _label_sink(name, eld)
+            print(f"SINK {name}")
+            print(f"HDMI audio -> {eld} ({name})")
+            return name
+        time.sleep(0.1)
+    return None
+
+
 def cmd_audio_list(args):
     saved = saved_connector() or ""
     model = (read_config().get("DISPLAY_MODEL") or "").strip()
@@ -567,8 +654,18 @@ def cmd_audio_route(args):
     if not target:
         print("no HDMI audio for the saved display; leaving audio alone")
         return 0
+    if args.dry_run:
+        if target["card_profile"] == target["profile"]:
+            print(f"would keep {target['card']} on {target['profile']} "
+                  f"({target['eld']})")
+        else:
+            print(f"would set {target['card']} to {target['profile']} "
+                  f"({target['eld']})")
+        return 0
+
     if target["card_profile"] == target["profile"]:
         print(f"HDMI audio already on {target['eld']} ({target['profile']})")
+        _apply_console_sink(target)
         return 0
 
     previous_sink = _default_sink()
@@ -587,27 +684,17 @@ def cmd_audio_route(args):
         "eld": target["eld"],
         "profile": target["profile"],
     }
-    if args.dry_run:
-        print(f"would set {target['card']} to {target['profile']} "
-              f"({target['eld']})")
-        return 0
     _save_audio_state(state)
+    # Name the node before it appears, so Steam never sees the GPU card name.
+    _write_wp_rule(
+        target["card"].replace("alsa_card.", "alsa_output.", 1)
+        + "." + target["profile"].replace("output:", ""),
+        target.get("eld") or "")
     if _pactl("set-card-profile", target["card"], target["profile"]) is None:
         print(f"could not switch HDMI audio to {target['eld']}", file=sys.stderr)
         return 1
-    # The sink name changes with the profile; pick the one that just appeared
-    # on this card rather than leaving the default pointing at a dead node.
-    for _ in range(10):
-        for sink in _sinks():
-            if not _sink_matches(sink, target):
-                continue
-            name = sink.get("name") or ""
-            _pactl("set-default-sink", name)
-            nick = (sink.get("properties") or {}).get("node.nick") or target["eld"]
-            print(f"HDMI audio -> {nick} ({name})")
-            return 0
-        time.sleep(0.1)
-    print(f"switched profile to {target['profile']}; default sink not found yet")
+    if _apply_console_sink(target) is None:
+        print(f"switched profile to {target['profile']}; default sink not found yet")
     return 0
 
 
@@ -629,6 +716,7 @@ def cmd_audio_restore(args):
     if sink:
         _pactl("set-default-sink", sink)
     _drop_audio_state()
+    _drop_wp_rule()
     print(f"restored HDMI audio to {profile}")
     return 0
 
