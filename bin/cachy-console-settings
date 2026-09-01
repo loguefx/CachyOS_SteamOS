@@ -34,7 +34,7 @@ def snapshot():
     seen = set()
     for display in found:
         connector = ccd.connector_of(display)
-        seen.add(connector.lower())
+        seen.add(ccd.normalize_connector(connector))
         rows.append({
             "connector": connector,
             "model": display.get("model") or display["name"],
@@ -43,7 +43,7 @@ def snapshot():
         })
     saved = ccd.saved_connector()
     model = (ccd.read_config().get("DISPLAY_MODEL") or "").strip()
-    if saved and saved.lower() not in seen:
+    if saved and ccd.normalize_connector(saved) not in seen:
         rows.append({
             "connector": saved,
             "model": model or saved,
@@ -152,7 +152,7 @@ def run_gtk():
                     group = radio
                 radio.connector = row["connector"]
                 radio.model = row["model"]
-                if saved and row["connector"].lower() == saved.lower():
+                if saved and ccd.connectors_match(row["connector"], saved):
                     radio.set_active(True)
                     self.choice = row["connector"]
                     self.choice_model = row["model"]
@@ -227,6 +227,10 @@ def run_tk():
         rows, saved = snapshot()
         if saved:
             var.set(saved)
+            for row in rows:
+                if ccd.connectors_match(row["connector"], saved):
+                    var.set(row["connector"])
+                    break
             extra = " Console mode is running on the previous display." if console_running() else ""
             status.set(f"Saved: {saved}.{extra}")
         else:

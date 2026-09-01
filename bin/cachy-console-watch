@@ -68,6 +68,40 @@ def log(msg):
     print(f"[cachy-console-watch] {msg}", flush=True)
 
 
+def ensure_session_env():
+    """Plasma often starts systemd --user without DISPLAY/WAYLAND_DISPLAY."""
+    if not os.environ.get("DISPLAY"):
+        try:
+            socks = sorted(
+                s for s in os.listdir("/tmp/.X11-unix")
+                if s.startswith("X") and s[1:].isdigit())
+        except OSError:
+            socks = []
+        if socks:
+            os.environ["DISPLAY"] = f":{socks[0][1:]}"
+    if not os.environ.get("XAUTHORITY"):
+        runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+        candidates = []
+        if runtime:
+            candidates.append(os.path.join(runtime, "Xauthority"))
+            try:
+                candidates.extend(
+                    os.path.join(runtime, n) for n in os.listdir(runtime)
+                    if n.startswith("xauth"))
+            except OSError:
+                pass
+        candidates.append(os.path.expanduser("~/.Xauthority"))
+        for path in candidates:
+            if os.path.isfile(path):
+                os.environ["XAUTHORITY"] = path
+                break
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+        sock = os.path.join(runtime, "wayland-0") if runtime else ""
+        if sock and os.path.exists(sock):
+            os.environ["WAYLAND_DISPLAY"] = "wayland-0"
+
+
 class Xprop:
     """Thin wrapper around xprop; returns None when X is unreachable."""
 
@@ -434,6 +468,7 @@ def main():
         display = "" if (not raw or raw.lower() == "auto" or raw.isdigit()) else raw
 
     bpm_re = re.compile(args.bpm_pattern, re.I)
+    ensure_session_env()
     xprop = Xprop()
 
     if xprop.active_window() is None and not xprop.client_list():

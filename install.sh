@@ -70,7 +70,7 @@ say "== installing =="
 mkdir -p "$BIN_DIR"
 for tool in cachy-console cachy-console-display cachy-console-watch \
             cachy-console-audio cachy-console-exit cachy-console-shortcut \
-            cachy-console-settings; do
+            cachy-console-settings cachy-console-session; do
     install -m755 "$SRC/bin/$tool" "$BIN_DIR/$tool"
     printf '  %s -> %s\n' "$tool" "$BIN_DIR"
 done
@@ -79,6 +79,14 @@ mkdir -p "$APP_DIR"
 install -m644 "$SRC/share/applications/cachy-console.desktop" "$APP_DIR/"
 install -m644 "$SRC/share/applications/cachy-console-settings.desktop" "$APP_DIR/"
 printf '  %s -> %s\n' "desktop entries" "$APP_DIR"
+
+# Plasma often does not copy DISPLAY/XAUTHORITY into systemd --user. This
+# autostart does it on both GNOME and KDE after the session is up.
+AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
+mkdir -p "$AUTOSTART_DIR"
+install -m644 "$SRC/share/autostart/cachy-console-session-env.desktop" \
+    "$AUTOSTART_DIR/cachy-console-session-env.desktop"
+printf '  %s -> %s\n' "session autostart" "$AUTOSTART_DIR"
 
 # A PATH without ~/.local/bin makes every command here look uninstalled, which
 # is a confusing first impression.

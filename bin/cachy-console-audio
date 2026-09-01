@@ -64,6 +64,40 @@ def log(msg):
     print(f"[cachy-console-audio] {msg}", flush=True)
 
 
+def ensure_session_env():
+    """Plasma often starts systemd --user without DISPLAY/WAYLAND_DISPLAY."""
+    if not os.environ.get("DISPLAY"):
+        try:
+            socks = sorted(
+                s for s in os.listdir(X11_SOCKET_DIR)
+                if s.startswith("X") and s[1:].isdigit())
+        except OSError:
+            socks = []
+        if socks:
+            os.environ["DISPLAY"] = f":{socks[0][1:]}"
+    if not os.environ.get("XAUTHORITY"):
+        runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+        candidates = []
+        if runtime:
+            candidates.append(os.path.join(runtime, "Xauthority"))
+            try:
+                candidates.extend(
+                    os.path.join(runtime, n) for n in os.listdir(runtime)
+                    if n.startswith("xauth"))
+            except OSError:
+                pass
+        candidates.append(os.path.expanduser("~/.Xauthority"))
+        for path in candidates:
+            if os.path.isfile(path):
+                os.environ["XAUTHORITY"] = path
+                break
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+        sock = os.path.join(runtime, "wayland-0") if runtime else ""
+        if sock and os.path.exists(sock):
+            os.environ["WAYLAND_DISPLAY"] = "wayland-0"
+
+
 def vlog(enabled, msg):
     if enabled:
         log(msg)
@@ -370,6 +404,7 @@ def main():
     ap.add_argument("--status", action="store_true",
                     help="show streams, their games and the focused app, then exit")
     args = ap.parse_args()
+    ensure_session_env()
 
     if args.status:
         return status()

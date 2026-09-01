@@ -392,10 +392,10 @@ status() {
         printf '  %-20s %s\n' "service environment" "ok"
     else
         printf '  %-20s %s\n' "service environment" "INCOMPLETE"
-        say "     systemd's user session is missing DISPLAY or XAUTHORITY, so the"
-        say "     Steam button and audio focus cannot see your windows. Fix with:"
-        say "       systemctl --user import-environment DISPLAY XAUTHORITY"
-        say "     and add that to your desktop's autostart to make it persist."
+        say "     systemd's user session is missing DISPLAY or XAUTHORITY."
+        say "     That is common on Plasma; the session wrapper and autostart"
+        say "     fill it in. If the Steam button still does nothing, run:"
+        say "       systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY"
         warnings=$(( warnings + 1 ))
     fi
 

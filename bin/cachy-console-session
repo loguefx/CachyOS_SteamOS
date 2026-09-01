@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Give the helpers a session they can see on both GNOME and Plasma.
+#
+# systemd --user is a different process from the desktop. GNOME usually copies
+# DISPLAY, WAYLAND_DISPLAY and XAUTHORITY into it at login; Plasma often does
+# not. Without those, the Steam-button watcher cannot see windows and SDL
+# cannot ask Wayland for the real refresh rate. This fills in whatever is
+# missing from the sockets the session already left in $XDG_RUNTIME_DIR, then
+# runs the real command.
+set -euo pipefail
+
+if [[ -z "${DISPLAY:-}" ]]; then
+    for sock in /tmp/.X11-unix/X[0-9]*; do
+        [[ -e "$sock" ]] || continue
+        export DISPLAY=":${sock##*X}"
+        break
+    done
+fi
+
+if [[ -z "${XAUTHORITY:-}" ]]; then
+    if [[ -n "${XDG_RUNTIME_DIR:-}" && -f "$XDG_RUNTIME_DIR/Xauthority" ]]; then
+        export XAUTHORITY="$XDG_RUNTIME_DIR/Xauthority"
+    elif [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+        for f in "$XDG_RUNTIME_DIR"/xauth*; do
+            [[ -f "$f" ]] || continue
+            export XAUTHORITY="$f"
+            break
+        done
+    fi
+    if [[ -z "${XAUTHORITY:-}" && -f "$HOME/.Xauthority" ]]; then
+        export XAUTHORITY="$HOME/.Xauthority"
+    fi
+fi
+
+if [[ -z "${WAYLAND_DISPLAY:-}" && -n "${XDG_RUNTIME_DIR:-}" ]]; then
+    if [[ -S "$XDG_RUNTIME_DIR/wayland-0" ]]; then
+        export WAYLAND_DISPLAY=wayland-0
+    else
+        for sock in "$XDG_RUNTIME_DIR"/wayland-*; do
+            [[ -S "$sock" ]] || continue
+            [[ "$sock" == *.lock ]] && continue
+            export WAYLAND_DISPLAY="${sock##*/}"
+            break
+        done
+    fi
+fi
+
+exec "$@"

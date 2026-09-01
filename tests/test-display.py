@@ -119,6 +119,23 @@ fake_sdl(X11, WAYLAND)
 check("by connector name", cd.connector_of(cd.pick("HDMI-1")), "HDMI-1")
 check("connector matching ignores case", cd.connector_of(cd.pick("hdmi-1")), "HDMI-1")
 
+check("Mutter HDMI-1 and KWin HDMI-A-1 are the same port",
+      cd.connectors_match("HDMI-1", "HDMI-A-1"), True)
+check("HDMI-1 is not HDMI-2", cd.connectors_match("HDMI-1", "HDMI-2"), False)
+check("DisplayPort-1 is DP-1", cd.normalize_connector("DisplayPort-1"), "DP-1")
+check("HDMI-A-1 normalizes to HDMI-1", cd.normalize_connector("HDMI-A-1"), "HDMI-1")
+
+# Plasma's SDL view of the same Optoma: connector lettered, still the saved TV.
+fake_sdl([display(0, 'DP-1 49"', 1920, 0, 5120, 1440, 60),
+          display(1, 'DP-2 24"', 0, 0, 1920, 1080, 240),
+          display(2, "HDMI-A-1", 7040, 0, 1920, 1080, 240)],
+         [display(0, "Samsung Electric Company 49\"", 1920, 0, 5120, 1440, 240),
+          display(1, "BenQ Corporation 24\"", 0, 0, 1920, 1080, 240),
+          display(2, "Optoma Corporation", 7040, 0, 1920, 1080, 240)])
+check("a saved HDMI-1 still resolves when Plasma calls it HDMI-A-1",
+      cd.connector_of(cd.pick("HDMI-1")), "HDMI-A-1")
+fake_sdl(X11, WAYLAND)
+
 try:
     cd.pick("auto")
     check("auto is refused rather than picking another screen", "returned", "DisplayError")

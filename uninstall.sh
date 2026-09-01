@@ -33,7 +33,7 @@ systemctl --user daemon-reload 2>/dev/null || true
 say "== commands =="
 for tool in cachy-console cachy-console-display cachy-console-watch \
             cachy-console-audio cachy-console-exit cachy-console-shortcut \
-            cachy-console-settings; do
+            cachy-console-settings cachy-console-session; do
     if [[ -e "$BIN_DIR/$tool" ]]; then
         rm -f "$BIN_DIR/$tool"
         say "  removed $tool"
@@ -41,6 +41,7 @@ for tool in cachy-console cachy-console-display cachy-console-watch \
 done
 
 rm -f "$APP_DIR/cachy-console.desktop" "$APP_DIR/cachy-console-settings.desktop"
+rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/cachy-console-session-env.desktop"
 
 if (( PURGE )); then
     rm -rf "$CONFIG_DIR"

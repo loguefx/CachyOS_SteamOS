@@ -34,49 +34,62 @@ Your other monitors keep running the desktop the whole time.
 ## Requirements
 
 - CachyOS, or any Arch-based system
-- A Wayland session
+- GNOME or KDE Plasma on Wayland
 - Steam, and gamescope
 
 Nothing here talks to a specific compositor: displays come from SDL, windows
-from XWayland, audio from PipeWire. Developed and tested on **GNOME 50
-(Wayland)**. **KDE Plasma is expected to work but has not been verified** — if
-you try it, please open an issue either way. `cachy-console status` checks the
-things most likely to differ between desktops.
-
-One difference to expect: desktops name outputs differently, so KWin may call a
-display `HDMI-A-1` where Mutter calls it `HDMI-1`. Search the app menu for
-**Cachy Console** (or run `cachy-console settings`) and pick from that list.
-It saves **one connector name** (HDMI-1, DP-2, …). That saved display is the
+from XWayland, audio from PipeWire. It is written for **GNOME** and **KDE
+Plasma** on Wayland (CachyOS ships Plasma by default). The same saved TV works
+on both: Plasma may list it as `HDMI-A-1` and GNOME as `HDMI-1`, and those are
+treated as the same port. Search the app menu for **Cachy Console** (or run
+`cachy-console settings`) and pick from that list. That saved display is the
 only one console mode will ever use. If you turn it off, the Steam button
 leaves Big Picture on the desktop until that same display comes back — it will
 not pick another screen by itself.
+
+`cachy-console status` checks the things most likely to differ between
+desktops, including whether systemd can see your session.
 
 If you change the display while console mode is already open, the live session
 stays where it is. Exit with `cachy-console exit` (or the library shortcut),
 then press the Steam button twice to open gamescope on the new display.
 
-```bash
-sudo pacman -S --needed steam gamescope sdl2 libpulse xorg-xprop
-```
-
-Optional, but worth it:
-
-```bash
-paru -S libextest-git    # stops the controller trackpad asking for permission
-```
-
 ## Install
 
+One command. **pacman** installs the packages; the script only clones this repo
+and copies files into your home directory.
+
 ```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/loguefx/CachyOS_SteamOS/main/get.sh)
+```
+
+That will:
+
+1. `sudo pacman -S --needed git steam gamescope sdl2 libpulse xorg-xprop tk`
+2. Clone this repo to `~/CachyOS_SteamOS` (or update it if it is already there)
+3. Run `./install.sh`, which copies the commands into `~/.local/bin`, enables
+   two user services, and walks you through choosing a display
+
+Root is used for pacman, and once more if you let it grant gamescope realtime
+scheduling. If you already have `paru` or `yay`, it will offer **libextest**
+from the AUR (trackpad permission prompt). It will not install an AUR helper
+or add a third-party repo.
+
+Uninstall with `~/CachyOS_SteamOS/uninstall.sh`. To clone somewhere else:
+
+```bash
+CACHY_CONSOLE_SRC=~/src/CachyOS_SteamOS bash <(curl -fsSL https://raw.githubusercontent.com/loguefx/CachyOS_SteamOS/main/get.sh)
+```
+
+### Step by step
+
+```bash
+sudo pacman -S --needed steam gamescope sdl2 libpulse xorg-xprop tk
+# optional, AUR:  paru -S libextest-git
 git clone https://github.com/loguefx/CachyOS_SteamOS.git
 cd CachyOS_SteamOS
 ./install.sh
 ```
-
-The installer copies the commands into `~/.local/bin`, enables two user
-services, and walks you through choosing a display. It needs root exactly once,
-optionally, to let gamescope use realtime scheduling. Uninstall with
-`./uninstall.sh`.
 
 ## Using it
 
@@ -134,13 +147,20 @@ edit by hand:
 ## How it works
 
 **Picking the display.** gamescope's `--display-index` is an SDL index, so SDL
-is asked directly rather than any compositor — that keeps the project working on
-KDE, GNOME and everything else. SDL is asked twice, because neither backend
-tells the whole truth: its **x11** backend names displays by connector and
-numbers them the way gamescope expects, but under XWayland it can report 60Hz
-for a 240Hz screen, while its **wayland** backend reports the true mode but
-names displays by manufacturer. The two views are matched up by screen position,
-taking names and indices from one and the mode from the other.
+is asked directly rather than any compositor — that is why the same build works
+on GNOME and Plasma. SDL is asked twice, because neither backend tells the
+whole truth: its **x11** backend names displays by connector and numbers them
+the way gamescope expects, but under XWayland it can report 60Hz for a 240Hz
+screen, while its **wayland** backend reports the true mode but names displays
+by manufacturer. The two views are matched up by screen position, taking names
+and indices from one and the mode from the other. Connector names are
+normalized so Plasma's `HDMI-A-1` and GNOME's `HDMI-1` stay the same saved
+display.
+
+**Session environment.** The Steam-button watcher and per-game audio run as
+systemd user services. GNOME usually exports `DISPLAY` and `XAUTHORITY` into
+that manager; Plasma often does not. An autostart entry and a small wrapper
+fill those in from the sockets your session already created, on both desktops.
 
 **The Steam button.** Pressing it twice does not launch anything — it flips the
 *already running* Steam client into Big Picture, so there is no command to

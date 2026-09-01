@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Cachy Console session
+Comment=Import display variables into systemd so console mode works on GNOME and Plasma
+Exec=sh -c "systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP; systemctl --user try-restart cachy-console-watch.service cachy-console-audio.service"
+Terminal=false
+NoDisplay=true
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
+X-KDE-autostart-after=panel
+X-KDE-StartupNotify=false

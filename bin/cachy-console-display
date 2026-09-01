@@ -169,6 +169,30 @@ def connector_of(display):
     return display["name"].split(" ")[0] if display["name"] else f"display-{display['index']}"
 
 
+def normalize_connector(name):
+    """The same physical port under Mutter and KWin names.
+
+    Mutter/XRandR tends to say HDMI-1; KWin/DRM tends to say HDMI-A-1.
+    DisplayPort is DP-1 in both, or DisplayPort-1 from some SDL builds.
+    The letter after HDMI/DP/DVI is the connector *type*, not a second screen,
+    so HDMI-A-1 and HDMI-1 are the same port. HDMI-1 and HDMI-2 are not.
+    """
+    token = (name or "").strip().split(" ")[0]
+    if not token:
+        return ""
+    token = re.sub(r"displayport", "DP", token, flags=re.I)
+    match = re.match(r"^(HDMI|DP|DVI|VGA|eDP|USB-C|USBC)-(?:[A-Z]-)?(\d+)$",
+                     token, re.I)
+    if not match:
+        return token.lower()
+    return f"{match.group(1).upper()}-{match.group(2)}"
+
+
+def connectors_match(left, right):
+    a, b = normalize_connector(left), normalize_connector(right)
+    return bool(a and a == b)
+
+
 # ---- selection ----------------------------------------------------------
 
 def read_config():
@@ -261,7 +285,7 @@ def pick(wanted=None, allow_index=False):
             f"no display with index {wanted} (found {len(found)})")
 
     for display in found:
-        if connector_of(display).lower() == wanted.lower():
+        if connectors_match(connector_of(display), wanted):
             return display
 
     known = ", ".join(connector_of(d) for d in found) or "none"
@@ -282,7 +306,7 @@ def cmd_list(args):
     print(f"  {'#':<3} {'connector':<12} {'mode':<18} {'position':<12} display")
     for display in found:
         connector = connector_of(display)
-        mark = "*" if configured and connector.lower() == configured.lower() else " "
+        mark = "*" if configured and connectors_match(connector, configured) else " "
         mode = f"{display['w']}x{display['h']}@{display['refresh']}Hz"
         position = f"+{display['x']}+{display['y']}"
         print(f"{mark} {display['index']:<3} {connector:<12} {mode:<18} "
@@ -290,7 +314,7 @@ def cmd_list(args):
     if not configured and not args.no_hint:
         print("\n  no display saved yet. Pick one with: cachy-console settings")
     elif configured and not any(
-            connector_of(d).lower() == configured.lower() for d in found):
+            connectors_match(connector_of(d), configured) for d in found):
         print(f"\n  saved display {configured} is currently off. "
               "Console mode will wait for it rather than use another screen.")
     return 0
@@ -357,8 +381,8 @@ def cmd_set(args):
     model = ""
     try:
         for display in displays():
-            if connector_of(display).lower() == connector.lower():
-                connector = connector_of(display)   # canonical casing
+            if connectors_match(connector_of(display), connector):
+                connector = connector_of(display)   # live name gamescope will see
                 model = display.get("model") or display["name"]
                 break
     except DisplayError:
