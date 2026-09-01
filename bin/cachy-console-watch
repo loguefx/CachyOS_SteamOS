@@ -1,0 +1,618 @@
+#!/usr/bin/env python3
+"""Make the Steam button open console mode.
+
+Pressing the Steam button twice does not launch anything: it flips the *already
+running* Steam client into Big Picture, so there is no command to wrap. And
+gamescope cannot adopt a window belonging to another compositor, so an
+already-open Big Picture can never be moved into one.
+
+Relaunching Steam under gamescope is therefore the only way in. This watches for
+Big Picture appearing on the desktop and does exactly that, by running
+`cachy-console`. When the session ends it brings the ordinary desktop Steam
+client back, so the Steam button works again next time.
+
+Nothing about your display arrangement is ever changed; your other monitors keep
+running the desktop throughout.
+
+State machine:
+  IDLE     -> STARTING  Big Picture appeared; `cachy-console` runs
+  STARTING -> GAME      gamescope appeared
+  STARTING -> IDLE      it did not appear within --start-timeout
+  GAME     -> IDLE      gamescope exited; the desktop Steam client is restarted
+
+A game launched straight from the desktop never triggers anything, because Big
+Picture was never opened.
+
+Steam can be configured to start *itself* in Big Picture, which would otherwise
+ping-pong between desktop and console mode forever, so starts are rate limited.
+"""
+
+import argparse
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+# WM_CLASS of Steam's own windows (desktop client and Big Picture alike).
+STEAM_CLASSES = {"steam", "steamwebhelper"}
+# WM_CLASS of a running game, e.g. steam_app_1623730.
+GAME_CLASS_RE = re.compile(r"^steam_app_\d+$")
+
+CLIENT_LIST_RE = re.compile(r"0x[0-9a-fA-F]+")
+
+CONFIG_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "cachy-console", "config")
+
+
+def read_config():
+    """The user's settings, or an empty dict before they have run setup."""
+    values = {}
+    try:
+        with open(CONFIG_PATH) as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                values[key.strip()] = value.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return values
+
+
+def log(msg):
+    print(f"[cachy-console-watch] {msg}", flush=True)
+
+
+class Xprop:
+    """Thin wrapper around xprop; returns None when X is unreachable."""
+
+    def __init__(self, binary="xprop"):
+        self.binary = binary
+
+    def _run(self, args):
+        try:
+            res = subprocess.run(
+                [self.binary, *args],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if res.returncode != 0:
+            return None
+        return res.stdout
+
+    def active_window(self):
+        out = self._run(["-root", "_NET_ACTIVE_WINDOW"])
+        if not out:
+            return None
+        ids = CLIENT_LIST_RE.findall(out)
+        if not ids or int(ids[0], 16) == 0:
+            return None
+        return ids[0]
+
+    def client_list(self):
+        out = self._run(["-root", "_NET_CLIENT_LIST"])
+        if not out:
+            return []
+        return CLIENT_LIST_RE.findall(out)
+
+    def window(self, wid):
+        """Return {'id', 'classes', 'name'} for a window id."""
+        out = self._run(["-id", wid, "WM_CLASS", "_NET_WM_NAME"])
+        if not out:
+            return None
+        classes, name = set(), ""
+        for line in out.splitlines():
+            # Missing properties come back as 'WM_CLASS:  not found.', which
+            # has no ' = ' and must not be parsed as a value.
+            key, sep, value = line.partition(" = ")
+            if not sep:
+                continue
+            if key.startswith("WM_CLASS"):
+                classes = {v.strip().strip('"').lower()
+                           for v in value.split(",") if v.strip()}
+            elif key.startswith("_NET_WM_NAME"):
+                name = value.strip().strip('"')
+        return {"id": wid, "classes": classes, "name": name}
+
+
+# gamescope's own process name is gamescope-wl, which is why a plain
+# `pgrep -x gamescope` reports nothing while a session is clearly running.
+GAMESCOPE_COMMS = frozenset(("gamescope", "gamescope-wl"))
+
+EXTEST_SONAME = "libextest.so"
+
+
+def proc_state(pid):
+    """Single-letter state from /proc/PID/status, or None if it is gone."""
+    try:
+        with open(f"/proc/{pid}/status") as fh:
+            for line in fh:
+                if line.startswith("State:"):
+                    rest = line.split(None, 1)
+                    return rest[1].strip()[:1] if len(rest) > 1 else None
+    except OSError:
+        pass
+    return None
+
+
+def gamescope_pids():
+    """PIDs of the gamescope compositors currently running.
+
+    Zombies are excluded on purpose. `cachy-console` execs into gamescope, so
+    the process left behind is our own child; until we reap it, an exited
+    gamescope keeps a /proc entry that still reports its name, and counting it
+    would pin us in GAME forever and never restore the desktop client.
+    """
+    pids = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return pids
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/comm") as fh:
+                comm = fh.read().strip()
+        except OSError:
+            continue          # process exited while we were looking at it
+        if comm not in GAMESCOPE_COMMS:
+            continue
+        if proc_state(entry) == "Z":
+            continue
+        pids.append(int(entry))
+    return pids
+
+
+class Session:
+    """Starts and tracks the console-mode gamescope session."""
+
+    def __init__(self, console, helper, display, dry_run=False,
+                 relaunch_steam=True, log_path=None, display_locked=False):
+        self.console = console
+        self.helper = helper
+        self.display = display or ""
+        self.display_locked = display_locked
+        self.dry_run = dry_run
+        self.relaunch_steam = relaunch_steam
+        self.log_path = log_path or os.path.join(
+            os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "cachy-console-session.log")
+        self._proc = None
+
+    def connected(self):
+        """Whether the saved display is actually plugged in and on.
+
+        An empty or "auto" target is treated as disconnected: we must not look
+        for some other screen to use instead.
+        """
+        if not self.display or self.display.lower() == "auto" or self.display.isdigit():
+            return False
+        try:
+            res = subprocess.run(
+                [self.helper, "has", self.display],
+                capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return res.returncode == 0
+
+    def running(self):
+        # Live nested compositor is gamescope-wl. Polling reaps a zombie so a
+        # dead session cannot pin us in GAME forever.
+        if self._proc is not None and self._proc.poll() is not None:
+            self._proc = None
+        return bool(gamescope_pids())
+
+    def start(self):
+        """Run `cachy-console`, which restarts Steam inside gamescope."""
+        # Read the saved connector now, not the one from when this process
+        # started. Otherwise a Cachy Console save after the last session is
+        # ignored until the *following* launch.
+        if not self.display_locked:
+            self.refresh_target()
+        if self.dry_run:
+            log(f"[dry-run] would start console mode on {self.display}")
+            return True
+        if not self.display:
+            log("no display saved; not starting.")
+            return False
+        try:
+            out = open(self.log_path, "w")
+        except OSError as exc:
+            log(f"cannot write {self.log_path}: {exc}")
+            return False
+        try:
+            # Do not pass --display: cachy-console reads the config file at
+            # exec, so the connector saved a moment ago is the one that runs.
+            argv = [self.console]
+            if self.display_locked:
+                argv.extend(["--display", self.display])
+            self._proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+        except OSError as exc:
+            log(f"could not run {self.console}: {exc}")
+            return False
+        finally:
+            out.close()
+        log(f"session output goes to {self.log_path}")
+        return True
+
+    def restore_audio(self):
+        """Put HDMI audio back if console mode left the GPU profile switched.
+
+        The wrapper restores on EXIT, but a crash can skip that trap.
+        Restoring twice is a no-op once the state file is gone.
+        """
+        if self.dry_run:
+            log("[dry-run] would restore HDMI audio")
+            return
+        try:
+            subprocess.run(
+                [self.helper, "audio-restore"],
+                capture_output=True, text=True, timeout=8)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def refresh_target(self):
+        """Re-read the saved connector. A settings change should take effect
+        without restarting this service, and a display coming back should still
+        be the same saved one — never a newly appeared monitor.
+        """
+        if self.display_locked:
+            return self.display
+        raw = (read_config().get("DISPLAY") or "").strip()
+        if not raw or raw.lower() == "auto" or raw.isdigit():
+            self.display = ""
+        else:
+            self.display = raw
+        return self.display
+
+    def relaunch_desktop_steam(self):
+        """Bring back the desktop client, so the Steam button works again."""
+        if not self.relaunch_steam:
+            return
+        if self.dry_run:
+            log("[dry-run] would relaunch the desktop Steam client")
+            return
+        steam = shutil.which("steam")
+        if steam is None:
+            log("steam is not on PATH; cannot bring the desktop client back")
+            return
+
+        env = dict(os.environ)
+        # Keep the trackpad working without the desktop's "allow remote
+        # interaction" prompt, the same way console mode does.
+        preload = env.get("LD_PRELOAD", "")
+        if EXTEST_SONAME not in preload:
+            env["LD_PRELOAD"] = f"{EXTEST_SONAME} {preload}".strip()
+
+        try:
+            # -silent returns it to the tray instead of popping a window over
+            # whatever the user went back to doing.
+            subprocess.Popen(
+                [steam, "-silent"], env=env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True)
+        except OSError as exc:
+            log(f"could not start steam: {exc}")
+
+
+def _sibling_or_path(name):
+    """Prefer the copy next to this script, then fall back to PATH."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    local = os.path.join(here, name)
+    if os.access(local, os.X_OK):
+        return local
+    found = shutil.which(name)
+    if found:
+        return found
+    sys.exit(f"cachy-console-watch: cannot find {name}")
+
+
+def find_helper():
+    return _sibling_or_path("cachy-console-display")
+
+
+def find_console():
+    return _sibling_or_path("cachy-console")
+
+
+def classify(win, bpm_re):
+    if win is None:
+        return "none"
+    if any(GAME_CLASS_RE.match(c) for c in win["classes"]):
+        return "game"
+    if win["classes"] & STEAM_CLASSES:
+        return "bigpicture" if bpm_re.search(win["name"]) else "steam"
+    return "other"
+
+
+def present_kinds(xprop, bpm_re):
+    """What kinds of window currently exist.
+
+    Deliberately based on which windows are mapped rather than which one is
+    focused: with Big Picture fullscreen, compositors have been seen reporting
+    _NET_ACTIVE_WINDOW as an unrelated internal window, so keying off focus
+    never fires. Big Picture's window only exists while it is open, so its
+    presence is the reliable signal.
+    """
+    kinds = set()
+    for wid in xprop.client_list():
+        win = xprop.window(wid)
+        if win is not None:
+            kinds.add(classify(win, bpm_re))
+    return kinds
+
+
+def discover(xprop, bpm_re, interval):
+    log("discover mode: no display changes will be made.")
+    log("Press the Steam button / open Big Picture and watch the output.")
+    log("The line marked >>> is the currently focused window.")
+    previous = None
+    while True:
+        active = xprop.active_window()
+        rows = []
+        for wid in xprop.client_list():
+            win = xprop.window(wid)
+            if win is None:
+                continue
+            rows.append((
+                ">>>" if wid == active else "   ",
+                wid,
+                ",".join(sorted(win["classes"])),
+                win["name"],
+                classify(win, bpm_re),
+            ))
+        snapshot = repr(rows)
+        if snapshot != previous:
+            previous = snapshot
+            print()
+            log(f"--- window list changed ({time.strftime('%H:%M:%S')}) ---")
+            for mark, wid, cls, name, kind in rows:
+                print(f"  {mark} {wid:>11}  {kind:<11} "
+                      f"class={cls:<28} name={name!r}")
+        time.sleep(interval)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--display", default=None,
+                    help="which display to open console mode on; defaults to "
+                         "the DISPLAY setting in the config file")
+    ap.add_argument("--interval", type=float, default=0.5,
+                    help="seconds between polls (default 0.5)")
+    ap.add_argument("--engage-polls", type=int, default=2,
+                    help="polls before acting, so ~1s (default 2)")
+    ap.add_argument("--start-timeout", type=float, default=90.0,
+                    help="seconds to wait for gamescope to appear (default 90)")
+    ap.add_argument("--settle", type=float, default=25.0,
+                    help="seconds to ignore windows after a session ends, "
+                         "while the desktop client restarts (default 25)")
+    ap.add_argument("--max-starts", type=int, default=3,
+                    help="sessions allowed per --start-window before giving up "
+                         "(default 3)")
+    ap.add_argument("--start-window", type=float, default=300.0,
+                    help="window for --max-starts, in seconds (default 300)")
+    ap.add_argument("--no-steam-relaunch", dest="relaunch_steam",
+                    action="store_false",
+                    help="do not restart the desktop Steam client afterwards")
+    ap.add_argument("--bpm-pattern", default=os.environ.get(
+        "CACHY_CONSOLE_BPM_PATTERN", "big.?picture"),
+        help="case-insensitive regex matched against the window title")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="log decisions without starting or stopping anything")
+    ap.add_argument("--discover", action="store_true",
+                    help="print Steam windows as they change and exit on Ctrl-C")
+    ap.add_argument("--once", action="store_true",
+                    help="report the current classification and exit")
+    args = ap.parse_args()
+
+    # Output is usually a pipe or the journal, where the default block
+    # buffering would swallow everything if we get killed.
+    sys.stdout.reconfigure(line_buffering=True)
+
+    config = read_config()
+    # Opting out should stop the service doing anything, not merely be
+    # something the user has to remember to disable in systemd as well.
+    if config.get("STEAM_BUTTON", "on").lower() in ("off", "no", "0", "false"):
+        log("STEAM_BUTTON is off in the config; nothing to do.")
+        return 0
+    display = args.display
+    display_locked = bool(args.display)
+    if not display_locked:
+        raw = (config.get("DISPLAY") or "").strip()
+        display = "" if (not raw or raw.lower() == "auto" or raw.isdigit()) else raw
+
+    bpm_re = re.compile(args.bpm_pattern, re.I)
+    xprop = Xprop()
+
+    if xprop.active_window() is None and not xprop.client_list():
+        log("cannot read X11 windows. Is DISPLAY/XAUTHORITY set? "
+            "(a systemd --user service inherits them from the session)")
+        return 1
+
+    if args.discover:
+        try:
+            discover(xprop, bpm_re, max(args.interval, 0.5))
+        except KeyboardInterrupt:
+            print()
+            log("done.")
+        return 0
+
+    session = Session(find_console(), find_helper(), display,
+                      args.dry_run, args.relaunch_steam,
+                      display_locked=display_locked)
+
+    if args.once:
+        for wid in xprop.client_list():
+            win = xprop.window(wid)
+            if win is not None:
+                log(f"  {wid} {classify(win, bpm_re):<11} "
+                    f"class={','.join(sorted(win['classes']))} "
+                    f"name={win['name']!r}")
+        kinds = present_kinds(xprop, bpm_re)
+        log(f"kinds present:  {sorted(kinds) or ['none']}")
+        log(f"would start:    {'bigpicture' in kinds}")
+        log(f"display {display}: {'connected' if session.connected() else 'not connected'}")
+        pids = gamescope_pids()
+        log(f"gamescope:      {pids or 'not running'}")
+        return 0
+
+    stopping = {"now": False}
+
+    def on_signal(signum, _frame):
+        stopping["now"] = True
+
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGHUP, on_signal)
+
+    if display:
+        log(f"watching for Big Picture; will open console mode on {display}"
+            + (" (dry run)" if args.dry_run else ""))
+    else:
+        log("watching for Big Picture; no display saved yet "
+            "(open Console Mode Settings)"
+            + (" (dry run)" if args.dry_run else ""))
+
+    run_loop(xprop, session, bpm_re, args, stopping, time.sleep)
+    log("stopped.")
+    return 0
+
+
+IDLE, STARTING, GAME = "idle", "starting", "game"
+
+
+def run_loop(xprop, session, bpm_re, args, stopping, sleep,
+             now=time.monotonic):
+    """The state machine, kept separate so it can be driven by fakes in tests."""
+    state = IDLE
+    engage_streak = 0
+    deadline = 0.0
+    starts = []
+    # A stand-down repeats for as long as Big Picture stays up, which would fill
+    # the journal with one identical line per poll. Log a reason only when it
+    # changes, and forget it once the situation does.
+    last_standdown = None
+    # After we leave a session, Steam often restores itself into Big Picture.
+    # Treating that leftover window as a new Steam-button press relaunches
+    # gamescope on the previous display before the user can save a new one in
+    # Cachy Console. Wait until Big Picture has actually gone away, then treat
+    # the next appearance as a real request.
+    awaiting_bpm_clear = False
+
+    def stand_down(reason, message):
+        nonlocal last_standdown
+        if reason != last_standdown:
+            log(message)
+            last_standdown = reason
+
+    while not stopping["now"]:
+        if state == GAME:
+            if not session.running():
+                log("console mode ended -> bringing the desktop Steam client back.")
+                if hasattr(session, "restore_audio"):
+                    session.restore_audio()
+                session.relaunch_desktop_steam()
+                state = IDLE
+                engage_streak = 0
+                last_standdown = None
+                awaiting_bpm_clear = True
+                # Steam takes a while to come up, and if it restores itself
+                # into Big Picture we must not read that as a fresh request.
+                sleep(args.settle)
+                continue
+
+        elif state == STARTING:
+            if session.running():
+                log(f"console mode is up on {session.display}.")
+                state = GAME
+            elif now() >= deadline:
+                log(f"gamescope did not appear within {args.start_timeout:.0f}s; "
+                    f"see {session.log_path}")
+                state = IDLE
+                engage_streak = 0
+
+        else:
+            if session.running():
+                # Started by hand from a terminal, or left over from a restart.
+                log("tracking a gamescope session we did not start.")
+                state = GAME
+            else:
+                kinds = present_kinds(xprop, bpm_re)
+                if awaiting_bpm_clear:
+                    if "bigpicture" in kinds:
+                        stand_down("awaiting-clear",
+                                   "waiting for Big Picture to close after the "
+                                   "last session; press the Steam button twice "
+                                   "when you want console mode again.")
+                        sleep(args.interval)
+                        continue
+                    awaiting_bpm_clear = False
+                    last_standdown = None
+
+                if "bigpicture" in kinds:
+                    engage_streak += 1
+                else:
+                    engage_streak = 0
+                    # Big Picture went away, so the next attempt is allowed to
+                    # explain itself again.
+                    last_standdown = None
+
+                if engage_streak >= args.engage_polls:
+                    engage_streak = 0
+
+                    if hasattr(session, "refresh_target"):
+                        session.refresh_target()
+
+                    if not getattr(session, "display", None):
+                        stand_down("unconfigured",
+                                   "no display saved; open Console Mode Settings. "
+                                   "Not using another screen.")
+                        sleep(args.interval * 5)
+                        continue
+
+                    # With the saved display switched off, do not pick another.
+                    if not session.connected():
+                        stand_down("disconnected", f"saved display "
+                                   f"{session.display} is off; leaving Big Picture "
+                                   f"on the desktop instead of using another screen.")
+                        sleep(args.interval * 5)
+                        continue
+
+                    starts[:] = [t for t in starts if now() - t < args.start_window]
+                    if len(starts) >= args.max_starts:
+                        stand_down("throttled",
+                                   f"{len(starts)} sessions started in the last "
+                                   f"{args.start_window:.0f}s; refusing to loop. "
+                                   f"Turn off Steam's 'start in Big Picture' "
+                                   f"setting, then restart this service.")
+                        sleep(args.interval * 10)
+                        continue
+
+                    last_standdown = None
+                    log("Big Picture opened -> switching to console mode"
+                        f" on {session.display}.")
+                    starts.append(now())
+                    if session.start():
+                        state = STARTING
+                        deadline = now() + args.start_timeout
+                    else:
+                        stand_down("startfail",
+                                   "could not start the session; will retry.")
+
+        sleep(args.interval)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

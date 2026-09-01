@@ -1,0 +1,433 @@
+#!/usr/bin/env python3
+"""cachy-console-audio — keep only the focused game audible.
+
+Big Picture will happily run several games at once, and mixes all of their
+audio together: switching to one game leaves the other still playing in your
+ears. gamescope publishes which app it has focused, and PipeWire can mute an
+individual stream, so pairing the two gives per-game audio focus. The game you
+switch to plays; the others are muted until you switch back.
+
+Only games are ever touched. A stream counts as a game's when its process, or
+one of its ancestors, was started by Steam with SteamGameId set. Anything
+without one -- Steam's own UI sounds, a browser, music -- is left alone. Nothing
+is muted unless at least two games are really producing audio, and every mute
+made here is undone when the games close, when only one is left, or when this
+daemon stops.
+
+While focus sits on something that is not a game, such as the Big Picture
+library, the current mutes are held rather than cleared, so opening the Steam
+menu does not suddenly let a background game blare through.
+
+Usage:
+    cachy-console-audio [--verbose] [--dry-run] [--once] [--status]
+"""
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+POLL = 0.5                     # while a session is running
+IDLE_POLL = 2.0                # while nothing is going on
+X11_SOCKET_DIR = "/tmp/.X11-unix"
+
+# Steam's own ids: the client, and Big Picture itself. Their sounds are part of
+# the interface, so they keep playing while a game is focused.
+NON_GAME_APPIDS = {0, 7, 769}
+
+RUNNING = True
+
+CONFIG_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "cachy-console", "config")
+
+
+def audio_focus_enabled():
+    """Whether the user wants this at all; on by default before setup runs."""
+    try:
+        with open(CONFIG_PATH) as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                key, _, value = line.partition("=")
+                if key.strip() == "AUDIO_FOCUS":
+                    return value.strip().strip('"').strip("'").lower() not in (
+                        "off", "no", "0", "false")
+    except OSError:
+        pass
+    return True
+
+
+def log(msg):
+    print(f"[cachy-console-audio] {msg}", flush=True)
+
+
+def vlog(enabled, msg):
+    if enabled:
+        log(msg)
+
+
+def run(args, timeout=5):
+    """Run a command, returning stdout, or None if it fails or hangs.
+
+    xprop blocks indefinitely on an X display that has stopped answering, which
+    happens while a gamescope session is tearing down, so everything here is on
+    a timeout.
+    """
+    try:
+        res = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             timeout=timeout)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    if res.returncode != 0:
+        return None
+    return res.stdout.decode("utf-8", "replace")
+
+
+# ---- processes ----------------------------------------------------------
+
+def read_environ(pid):
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return {}
+    env = {}
+    for item in raw.split(b"\x00"):
+        if b"=" in item:
+            key, _, value = item.partition(b"=")
+            env[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
+    return env
+
+
+def parent_of(pid):
+    try:
+        with open(f"/proc/{pid}/status") as fh:
+            for line in fh:
+                if line.startswith("PPid:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def steam_appid(pid, limit=24):
+    """The Steam appid owning this process, or None if Steam did not start it.
+
+    The process that opens the audio stream is often several levels below the
+    one Steam launched -- Proton games are a wine process under a launcher
+    under the reaper -- so the ancestry is walked until Steam's own variables
+    turn up.
+    """
+    seen = 0
+    while pid and pid > 1 and seen < limit:
+        env = read_environ(pid)
+        for key in ("SteamGameId", "SteamAppId"):
+            value = env.get(key, "")
+            if value.isdigit() and int(value):
+                return int(value)
+        pid = parent_of(pid)
+        seen += 1
+    return None
+
+
+# ---- audio --------------------------------------------------------------
+
+class Stream:
+    __slots__ = ("index", "pid", "muted", "name")
+
+    def __init__(self, index, pid, muted, name):
+        self.index, self.pid, self.muted, self.name = index, pid, muted, name
+
+    def __repr__(self):
+        return f"<stream {self.index} pid={self.pid} muted={self.muted} {self.name!r}>"
+
+
+def sink_inputs():
+    """Every playback stream PipeWire currently has."""
+    out = run(["pactl", "-f", "json", "list", "sink-inputs"])
+    if not out:
+        return []
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return []
+    streams = []
+    for item in data:
+        props = item.get("properties") or {}
+        raw_pid = props.get("application.process.id")
+        try:
+            pid = int(raw_pid)
+        except (TypeError, ValueError):
+            continue          # no owning process: not something we can attribute
+        streams.append(Stream(
+            index=item.get("index"),
+            pid=pid,
+            muted=bool(item.get("mute")),
+            name=props.get("application.name") or props.get("media.name") or "?"))
+    return streams
+
+
+def set_mute(index, muted, dry_run):
+    if dry_run:
+        return True
+    return run(["pactl", "set-sink-input-mute", str(index), "1" if muted else "0"]) is not None
+
+
+# ---- focus --------------------------------------------------------------
+
+def cardinals(text):
+    """The numbers on the right of an xprop line, or [] if the atom is absent."""
+    if not text or "not found" in text or "no such atom" in text:
+        return []
+    _, sep, rhs = text.partition(" = ")
+    if not sep:
+        return []
+    out = []
+    for part in rhs.split(","):
+        part = part.strip()
+        try:
+            out.append(int(part, 16) if part.lower().startswith("0x") else int(part))
+        except ValueError:
+            continue
+    return out
+
+
+def root_prop(display, name):
+    return cardinals(run(["xprop", "-display", display, "-root", name], timeout=3))
+
+
+def window_prop(display, window, name):
+    return cardinals(
+        run(["xprop", "-display", display, "-id", str(window), name], timeout=3))
+
+
+def gamescope_displays():
+    """X displays served by a live gamescope, found via its GAMESCOPE_PID atom."""
+    try:
+        socks = os.listdir(X11_SOCKET_DIR)
+    except OSError:
+        return []
+    found = []
+    for sock in sorted(socks):
+        if not sock.startswith("X") or not sock[1:].isdigit():
+            continue
+        display = f":{sock[1:]}"
+        pids = root_prop(display, "GAMESCOPE_PID")
+        # The atom outlives the process on a shared display, so confirm it runs.
+        if pids and os.path.isdir(f"/proc/{pids[0]}"):
+            found.append(display)
+    return found
+
+
+def focused_appid(display):
+    """The Steam appid gamescope currently has focused, or None.
+
+    gamescope only advertises GAMESCOPE_FOCUSED_APP once something with an appid
+    is focused, so the focused window's own STEAM_GAME property is the fallback.
+    """
+    app = root_prop(display, "GAMESCOPE_FOCUSED_APP")
+    if app:
+        return app[0]
+    for atom in ("GAMESCOPE_FOCUSED_WINDOW", "_NET_ACTIVE_WINDOW"):
+        window = root_prop(display, atom)
+        if not window or not window[0]:
+            continue
+        game = window_prop(display, window[0], "STEAM_GAME")
+        if game:
+            return game[0]
+    return None
+
+
+# ---- the daemon ---------------------------------------------------------
+
+class AudioFocus:
+    def __init__(self, verbose=False, dry_run=False):
+        self.verbose = verbose
+        self.dry_run = dry_run
+        self.muted_appids = set()      # games we are holding muted
+        self.appid_cache = {}          # pid -> appid, so we re-read /proc rarely
+        self.last_focus = None
+        self.last_report = None
+
+    def appid_for(self, pid):
+        if pid not in self.appid_cache:
+            self.appid_cache[pid] = steam_appid(pid)
+        return self.appid_cache[pid]
+
+    def games(self, streams):
+        """Map of appid -> streams, for games only."""
+        out = {}
+        for stream in streams:
+            appid = self.appid_for(stream.pid)
+            if appid is None or appid in NON_GAME_APPIDS:
+                continue
+            out.setdefault(appid, []).append(stream)
+        return out
+
+    def mute_appid(self, appid, streams, muted):
+        changed = False
+        for stream in streams:
+            if stream.muted == muted:
+                continue
+            if set_mute(stream.index, muted, self.dry_run):
+                changed = True
+            elif any(s.index == stream.index for s in sink_inputs()):
+                log(f"could not {'mute' if muted else 'unmute'} stream {stream.index}")
+            # Otherwise the stream vanished between listing it and acting on
+            # it, which is just a game closing, not something worth reporting.
+        if changed:
+            log(f"{'muted' if muted else 'unmuted'} game {appid}")
+        return changed
+
+    def unmute_all(self, streams=None):
+        """Hand every game we muted back to the user."""
+        if not self.muted_appids:
+            return
+        if streams is None:
+            streams = sink_inputs()
+        by_app = self.games(streams)
+        for appid in sorted(self.muted_appids):
+            self.mute_appid(appid, by_app.get(appid, []), False)
+        self.muted_appids.clear()
+
+    def prune(self, streams):
+        live = {s.pid for s in streams}
+        for pid in [p for p in self.appid_cache if p not in live]:
+            del self.appid_cache[pid]
+
+    def poll(self):
+        """One pass. Returns True if a session is active, for pacing."""
+        streams = sink_inputs()
+        self.prune(streams)
+        by_app = self.games(streams)
+
+        # One game, or none, cannot drown anything out.
+        if len(by_app) < 2:
+            if self.muted_appids:
+                log("only one game left with audio; restoring")
+                self.unmute_all(streams)
+            self.report(by_app, None)
+            return bool(by_app)
+
+        displays = gamescope_displays()
+        if not displays:
+            if self.muted_appids:
+                log("no gamescope session; restoring")
+                self.unmute_all(streams)
+            return False
+
+        focus = None
+        for display in displays:
+            focus = focused_appid(display)
+            if focus is not None:
+                break
+
+        # Focus on the Big Picture library or anything else that is not one of
+        # the running games: hold what we have rather than surprising the user
+        # with a background game coming back.
+        if focus is None or focus not in by_app:
+            vlog(self.verbose, f"focus {focus} is not a running game; holding")
+            self.report(by_app, focus)
+            return True
+
+        for appid, appstreams in by_app.items():
+            if appid == focus:
+                if appid in self.muted_appids:
+                    self.mute_appid(appid, appstreams, False)
+                    self.muted_appids.discard(appid)
+            else:
+                if appid not in self.muted_appids:
+                    self.mute_appid(appid, appstreams, True)
+                    self.muted_appids.add(appid)
+                else:
+                    # A game that starts a new stream while muted, for instance
+                    # a second audio device, must not slip through.
+                    self.mute_appid(appid, appstreams, True)
+
+        self.report(by_app, focus)
+        return True
+
+    def report(self, by_app, focus):
+        state = (tuple(sorted(by_app)), focus)
+        if state == self.last_report:
+            return
+        self.last_report = state
+        if by_app:
+            listing = ", ".join(
+                f"{a}{' (focused)' if a == focus else ''}" for a in sorted(by_app))
+            log(f"games with audio: {listing}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--verbose", action="store_true", help="log every decision")
+    ap.add_argument("--dry-run", action="store_true", help="decide but never mute")
+    ap.add_argument("--once", action="store_true", help="one pass, then exit")
+    ap.add_argument("--status", action="store_true",
+                    help="show streams, their games and the focused app, then exit")
+    args = ap.parse_args()
+
+    if args.status:
+        return status()
+
+    if not audio_focus_enabled():
+        log("AUDIO_FOCUS is off in the config; nothing to do.")
+        return 0
+
+    focus = AudioFocus(verbose=args.verbose, dry_run=args.dry_run)
+
+    def stop(_signum, _frame):
+        global RUNNING
+        RUNNING = False
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    if args.once:
+        focus.poll()
+        return 0
+
+    log("watching for games sharing the speakers"
+        + (" (dry run)" if args.dry_run else ""))
+    try:
+        while RUNNING:
+            try:
+                active = focus.poll()
+            except Exception as exc:                  # never die on a bad poll
+                log(f"poll failed: {exc}")
+                active = False
+            time.sleep(POLL if active else IDLE_POLL)
+    finally:
+        # Leaving games muted with nothing running to unmute them would be a
+        # nasty thing to leave behind.
+        focus.unmute_all()
+        log("stopped.")
+    return 0
+
+
+def status():
+    streams = sink_inputs()
+    print(f"playback streams: {len(streams)}")
+    for stream in streams:
+        appid = steam_appid(stream.pid)
+        kind = "not a game"
+        if appid in NON_GAME_APPIDS and appid is not None:
+            kind = f"steam itself (appid {appid})"
+        elif appid is not None:
+            kind = f"game appid {appid}"
+        print(f"  [{stream.index}] {stream.name!r} pid={stream.pid} "
+              f"muted={stream.muted} -> {kind}")
+
+    displays = gamescope_displays()
+    print(f"gamescope displays: {displays or 'none'}")
+    for display in displays:
+        print(f"  {display}: focused app = {focused_appid(display)}")
+        print(f"  {display}: focusable   = {root_prop(display, 'GAMESCOPE_FOCUSABLE_APPS')}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

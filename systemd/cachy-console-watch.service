@@ -1,0 +1,22 @@
+[Unit]
+Description=Open console mode when the Steam button opens Big Picture
+Documentation=https://github.com/loguefx/CachyOS_SteamOS
+# Tied to the graphical session: it reads X11 window properties, so it needs
+# DISPLAY and XAUTHORITY, which the desktop imports into the user manager.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/cachy-console-watch
+Restart=on-failure
+RestartSec=5
+# Only stop the watcher itself. The default control-group mode would take the
+# whole console-mode session, and any game running in it, down with us.
+KillMode=process
+# NoNewPrivileges is deliberately NOT set. It sets PR_SET_NO_NEW_PRIVS, which
+# makes the kernel ignore file capabilities for every descendant, silently
+# stripping the CAP_SYS_NICE that gamescope needs for --rt scheduling.
+
+[Install]
+WantedBy=graphical-session.target

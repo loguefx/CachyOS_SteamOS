@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""Add an "Exit Console Mode" entry to Steam's library as a non-Steam shortcut.
+
+Big Picture offers no usable way out of a gamescope session it did not start
+itself: Steam hides "Exit Steam", "Exit Big Picture Mode" and "Minimize" while
+it detects gamescope, and "Switch to Desktop" calls a SteamOS-only method that
+the ordinary Linux client answers with "not implemented". A library entry is
+reachable with a controller and owes nothing to Steam's menus, so it is an exit
+that no client update can take away.
+
+The entry runs `cachy-console-exit`, which stops gamescope; Steam is its child,
+so the desktop comes back and cachy-console-watch restarts the desktop client.
+
+Steam rewrites shortcuts.vdf from memory when it shuts down, so it must not be
+running while we edit the file, or our entry is silently discarded.
+
+Usage:
+    cachy-console shortcut [--dry-run] [--revert] [--force] [--name NAME]
+"""
+
+import argparse
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import time
+import zlib
+
+MAP_START, STRING, INT32, MAP_END = 0x00, 0x01, 0x02, 0x08
+
+DEFAULT_NAME = "Exit Console Mode"
+STEAM_ROOT = os.path.expanduser("~/.steam/steam")
+
+
+class VDFError(Exception):
+    pass
+
+
+def read_cstring(data, i):
+    end = data.find(b"\x00", i)
+    if end < 0:
+        raise VDFError(f"unterminated string at byte {i}")
+    return data[i:end].decode("utf-8", "replace"), end + 1
+
+
+def parse_map(data, i, root=False):
+    """Parse one binary-KeyValues map, returning it and the offset after it.
+
+    The outermost map is implicit and its terminator is the last byte of the
+    file, so at the root a clean end-of-data is the end of the map rather than
+    truncation.
+    """
+    out = {}
+    while True:
+        if i >= len(data):
+            if root:
+                return out, i
+            raise VDFError("file ended inside a map")
+        kind = data[i]
+        i += 1
+        if kind == MAP_END:
+            return out, i
+        key, i = read_cstring(data, i)
+        if kind == MAP_START:
+            out[key], i = parse_map(data, i)
+        elif kind == STRING:
+            out[key], i = read_cstring(data, i)
+        elif kind == INT32:
+            if i + 4 > len(data):
+                raise VDFError(f"truncated int for key {key!r}")
+            out[key] = struct.unpack_from("<I", data, i)[0]
+            i += 4
+        else:
+            raise VDFError(f"unknown type byte 0x{kind:02x} for key {key!r}")
+
+
+def parse(data):
+    if not data:
+        return {}
+    obj, _ = parse_map(data, 0, root=True)
+    return obj
+
+
+def serialize(obj):
+    out = bytearray()
+    for key, value in obj.items():
+        name = key.encode("utf-8") + b"\x00"
+        if isinstance(value, dict):
+            out += bytes([MAP_START]) + name + serialize(value) + bytes([MAP_END])
+        elif isinstance(value, bool):
+            out += bytes([INT32]) + name + struct.pack("<I", int(value))
+        elif isinstance(value, int):
+            # Unsigned: shortcut appids have the high bit set.
+            out += bytes([INT32]) + name + struct.pack("<I", value & 0xFFFFFFFF)
+        else:
+            out += bytes([STRING]) + name + str(value).encode("utf-8") + b"\x00"
+    return bytes(out)
+
+
+def dumps(obj):
+    """Serialize a whole file, including the implicit root map's terminator."""
+    return serialize(obj) + bytes([MAP_END])
+
+
+def shortcut_appid(exe, name):
+    """The id Steam derives for a non-Steam shortcut: crc32, high bit set."""
+    return zlib.crc32((exe + name).encode("utf-8")) | 0x80000000
+
+
+def default_exe():
+    """Where cachy-console-exit lives.
+
+    Steam stores an absolute path in shortcuts.vdf and launches it with its own
+    environment, so this has to be resolved now rather than left to a PATH that
+    Steam may not share.
+    """
+    name = "cachy-console-exit"
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+    if os.access(here, os.X_OK):
+        return here
+    found = shutil.which(name)
+    if found:
+        return found
+    return os.path.expanduser(f"~/.local/bin/{name}")
+
+
+def steam_running():
+    try:
+        subprocess.run(["pgrep", "-x", "steam"], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+def config_paths():
+    base = os.path.join(STEAM_ROOT, "userdata")
+    if not os.path.isdir(base):
+        return []
+    found = []
+    for entry in sorted(os.listdir(base)):
+        if not entry.isdigit() or entry == "0":
+            continue          # "0" is the anonymous/logged-out profile
+        cfg = os.path.join(base, entry, "config")
+        if os.path.isdir(cfg):
+            found.append(os.path.join(cfg, "shortcuts.vdf"))
+    return found
+
+
+def load(path):
+    if not os.path.exists(path):
+        return {"shortcuts": {}}
+    with open(path, "rb") as fh:
+        data = fh.read()
+    obj = parse(data)
+    obj.setdefault("shortcuts", {})
+    return obj
+
+
+def save(path, obj, dry_run):
+    payload = dumps(obj)
+    if dry_run:
+        print(f"  would write {len(payload)} bytes to {path}")
+        return
+    if os.path.exists(path):
+        backup = f"{path}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+        shutil.copy2(path, backup)
+        print(f"  backed up existing file to {os.path.basename(backup)}")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "wb") as fh:
+        fh.write(payload)
+    os.replace(tmp, path)     # atomic, so a crash cannot truncate the library
+    print(f"  wrote {len(payload)} bytes to {path}")
+
+
+def find_entry(shortcuts, exe, name):
+    for index, entry in shortcuts.items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("AppName") == name or exe in str(entry.get("Exe", "")):
+            return index
+    return None
+
+
+def next_index(shortcuts):
+    used = [int(k) for k in shortcuts if k.isdigit()]
+    return str(max(used) + 1 if used else 0)
+
+
+def build_entry(exe, name):
+    quoted = f'"{exe}"'       # Steam stores Exe and StartDir quoted
+    return {
+        "appid": shortcut_appid(quoted, name),
+        "AppName": name,
+        "Exe": quoted,
+        "StartDir": f'"{os.path.dirname(exe)}/"',
+        "icon": "",
+        "ShortcutPath": "",
+        "LaunchOptions": "",
+        "IsHidden": 0,
+        "AllowDesktopConfig": 1,
+        "AllowOverlay": 1,
+        "OpenVR": 0,
+        "Devkit": 0,
+        "DevkitGameID": "",
+        "DevkitOverrideAppID": 0,
+        "LastPlayTime": 0,
+        "FlatpakAppID": "",
+        "tags": {},
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="show what would change, write nothing")
+    ap.add_argument("--revert", action="store_true",
+                    help="remove the shortcut instead of adding it")
+    ap.add_argument("--force", action="store_true",
+                    help="edit even while Steam is running (it will be lost)")
+    ap.add_argument("--name", default=DEFAULT_NAME, help="library entry name")
+    ap.add_argument("--exe", default=default_exe(),
+                    help="program the entry runs")
+    args = ap.parse_args()
+
+    if not args.dry_run and steam_running() and not args.force:
+        print("Steam is running. It rewrites shortcuts.vdf on exit, which would\n"
+              "discard this change. Close Steam first, or pass --force.",
+              file=sys.stderr)
+        return 1
+
+    if not args.revert and not os.access(args.exe, os.X_OK):
+        print(f"not executable: {args.exe}", file=sys.stderr)
+        return 1
+
+    paths = config_paths()
+    if not paths:
+        print(f"no Steam user config found under {STEAM_ROOT}/userdata",
+              file=sys.stderr)
+        return 1
+
+    for path in paths:
+        account = os.path.basename(os.path.dirname(os.path.dirname(path)))
+        print(f"account {account}:")
+        try:
+            obj = load(path)
+        except VDFError as exc:
+            print(f"  cannot parse existing shortcuts.vdf ({exc}); "
+                  f"leaving it alone", file=sys.stderr)
+            continue
+
+        shortcuts = obj["shortcuts"]
+        existing = find_entry(shortcuts, args.exe, args.name)
+
+        if args.revert:
+            if existing is None:
+                print("  no matching entry; nothing to remove")
+                continue
+            del shortcuts[existing]
+            # Steam expects consecutive numeric keys.
+            obj["shortcuts"] = {str(n): v for n, v in enumerate(shortcuts.values())}
+            print(f"  removing {args.name!r}")
+        else:
+            entry = build_entry(args.exe, args.name)
+            if existing is not None:
+                shortcuts[existing] = entry
+                print(f"  updating existing entry {existing} -> {args.name!r}")
+            else:
+                index = next_index(shortcuts)
+                shortcuts[index] = entry
+                print(f"  adding entry {index}: {args.name!r} -> {args.exe}")
+                other = len(shortcuts) - 1
+                if other:
+                    print(f"  ({other} existing shortcut(s) preserved)")
+
+        save(path, obj, args.dry_run)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

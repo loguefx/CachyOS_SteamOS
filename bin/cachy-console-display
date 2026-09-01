@@ -1,0 +1,665 @@
+#!/usr/bin/env python3
+"""Find the displays, what they are running at, and how gamescope numbers them.
+
+Everything here is deliberately compositor-agnostic. CachyOS ships KDE by
+default but is happy on GNOME, Hyprland or anything else, so asking a specific
+compositor -- GNOME's Mutter over DBus, say -- would work for one desktop and
+fail for the rest. SDL is asked instead, which is also what gamescope itself
+uses, so the numbers here are the numbers it will act on.
+
+SDL has to be asked twice, because neither backend alone tells the whole truth:
+
+  x11      names displays by connector ("HDMI-1") and enumerates them in the
+           order gamescope's --display-index expects, but under XWayland the
+           refresh rate is whatever the X server made up, which can be 60 for a
+           240Hz screen.
+  wayland  reports the true mode straight from wl_output, but names displays by
+           manufacturer ("Optoma Corporation"), which is no good for matching.
+
+Each backend reports the same desktop-space position for a display, so the two
+views are correlated on position: connector names and indices come from x11, and
+resolution and refresh come from wayland. On a plain X11 session there is no
+second view and x11 is used for everything, which is correct there anyway.
+
+Subcommands:
+  list [--json]         every display, its mode, and its gamescope index
+  resolve [NAME]        the one to use: "INDEX WIDTH HEIGHT REFRESH CONNECTOR"
+                        NAME is a connector. Omitted means the saved config.
+                        Never substitutes another screen if the saved one is off.
+  has [NAME]            exit 0 if that display (or the saved one) is connected
+  saved                 print the saved connector, even if it is currently off
+  set CONNECTOR         save CONNECTOR as the only display console mode will use
+  probe [--driver X]    raw SDL output, for when something looks wrong
+  audio-list            HDMI/DP audio ports and which one matches the saved display
+  audio-route           switch the GPU HDMI profile to that display (Steam's list)
+  audio-restore         put the previous HDMI profile back after console mode
+"""
+
+import argparse
+import ctypes
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+SDL_INIT_VIDEO = 0x20
+SDL_LIBS = ("libSDL2-2.0.so.0", "libSDL2.so", "libSDL2-2.0.so")
+
+CONFIG_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "cachy-console", "config")
+
+
+class DisplayError(Exception):
+    pass
+
+
+def run(args, timeout=8):
+    try:
+        res = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             timeout=timeout)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    if res.returncode != 0:
+        return None
+    return res.stdout.decode("utf-8", "replace")
+
+
+# ---- SDL ----------------------------------------------------------------
+
+class _Mode(ctypes.Structure):
+    _fields_ = [("format", ctypes.c_uint32), ("w", ctypes.c_int),
+                ("h", ctypes.c_int), ("refresh_rate", ctypes.c_int),
+                ("driverdata", ctypes.c_void_p)]
+
+
+class _Rect(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_int), ("y", ctypes.c_int),
+                ("w", ctypes.c_int), ("h", ctypes.c_int)]
+
+
+_lib = None
+
+
+def sdl():
+    global _lib
+    if _lib is None:
+        for name in SDL_LIBS:
+            try:
+                _lib = ctypes.CDLL(name)
+                break
+            except OSError:
+                continue
+        else:
+            raise DisplayError(
+                "cannot load SDL2 — install it with: sudo pacman -S sdl2")
+        _lib.SDL_GetDisplayName.restype = ctypes.c_char_p
+        _lib.SDL_GetError.restype = ctypes.c_char_p
+    return _lib
+
+
+def enumerate_sdl(driver):
+    """[{index, name, x, y, w, h, refresh}] as one SDL backend sees things."""
+    lib = sdl()
+    previous = os.environ.get("SDL_VIDEODRIVER")
+    os.environ["SDL_VIDEODRIVER"] = driver
+    try:
+        if lib.SDL_Init(SDL_INIT_VIDEO) != 0:
+            return []                      # backend unavailable in this session
+        try:
+            out = []
+            for i in range(lib.SDL_GetNumVideoDisplays()):
+                name = lib.SDL_GetDisplayName(i) or b""
+                mode, rect = _Mode(), _Rect()
+                lib.SDL_GetCurrentDisplayMode(i, ctypes.byref(mode))
+                lib.SDL_GetDisplayBounds(i, ctypes.byref(rect))
+                out.append({
+                    "index": i,
+                    "name": name.decode("utf-8", "replace"),
+                    "x": rect.x, "y": rect.y,
+                    "w": mode.w or rect.w, "h": mode.h or rect.h,
+                    "refresh": mode.refresh_rate,
+                })
+            return out
+        finally:
+            lib.SDL_Quit()
+    finally:
+        if previous is None:
+            os.environ.pop("SDL_VIDEODRIVER", None)
+        else:
+            os.environ["SDL_VIDEODRIVER"] = previous
+
+
+def displays():
+    """Every display, merging what each SDL backend knows best.
+
+    x11 is the authority on names and indices because that is the backend
+    gamescope runs; wayland is the authority on the mode.
+    """
+    x11 = enumerate_sdl("x11")
+    if not x11:
+        # No XWayland, so gamescope's SDL backend could not target an output
+        # either. Report what we can and let the caller complain.
+        wayland = enumerate_sdl("wayland")
+        if not wayland:
+            raise DisplayError(
+                "SDL found no displays under either the x11 or wayland backend")
+        return wayland
+
+    by_position = {(d["x"], d["y"]): d for d in enumerate_sdl("wayland")}
+    for display in x11:
+        display.setdefault("model", "")
+        truth = by_position.get((display["x"], display["y"]))
+        if not truth:
+            continue
+        # The manufacturer string is far friendlier than a connector for
+        # choosing a display, so keep it for matching and for display.
+        display["model"] = truth["name"]
+        # Only the refresh rate is taken from wayland: a mismatched resolution
+        # would mean the two views disagree about more than we can safely merge.
+        if truth["w"] == display["w"] and truth["h"] == display["h"]:
+            display["refresh"] = truth["refresh"]
+    return x11
+
+
+def connector_of(display):
+    """The connector part of an SDL name: 'HDMI-1 55"' -> 'HDMI-1'."""
+    return display["name"].split(" ")[0] if display["name"] else f"display-{display['index']}"
+
+
+# ---- selection ----------------------------------------------------------
+
+def read_config():
+    values = {}
+    try:
+        with open(CONFIG_PATH) as fh:
+            for line in fh:
+                # Trailing comments too, matching how the shell script and the
+                # watcher read this same file.
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                values[key.strip()] = value.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return values
+
+
+def saved_connector():
+    """The connector the user saved, or None if they have not chosen one.
+
+    "auto" and a bare SDL index are treated as unset: an index is only valid
+    while that exact set of displays is plugged in, so using it after a screen
+    is turned off would silently send Big Picture to a different monitor.
+    """
+    raw = (read_config().get("DISPLAY") or "").strip()
+    if not raw or raw.lower() == "auto" or raw.isdigit():
+        return None
+    return raw
+
+
+def update_config(updates):
+    """Change keys in the config file without rewriting the rest of it."""
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    try:
+        with open(CONFIG_PATH) as fh:
+            lines = fh.readlines()
+    except OSError:
+        lines = []
+    seen = set()
+    out = []
+    for line in lines:
+        stripped = line.split("#", 1)[0]
+        if "=" not in stripped:
+            out.append(line)
+            continue
+        key = stripped.split("=", 1)[0].strip()
+        if key in updates:
+            out.append(f"{key}={updates[key]}\n")
+            seen.add(key)
+            continue
+        out.append(line)
+    for key, value in updates.items():
+        if key not in seen:
+            out.append(f"{key}={value}\n")
+    with open(CONFIG_PATH, "w") as fh:
+        fh.writelines(out)
+
+
+def pick(wanted=None, allow_index=False):
+    """The display to run on, as one of the dicts from displays().
+
+    The saved target is a connector (HDMI-1), not "whichever screen is on".
+    If that connector is missing, this raises rather than picking another
+    output: turning the TV off must not dump Big Picture onto a desktop monitor.
+    """
+    found = displays()
+    if not found:
+        raise DisplayError("no displays found")
+
+    from_config = wanted is None
+    if from_config:
+        wanted = saved_connector()
+        if not wanted:
+            raise DisplayError(
+                "no display saved — open Console Mode Settings and pick one")
+        allow_index = False
+
+    wanted = str(wanted).strip()
+    if not wanted or wanted.lower() == "auto":
+        raise DisplayError(
+            "no display saved — open Console Mode Settings and pick one")
+
+    if allow_index and wanted.isdigit():
+        for display in found:
+            if display["index"] == int(wanted):
+                return display
+        raise DisplayError(
+            f"no display with index {wanted} (found {len(found)})")
+
+    for display in found:
+        if connector_of(display).lower() == wanted.lower():
+            return display
+
+    known = ", ".join(connector_of(d) for d in found) or "none"
+    raise DisplayError(
+        f"saved display {wanted} is off or unplugged; not using another screen "
+        f"(connected: {known})")
+
+
+# ---- commands -----------------------------------------------------------
+
+def cmd_list(args):
+    found = displays()
+    if args.json:
+        print(json.dumps([dict(d, connector=connector_of(d)) for d in found],
+                         indent=2))
+        return 0
+    configured = saved_connector() or ""
+    print(f"  {'#':<3} {'connector':<12} {'mode':<18} {'position':<12} display")
+    for display in found:
+        connector = connector_of(display)
+        mark = "*" if configured and connector.lower() == configured.lower() else " "
+        mode = f"{display['w']}x{display['h']}@{display['refresh']}Hz"
+        position = f"+{display['x']}+{display['y']}"
+        print(f"{mark} {display['index']:<3} {connector:<12} {mode:<18} "
+              f"{position:<12} {display.get('model') or display['name']}")
+    if not configured and not args.no_hint:
+        print("\n  no display saved yet. Pick one with: cachy-console settings")
+    elif configured and not any(
+            connector_of(d).lower() == configured.lower() for d in found):
+        print(f"\n  saved display {configured} is currently off. "
+              "Console mode will wait for it rather than use another screen.")
+    return 0
+
+
+def cmd_resolve(args):
+    display = pick(args.name, allow_index=bool(args.name and str(args.name).isdigit()))
+    config = read_config()
+
+    width = display["w"]
+    height = display["h"]
+    refresh = display["refresh"]
+
+    # An explicit override in the config wins, for the rare panel whose
+    # advertised mode is not the one the user wants to game at.
+    override = config.get("RESOLUTION", "auto")
+    if override and override.lower() != "auto" and "x" in override:
+        try:
+            width, height = (int(v) for v in override.lower().split("x", 1))
+        except ValueError:
+            pass
+    override = config.get("REFRESH", "auto")
+    if override and override.lower() != "auto":
+        try:
+            refresh = int(float(override))
+        except ValueError:
+            pass
+
+    if not refresh:
+        refresh = 60          # gamescope needs a number; 60 is the safe floor
+
+    if args.json:
+        print(json.dumps({"index": display["index"], "width": width,
+                          "height": height, "refresh": refresh,
+                          "connector": connector_of(display),
+                          "name": display["name"]}))
+    else:
+        print(f"{display['index']} {width} {height} {refresh} "
+              f"{connector_of(display)}")
+    return 0
+
+
+def cmd_has(args):
+    try:
+        pick(args.name, allow_index=bool(args.name and str(args.name).isdigit()))
+    except DisplayError:
+        return 1
+    return 0
+
+
+def cmd_saved(args):
+    saved = saved_connector()
+    if not saved:
+        print("(none)")
+        return 1
+    print(saved)
+    return 0
+
+
+def cmd_set(args):
+    connector = args.connector.strip()
+    if not connector or connector.lower() == "auto" or connector.isdigit():
+        raise DisplayError("save a connector name (HDMI-1), not auto or an index")
+    model = ""
+    try:
+        for display in displays():
+            if connector_of(display).lower() == connector.lower():
+                connector = connector_of(display)   # canonical casing
+                model = display.get("model") or display["name"]
+                break
+    except DisplayError:
+        pass
+    # Saving is allowed while the display is off: that is the whole point of
+    # remembering a connector instead of "whatever is plugged in right now".
+    update_config({"DISPLAY": connector, "DISPLAY_MODEL": model})
+    print(f"saved {connector}" + (f" ({model})" if model else ""))
+    return 0
+
+
+def cmd_probe(args):
+    for driver in ([args.driver] if args.driver else ["x11", "wayland"]):
+        print(f"== SDL_VIDEODRIVER={driver} ==")
+        found = enumerate_sdl(driver)
+        if not found:
+            print("   unavailable in this session")
+            continue
+        for display in found:
+            print(f"   index {display['index']}: {display['name'] or '?':<28} "
+                  f"{display['w']}x{display['h']}@{display['refresh']}Hz "
+                  f"at +{display['x']}+{display['y']}")
+    return 0
+
+
+AUDIO_STATE = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "cachy-console-audio-route.json")
+
+_STOPWORDS = {
+    "hdmi", "displayport", "digital", "stereo", "audio", "corporation",
+    "electric", "company", "lcd", "the", "and",
+}
+
+
+def _tokens(text):
+    return {t for t in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if len(t) > 2 and t not in _STOPWORDS}
+
+
+def _pactl_json(what):
+    out = run(["pactl", "-f", "json", "list", what], timeout=8)
+    if not out:
+        return []
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return []
+
+
+def _pactl(*args):
+    return run(["pactl", *args], timeout=8)
+
+
+def hdmi_ports():
+    """HDMI/DP ports on ALSA cards, with ELD monitor names and profiles."""
+    found = []
+    for card in _pactl_json("cards"):
+        ports = card.get("ports") or {}
+        if not isinstance(ports, dict):
+            continue
+        for pname, port in ports.items():
+            if not isinstance(port, dict):
+                continue
+            if (port.get("type") or "").upper() != "HDMI" and "hdmi" not in pname.lower():
+                continue
+            props = port.get("properties") or {}
+            profiles = [p for p in (port.get("profiles") or [])
+                        if str(p).startswith("output:") and "stereo" in str(p)]
+            if not profiles:
+                profiles = [p for p in (port.get("profiles") or [])
+                            if str(p).startswith("output:")]
+            found.append({
+                "card": card.get("name"),
+                "card_profile": card.get("active_profile"),
+                "port": pname,
+                "eld": props.get("device.product.name") or "",
+                "available": str(port.get("availability") or "").lower() == "available",
+                "profile": profiles[0] if profiles else None,
+            })
+    return found
+
+
+def score_port(port, model, connector):
+    if not port.get("available") or not port.get("profile"):
+        return 0
+    eld = port.get("eld") or ""
+    overlap = _tokens(eld) & (_tokens(model) | _tokens(connector))
+    if overlap:
+        return 10 + len(overlap)
+    eld_l, model_l = eld.lower(), (model or "").lower()
+    if eld_l and model_l and (eld_l in model_l or model_l in eld_l):
+        return 5
+    return 0
+
+
+def match_hdmi(connector=None, model=None):
+    """The HDMI audio profile for the saved (or named) display, or None."""
+    connector = connector or saved_connector()
+    if not connector:
+        return None
+    if not model:
+        model = (read_config().get("DISPLAY_MODEL") or "").strip()
+        try:
+            for display in displays():
+                if connector_of(display).lower() == connector.lower():
+                    model = display.get("model") or display["name"] or model
+                    break
+        except DisplayError:
+            pass
+    best, best_score = None, 0
+    for port in hdmi_ports():
+        sc = score_port(port, model, connector)
+        if sc > best_score:
+            best, best_score = port, sc
+    return best
+
+
+def _default_sink():
+    out = _pactl("get-default-sink")
+    return (out or "").strip() or None
+
+
+def _sinks():
+    return _pactl_json("sinks")
+
+
+def _load_audio_state():
+    try:
+        with open(AUDIO_STATE) as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _save_audio_state(state):
+    os.makedirs(os.path.dirname(AUDIO_STATE) or ".", exist_ok=True)
+    with open(AUDIO_STATE, "w") as fh:
+        json.dump(state, fh)
+
+
+def _drop_audio_state():
+    try:
+        os.remove(AUDIO_STATE)
+    except OSError:
+        pass
+
+
+def _sink_matches(sink, target):
+    name = sink.get("name") or ""
+    prefix = (target.get("card") or "").replace("alsa_card.", "alsa_output.", 1)
+    suffix = (target.get("profile") or "").replace("output:", "", 1)
+    if prefix and name.startswith(prefix):
+        return True
+    if suffix and name.endswith(suffix):
+        return True
+    props = sink.get("properties") or {}
+    nick = (props.get("node.nick") or props.get("device.product.name") or "")
+    eld = (target.get("eld") or "").lower()
+    return bool(eld and eld in nick.lower())
+
+
+def cmd_audio_list(args):
+    saved = saved_connector() or ""
+    model = (read_config().get("DISPLAY_MODEL") or "").strip()
+    target = match_hdmi(saved, model)
+    print(f"  saved display: {saved or '(none)'} {('('+model+')') if model else ''}")
+    print("  HDMI audio ports:")
+    for port in hdmi_ports():
+        mark = "*" if target and port["port"] == target["port"] and port["card"] == target["card"] else " "
+        avail = "on" if port["available"] else "off"
+        print(f"  {mark} {port['eld'] or '(no ELD)':22} {avail:3}  "
+              f"{port['profile'] or '-':28} {port['port']}")
+    if saved and not target:
+        print("  no HDMI audio matched that display "
+              "(it may not expose audio, or the port is off).")
+    return 0
+
+
+def cmd_audio_route(args):
+    """Point the GPU HDMI profile at the saved display so Steam can list it."""
+    target = match_hdmi()
+    if not target:
+        print("no HDMI audio for the saved display; leaving audio alone")
+        return 0
+    if target["card_profile"] == target["profile"]:
+        print(f"HDMI audio already on {target['eld']} ({target['profile']})")
+        return 0
+
+    previous_sink = _default_sink()
+    previous_profile = target["card_profile"]
+    existing = _load_audio_state()
+    # A crashed session may already have switched the profile. Keep the
+    # original desktop device so the next restore still lands there.
+    if existing and existing.get("applied") and existing.get("card") == target["card"]:
+        previous_profile = existing.get("previous_profile") or previous_profile
+        previous_sink = existing.get("previous_sink") or previous_sink
+    state = {
+        "card": target["card"],
+        "previous_profile": previous_profile,
+        "previous_sink": previous_sink,
+        "applied": True,
+        "eld": target["eld"],
+        "profile": target["profile"],
+    }
+    if args.dry_run:
+        print(f"would set {target['card']} to {target['profile']} "
+              f"({target['eld']})")
+        return 0
+    _save_audio_state(state)
+    if _pactl("set-card-profile", target["card"], target["profile"]) is None:
+        print(f"could not switch HDMI audio to {target['eld']}", file=sys.stderr)
+        return 1
+    # The sink name changes with the profile; pick the one that just appeared
+    # on this card rather than leaving the default pointing at a dead node.
+    for _ in range(10):
+        for sink in _sinks():
+            if not _sink_matches(sink, target):
+                continue
+            name = sink.get("name") or ""
+            _pactl("set-default-sink", name)
+            nick = (sink.get("properties") or {}).get("node.nick") or target["eld"]
+            print(f"HDMI audio -> {nick} ({name})")
+            return 0
+        time.sleep(0.1)
+    print(f"switched profile to {target['profile']}; default sink not found yet")
+    return 0
+
+
+def cmd_audio_restore(args):
+    state = _load_audio_state()
+    if not state:
+        return 0
+    if not state.get("applied"):
+        _drop_audio_state()
+        return 0
+    if args.dry_run:
+        print(f"would restore {state.get('card')} to {state.get('previous_profile')}")
+        return 0
+    card = state.get("card")
+    profile = state.get("previous_profile")
+    if card and profile:
+        _pactl("set-card-profile", card, profile)
+    sink = state.get("previous_sink")
+    if sink:
+        _pactl("set-default-sink", sink)
+    _drop_audio_state()
+    print(f"restored HDMI audio to {profile}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("list", help="every display and its mode")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--no-hint", action="store_true",
+                   help="skip the 'run setup' suggestion, for use during setup")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("resolve", help="the display to run console mode on")
+    p.add_argument("name", nargs="?")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_resolve)
+
+    p = sub.add_parser("has", help="exit 0 if the display is connected")
+    p.add_argument("name", nargs="?")
+    p.set_defaults(func=cmd_has)
+
+    sub.add_parser("saved", help="print the saved connector, even if it is off") \
+        .set_defaults(func=cmd_saved)
+
+    p = sub.add_parser("set", help="save the only display console mode will use")
+    p.add_argument("connector")
+    p.set_defaults(func=cmd_set)
+
+    p = sub.add_parser("probe", help="raw SDL enumeration, for debugging")
+    p.add_argument("--driver")
+    p.set_defaults(func=cmd_probe)
+
+    sub.add_parser("audio-list", help="HDMI audio ports and which one matches the saved display") \
+        .set_defaults(func=cmd_audio_list)
+
+    p = sub.add_parser("audio-route",
+                       help="switch HDMI audio to the saved display")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_audio_route)
+
+    p = sub.add_parser("audio-restore",
+                       help="put HDMI audio back after console mode")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_audio_restore)
+
+    args = ap.parse_args()
+    try:
+        return args.func(args) or 0
+    except DisplayError as exc:
+        print(f"cachy-console-display: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,518 @@
+#!/usr/bin/env bash
+# cachy-console — a console experience for CachyOS.
+#
+# Runs Steam Big Picture inside gamescope on the display you choose, at whatever
+# resolution and refresh rate that display is already set to. Your desktop keeps
+# running on the other monitors; console mode is a thing you switch into and
+# back out of, not a different way to boot the machine.
+#
+#   cachy-console              start console mode
+#   cachy-console settings     pick the display gamescope should always use
+#   cachy-console setup        same, from a terminal
+#   cachy-console exit         leave console mode, back to the desktop
+#   cachy-console status       check the setup and show what would run
+#   cachy-console displays     list displays, their modes and gamescope indices
+#   cachy-console shortcut     add "Exit Console Mode" to your Steam library
+#   cachy-console help
+#
+# Options:
+#   --display NAME    override the configured display for this run
+#   --dry-run         print the command instead of running it
+#
+# Leaving console mode:
+#   Steam hides its own "Exit Steam" while it detects gamescope, and Big
+#   Picture's "Switch to Desktop" is a SteamOS-only call that does nothing on a
+#   normal Linux install, so the way out is `cachy-console exit`, or the
+#   "Exit Console Mode" entry that `cachy-console shortcut` puts in your
+#   library, which can be clicked with a controller.
+#
+# Config: ~/.config/cachy-console/config
+
+set -euo pipefail
+
+NAME=cachy-console
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$NAME"
+CONFIG_FILE="$CONFIG_DIR/config"
+
+# Defaults, overridden by the config file and then by the command line.
+CFG_DISPLAY=auto
+CFG_RESOLUTION=auto
+CFG_REFRESH=auto
+CFG_HDR=off
+CFG_VRR=on
+CFG_TRACKPAD_FIX=on
+CFG_EXTRA_GAMESCOPE_ARGS=""
+
+DRY_RUN=0
+DISPLAY_OVERRIDE=""
+
+# A bare soname, so the dynamic linker picks /usr/lib32 for Steam's 32-bit
+# client and /usr/lib for its 64-bit children with no arch-mismatch noise.
+EXTEST_LIB="${CACHY_CONSOLE_EXTEST:-libextest.so}"
+
+have() { command -v "$1" >/dev/null 2>&1; }
+say() { printf '%s\n' "$*"; }
+warn() { printf '%s: %s\n' "$NAME" "$*" >&2; }
+die() { printf '%s: %s\n' "$NAME" "$*" >&2; exit 1; }
+is_on() { [[ "${1,,}" == on || "${1,,}" == yes || "${1,,}" == 1 || "${1,,}" == true ]]; }
+
+usage() {
+    awk 'NR == 1 { next }
+         /^# Config:/ { sub(/^# ?/, ""); print; exit }
+         /^#/ { sub(/^# ?/, ""); print; next }
+         { exit }' "$0"
+    exit 0
+}
+
+# The helpers sit next to this script in a checkout, or on PATH once installed.
+find_helper() {
+    local wanted="$1" here
+    here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+    if [[ -x "$here/$wanted" ]]; then
+        printf '%s\n' "$here/$wanted"
+    elif have "$wanted"; then
+        command -v "$wanted"
+    else
+        die "cannot find $wanted (is $NAME installed? run ./install.sh)"
+    fi
+}
+
+# Parsed rather than sourced: a config file should not be able to run commands
+# just because someone pasted the wrong thing into it.
+load_config() {
+    [[ -r "$CONFIG_FILE" ]] || return 0
+    local line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"
+        [[ "$line" == *=* ]] || continue
+        key="${line%%=*}"
+        value="${line#*=}"
+        key="${key//[[:space:]]/}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        value="${value%\"}"; value="${value#\"}"
+        value="${value%\'}"; value="${value#\'}"
+        case "$key" in
+            DISPLAY|DISPLAY_MODEL|RESOLUTION|REFRESH|HDR|VRR|TRACKPAD_FIX|EXTRA_GAMESCOPE_ARGS)
+                printf -v "CFG_$key" '%s' "$value" ;;
+            STEAM_BUTTON|AUDIO_FOCUS) ;;   # read by the services, not by us
+            "") ;;
+            *) warn "ignoring unknown setting in $CONFIG_FILE: $key" ;;
+        esac
+    done < "$CONFIG_FILE"
+}
+
+# ---- display ------------------------------------------------------------
+
+# Fills DISPLAY_INDEX / WIDTH / HEIGHT / REFRESH / CONNECTOR from the helper,
+# which reads the mode the display is *currently* set to. That is the whole
+# point: whatever you picked in your desktop's display settings -- 1080p60,
+# 1440p165, 4K120 -- is what console mode runs at, with nothing to configure.
+# Returns non-zero rather than exiting, so `status` can report a display being
+# switched off as one finding among many instead of dying halfway through.
+resolve_display() {
+    local wanted="${DISPLAY_OVERRIDE:-$CFG_DISPLAY}" line
+    if ! line="$("$HELPER_DISPLAY" resolve "$wanted" 2>&1)"; then
+        # The helper prefixes its own name; keeping it would print two
+        # program names in front of one message.
+        RESOLVE_ERROR="${line#"$NAME"-display: }"
+        return 1
+    fi
+    read -r DISPLAY_INDEX WIDTH HEIGHT REFRESH CONNECTOR <<<"$line"
+    if [[ -z "${DISPLAY_INDEX:-}" ]]; then
+        RESOLVE_ERROR="could not work out which display to use"
+        return 1
+    fi
+    return 0
+}
+
+# ---- steam --------------------------------------------------------------
+
+steam_running() { pgrep -x steam >/dev/null 2>&1; }
+
+# Every Steam game launch goes through the reaper, so this catches native and
+# Proton titles alike.
+game_running() { pgrep -f 'SteamLaunch AppId=[0-9]' >/dev/null 2>&1; }
+
+running_appids() {
+    pgrep -a -f 'SteamLaunch AppId=[0-9]' 2>/dev/null \
+        | grep -o 'AppId=[0-9][0-9]*' | cut -d= -f2 | sort -u | paste -sd' ' -
+}
+
+stop_steam() {
+    steam_running || return 0
+
+    # Restarting Steam takes any running game down with it, so never do that
+    # without saying so. Checked before anything else changes.
+    if game_running && [[ -z "${CACHY_CONSOLE_FORCE:-}" ]]; then
+        die "a game is running (AppID: $(running_appids)) — refusing to restart Steam.
+Quit the game first, or set CACHY_CONSOLE_FORCE=1 to override."
+    fi
+
+    say "Closing the running Steam client…"
+    steam -shutdown >/dev/null 2>&1 || pkill -x steam || true
+    local i
+    for i in $(seq 1 30); do
+        steam_running || return 0
+        sleep 1
+    done
+    warn "Steam ignored the shutdown request; killing it."
+    pkill -9 -x steam || true
+    sleep 2
+}
+
+# Steam drives the controller trackpad through XTEST. On Wayland, XWayland turns
+# the first XTEST call into an xdg-desktop-portal RemoteDesktop request -- the
+# "allow remote interaction" dialog -- and the permission dies with the Steam
+# process, so it returns on every restart. extest implements those XTEST calls
+# against /dev/uinput instead, so there is nothing to approve.
+extest_available() {
+    [[ -e /usr/lib32/libextest.so || -e /usr/lib/libextest.so ]]
+}
+
+use_extest() {
+    is_on "$CFG_TRACKPAD_FIX" || return 0
+    if ! extest_available; then
+        warn "libextest is not installed, so the controller trackpad will keep"
+        warn "asking for permission to move the cursor."
+        warn "install it with: paru -S libextest-git   (or yay -S libextest-git)"
+        return 0
+    fi
+    export LD_PRELOAD="${EXTEST_LIB}${LD_PRELOAD:+:$LD_PRELOAD}"
+}
+
+# ---- gamescope ----------------------------------------------------------
+
+# Captured rather than piped into grep -q, which SIGPIPEs getcap and trips
+# pipefail on a successful match.
+gamescope_has_rt() {
+    local caps
+    have gamescope || return 1
+    caps="$(getcap "$(command -v gamescope)" 2>/dev/null || true)"
+    [[ "$caps" == *cap_sys_nice* ]]
+}
+
+gamescope_argv() {
+    local -n out=$1
+    out=(gamescope
+         -W "$WIDTH" -H "$HEIGHT"
+         -r "$REFRESH"
+         --fullscreen
+         --steam
+         --expose-wayland)
+
+    is_on "$CFG_VRR" && out+=(--adaptive-sync)
+    is_on "$CFG_HDR" && out+=(--hdr-enabled)
+
+    # Realtime scheduling silently does nothing without CAP_SYS_NICE, so only
+    # ask for it when it will actually be granted.
+    gamescope_has_rt && out+=(--rt)
+
+    # Only the SDL backend can target a specific output, and only through
+    # XWayland: SDL's Wayland driver cannot position windows, so the compositor
+    # would choose the screen instead of us.
+        out+=(--backend sdl --display-index "$DISPLAY_INDEX"
+              --prefer-output "$CONNECTOR" --force-grab-cursor)
+
+    if [[ -n "$CFG_EXTRA_GAMESCOPE_ARGS" ]]; then
+        # Deliberately word-split: this is a list of arguments, not one string.
+        # shellcheck disable=SC2206
+        local extra=($CFG_EXTRA_GAMESCOPE_ARGS)
+        out+=("${extra[@]}")
+    fi
+
+    out+=(-- steam -gamepadui)
+}
+
+start_console() {
+    have steam || die "Steam is not installed"
+    have gamescope || die "gamescope is not installed — sudo pacman -S gamescope"
+
+    if [[ -z "${DISPLAY_OVERRIDE:-}" ]]; then
+        local saved
+        saved="$("$HELPER_DISPLAY" saved 2>/dev/null || true)"
+        if [[ -z "$saved" || "$saved" == "(none)" ]]; then
+            die "no display saved. Open Console Mode Settings and pick one.
+It will not choose a screen for you."
+        fi
+    fi
+
+    resolve_display || die "$RESOLVE_ERROR"
+    local argv
+    gamescope_argv argv
+
+    if (( DRY_RUN )); then
+        say "Would run:"
+        say "  ${argv[*]}"
+        say "  HDMI audio:"
+        "$HELPER_DISPLAY" audio-route --dry-run 2>/dev/null | sed 's/^/    /' || true
+        return 0
+    fi
+
+    say "Console mode on $CONNECTOR at ${WIDTH}x${HEIGHT}@${REFRESH}Hz."
+    use_extest
+    stop_steam
+
+    # One GPU HDMI profile is visible at a time. Steam's audio list is that
+    # profile plus USB devices, so without this the projector never appears.
+    restore_hdmi_audio() { "$HELPER_DISPLAY" audio-restore || true; }
+    trap restore_hdmi_audio EXIT
+    "$HELPER_DISPLAY" audio-route || warn "could not switch HDMI audio to $CONNECTOR"
+
+    export SDL_VIDEODRIVER=x11
+    # Not exec: the EXIT trap has to run so the desktop HDMI device comes back.
+    "${argv[@]}"
+}
+
+# ---- setup --------------------------------------------------------------
+
+write_config() {
+    mkdir -p "$CONFIG_DIR"
+    cat > "$CONFIG_FILE" <<EOF
+# cachy-console configuration
+# Written by 'cachy-console setup'; safe to edit by hand.
+
+# Which display console mode runs on. A connector name (HDMI-1, DP-2).
+# Not "auto": if this display is off, console mode waits rather than using
+# another screen. Change it with: cachy-console settings
+DISPLAY=$CFG_DISPLAY
+
+# Resolution and refresh rate. "auto" follows whatever that display is already
+# set to in your desktop's display settings, which is almost always what you
+# want. Override with e.g. RESOLUTION=1920x1080 and REFRESH=120.
+RESOLUTION=$CFG_RESOLUTION
+REFRESH=$CFG_REFRESH
+
+# Variable refresh rate (FreeSync/G-Sync) inside console mode.
+VRR=$CFG_VRR
+
+# HDR. Only worth turning on if the display and your games support it.
+HDR=$CFG_HDR
+
+# Stop the Steam controller's trackpad from asking permission to move the
+# cursor every time Steam restarts. Needs libextest installed.
+TRACKPAD_FIX=$CFG_TRACKPAD_FIX
+
+# Open console mode when you press the Steam button twice on a controller.
+# Read by cachy-console-watch.service.
+STEAM_BUTTON=on
+
+# With two or more games running, mute every game except the one you are
+# looking at. Read by cachy-console-audio.service.
+AUDIO_FOCUS=on
+
+# Extra arguments passed straight to gamescope, for anything not covered above.
+# For example: EXTRA_GAMESCOPE_ARGS=--mangoapp
+EXTRA_GAMESCOPE_ARGS=$CFG_EXTRA_GAMESCOPE_ARGS
+EOF
+    say "Saved $CONFIG_FILE"
+}
+
+setup() {
+    say "== $NAME setup =="
+    say
+    say "Displays detected:"
+    "$HELPER_DISPLAY" list --no-hint
+    say
+
+    local -a connectors=()
+    mapfile -t connectors < <("$HELPER_DISPLAY" list --json |
+        python3 -c 'import json,sys; [print(d["connector"]) for d in json.load(sys.stdin)]')
+    (( ${#connectors[@]} )) || die "no displays detected"
+
+    if (( ${#connectors[@]} == 1 )); then
+        CFG_DISPLAY="${connectors[0]}"
+        say "Only one display (${connectors[0]}), so console mode will use it."
+    else
+        local reply
+        read -rp "Which display should console mode use? [number] " reply
+        if [[ "$reply" =~ ^[0-9]+$ ]] && (( reply < ${#connectors[@]} )); then
+            CFG_DISPLAY="${connectors[$reply]}"
+        else
+            die "not one of the numbers listed: $reply
+Pick a display; console mode will not choose one by itself."
+        fi
+        say "Console mode will use: $CFG_DISPLAY"
+    fi
+
+    local reply
+    read -rp "Enable variable refresh rate (FreeSync/G-Sync)? [Y/n] " reply
+    [[ "${reply,,}" == n* ]] && CFG_VRR=off || CFG_VRR=on
+
+    read -rp "Enable HDR? Only if your display and games support it. [y/N] " reply
+    [[ "${reply,,}" == y* ]] && CFG_HDR=on || CFG_HDR=off
+
+    write_config
+    say
+    say "Done. Start console mode with:  $NAME"
+    say "Check everything with:          $NAME status"
+}
+
+# ---- status -------------------------------------------------------------
+
+status() {
+    local problems=0 warnings=0
+
+    say "== system =="
+    printf '  %-20s %s\n' "session" "${XDG_SESSION_TYPE:-unknown}"
+    printf '  %-20s %s\n' "desktop" "${XDG_CURRENT_DESKTOP:-unknown}"
+    printf '  %-20s %s\n' "config" \
+        "$([[ -r "$CONFIG_FILE" ]] && echo "$CONFIG_FILE" || echo "none yet (run: $NAME setup)")"
+
+    local bin
+    for bin in steam gamescope python3; do
+        if have "$bin"; then
+            printf '  %-20s %s\n' "$bin" "$(command -v "$bin")"
+        else
+            printf '  %-20s %s\n' "$bin" "MISSING"
+            problems=$(( problems + 1 ))
+        fi
+    done
+
+    if have gamescope; then
+        if gamescope_has_rt; then
+            printf '  %-20s %s\n' "gamescope --rt" "available"
+        else
+            printf '  %-20s %s\n' "gamescope --rt" "unavailable"
+            say "     gamescope cannot use realtime scheduling without CAP_SYS_NICE,"
+            say "     which costs you frame pacing under load. Grant it with:"
+            say "       sudo setcap CAP_SYS_NICE=eip $(command -v gamescope)"
+            warnings=$(( warnings + 1 ))
+        fi
+    fi
+
+    # The services read X11 window properties, so they need DISPLAY and
+    # XAUTHORITY in the *systemd user manager's* environment, which is separate
+    # from this shell's. Desktops are supposed to import them at login; when one
+    # does not, the watcher simply never reacts to the Steam button, and the
+    # only clue is a line in its journal. Say so here instead.
+    local sd_env
+    sd_env="$(systemctl --user show-environment 2>/dev/null || true)"
+    if [[ "$sd_env" == *DISPLAY=* && "$sd_env" == *XAUTHORITY=* ]]; then
+        printf '  %-20s %s\n' "service environment" "ok"
+    else
+        printf '  %-20s %s\n' "service environment" "INCOMPLETE"
+        say "     systemd's user session is missing DISPLAY or XAUTHORITY, so the"
+        say "     Steam button and audio focus cannot see your windows. Fix with:"
+        say "       systemctl --user import-environment DISPLAY XAUTHORITY"
+        say "     and add that to your desktop's autostart to make it persist."
+        warnings=$(( warnings + 1 ))
+    fi
+
+    say
+    say "== displays =="
+    if ! "$HELPER_DISPLAY" list; then
+        warn "could not enumerate displays"
+        problems=$(( problems + 1 ))
+    fi
+
+    say
+    say "== controller =="
+    if extest_available; then
+        say "  libextest is installed, so the trackpad will not ask for permission."
+        # A bare soname resolves through the linker cache. Captured rather than
+        # piped into grep -q, which SIGPIPEs ldconfig and trips pipefail.
+        local cache
+        cache="$(ldconfig -p 2>/dev/null || true)"
+        if [[ "$EXTEST_LIB" != /* && "$cache" != *"$EXTEST_LIB"* ]]; then
+            warn "$EXTEST_LIB is not in the linker cache; run: sudo ldconfig"
+            warnings=$(( warnings + 1 ))
+        fi
+    else
+        say "  libextest is NOT installed."
+        say "     Without it, the Steam controller's trackpad asks permission to"
+        say "     move the cursor every time Steam restarts. Install with:"
+        say "       paru -S libextest-git"
+        warnings=$(( warnings + 1 ))
+    fi
+    if [[ -w /dev/uinput ]]; then
+        say "  /dev/uinput is writable."
+    else
+        warn "/dev/uinput is not writable, so libextest cannot inject input."
+        warnings=$(( warnings + 1 ))
+    fi
+
+    say
+    say "== services =="
+    local unit
+    for unit in "$NAME-watch" "$NAME-audio"; do
+        if systemctl --user list-unit-files "$unit.service" >/dev/null 2>&1 &&
+           [[ -n "$(systemctl --user list-unit-files "$unit.service" --no-legend 2>/dev/null)" ]]; then
+            printf '  %-24s %s / %s\n' "$unit" \
+                "$(systemctl --user is-enabled "$unit.service" 2>/dev/null || echo disabled)" \
+                "$(systemctl --user is-active "$unit.service" 2>/dev/null || echo inactive)"
+        else
+            printf '  %-24s %s\n' "$unit" "not installed"
+        fi
+    done
+
+    say
+    say "== steam =="
+    if steam_running; then
+        say "  running; it will be restarted into console mode."
+    else
+        say "  not running."
+    fi
+    if game_running; then
+        warn "a game is running (AppID: $(running_appids)); starting console mode"
+        warn "now would refuse, because restarting Steam would close it."
+        warnings=$(( warnings + 1 ))
+    fi
+
+    say
+    say "== HDMI audio =="
+    "$HELPER_DISPLAY" audio-list || true
+
+    say
+    say "== what would run =="
+    if ! have gamescope; then
+        say "  gamescope is missing, so nothing can run yet."
+    elif resolve_display; then
+        local argv
+        gamescope_argv argv
+        say "  display: $CONNECTOR (gamescope index $DISPLAY_INDEX) at ${WIDTH}x${HEIGHT}@${REFRESH}Hz"
+        say "  ${argv[*]}"
+    else
+        warn "${RESOLVE_ERROR:-cannot resolve the configured display}"
+        say "  is it plugged in and switched on? see: $NAME displays"
+        problems=$(( problems + 1 ))
+    fi
+
+    say
+    if (( problems )); then
+        say "$problems problem(s), $warnings warning(s)."
+        return 1
+    fi
+    say "No problems. $warnings warning(s)."
+}
+
+# ---- main ---------------------------------------------------------------
+
+COMMAND=start
+ARGS=()
+
+while (( $# )); do
+    case "$1" in
+        -h|--help|help)     usage ;;
+        start|setup|settings|status|check|displays|exit|stop|shortcut)
+                            COMMAND="$1" ;;
+        --display)          DISPLAY_OVERRIDE="${2-}"; shift ;;
+        --display=*)        DISPLAY_OVERRIDE="${1#*=}" ;;
+        --dry-run)          DRY_RUN=1 ;;
+        *)                  ARGS+=("$1") ;;
+    esac
+    shift
+done
+
+load_config
+HELPER_DISPLAY="$(find_helper "$NAME-display")"
+
+case "$COMMAND" in
+    start)      start_console ;;
+    setup)      setup ;;
+    settings)   exec "$(find_helper "$NAME-settings")" ;;
+    status|check) status ;;
+    displays)   "$HELPER_DISPLAY" list ;;
+    exit|stop)  exec "$(find_helper "$NAME-exit")" ;;
+    shortcut)   exec "$(find_helper "$NAME-shortcut")" "${ARGS[@]+"${ARGS[@]}"}" ;;
+esac

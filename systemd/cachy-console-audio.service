@@ -1,0 +1,19 @@
+[Unit]
+Description=Mute unfocused games so you only hear the one you switched to
+Documentation=https://github.com/loguefx/CachyOS_SteamOS
+# Needs DISPLAY and XAUTHORITY to read which app gamescope has focused.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/cachy-console-audio
+Restart=on-failure
+RestartSec=5
+# On stop it unmutes everything it muted, so it has to receive the signal and
+# run that cleanup rather than being killed outright.
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=graphical-session.target

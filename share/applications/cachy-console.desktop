@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Cachy Console Session
+GenericName=Start Steam console mode
+Comment=Start Steam Big Picture in gamescope on the saved display
+Exec=cachy-console
+Icon=steam
+Terminal=false
+Categories=Game;
+Keywords=cachy;console;steam;bigpicture;gamescope;
+StartupNotify=false
+# Settings is the app you search for. Starting a session is the Steam button.
+NoDisplay=true

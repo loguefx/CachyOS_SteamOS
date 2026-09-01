@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# cachy-console-exit — leave console mode and go back to the desktop.
+#
+# Steam will not let you out on its own. It hides "Exit Steam", "Exit Big
+# Picture Mode" and "Minimize" whenever it detects gamescope, because SteamOS
+# expects a session manager to handle that, and Big Picture's "Switch to
+# Desktop" calls a SteamOS-only method that a normal Linux client answers with
+# "not implemented". So this is the way out.
+#
+# Three ways to run it:
+#   cachy-console exit                 from a terminal
+#   the "Exit Console Mode" entry      from inside Big Picture, with a
+#   in your Steam library              controller
+#   a keyboard shortcut                bound to this command
+#
+# It ends console mode by stopping gamescope. Steam is gamescope's child, so
+# both close and the desktop comes back; cachy-console-watch then restarts the
+# ordinary Steam client so the Steam button works again.
+set -euo pipefail
+
+GRACE=10
+TAG="cachy-console-exit"
+
+log() { printf '%s: %s\n' "$TAG" "$*" >&2; }
+
+# gamescope runs under the name gamescope-wl, which is why `pgrep -x gamescope`
+# finds nothing while a session is plainly running.
+is_gamescope() {
+    local comm
+    comm="$(cat "/proc/$1/comm" 2>/dev/null)" || return 1
+    [[ "$comm" == gamescope || "$comm" == gamescope-wl ]]
+}
+
+# An exited-but-unreaped gamescope keeps its /proc entry and its name, so
+# without this check a dead session still looks alive.
+is_zombie() {
+    local line
+    while read -r line; do
+        [[ "$line" == State:* ]] || continue
+        [[ "$line" == *Z* ]] && return 0 || return 1
+    done < "/proc/$1/status" 2>/dev/null
+    return 1
+}
+
+alive_gamescope() {
+    is_gamescope "$1" && ! is_zombie "$1"
+}
+
+ppid_of() {
+    local line
+    while read -r line; do
+        if [[ "$line" == PPid:* ]]; then
+            printf '%s\n' "${line#PPid:}" | tr -d '[:space:]'
+            return 0
+        fi
+    done < "/proc/$1/status"
+    return 1
+}
+
+# Walking our own ancestry first means that when this runs from inside the
+# session -- as the library shortcut does -- we end that session and not some
+# other gamescope the user happens to be running.
+find_ancestor() {
+    local pid=$$ hops=0
+    while [[ -n "$pid" && "$pid" -gt 1 && "$hops" -lt 40 ]]; do
+        if alive_gamescope "$pid"; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+        pid="$(ppid_of "$pid")" || return 1
+        hops=$(( hops + 1 ))
+    done
+    return 1
+}
+
+find_session() {
+    local -a pids=()
+    local pid
+    for pid in $(pgrep -u "$UID" -f 'gamescope.*steam -gamepadui' 2>/dev/null || true); do
+        alive_gamescope "$pid" && pids+=("$pid")
+    done
+    if (( ${#pids[@]} == 1 )); then
+        printf '%s\n' "${pids[0]}"
+        return 0
+    fi
+    (( ${#pids[@]} > 1 )) && log "found ${#pids[@]} sessions; not guessing which to end."
+    return 1
+}
+
+if target="$(find_ancestor)"; then
+    :
+elif target="$(find_session)"; then
+    :
+else
+    log "console mode is not running; nothing to do."
+    exit 0
+fi
+
+log "leaving console mode (gamescope pid $target)"
+
+# Detached on purpose: when this runs from inside the session, gamescope's
+# reaper takes down our process group as soon as it starts shutting down, so the
+# signal has to come from something that outlives us. Steam also expects the
+# thing it launched to return promptly.
+setsid bash -c '
+    pid=$1 grace=$2
+    sleep 0.5
+    kill -TERM "$pid" 2>/dev/null || exit 0
+    for _ in $(seq "$grace"); do
+        kill -0 "$pid" 2>/dev/null || exit 0
+        sleep 1
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+' _ "$target" "$GRACE" >/dev/null 2>&1 < /dev/null &
+
+exit 0
