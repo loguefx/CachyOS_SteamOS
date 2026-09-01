@@ -221,7 +221,15 @@ gamescope_argv() {
         out+=("${extra[@]}")
     fi
 
-    out+=(-- steam -gamepadui)
+    # Steam and games must not inherit the *host* Wayland display. If they do,
+    # a Vulkan game (Slay the Spire 2, etc.) creates a swapchain on GNOME/KWin
+    # instead of inside gamescope. The WSI layer then shows a GTK dialog on the
+    # desktop — and --force-grab-cursor means a controller cannot click OK.
+    # Strip WAYLAND_DISPLAY and force toolkit dialogs onto gamescope's X11.
+    out+=(-- env -u WAYLAND_DISPLAY
+          GDK_BACKEND=x11
+          QT_QPA_PLATFORM=xcb
+          steam -gamepadui)
 }
 
 start_console() {
@@ -264,6 +272,13 @@ It will not choose a screen for you."
     # Steam and games inherit this, so they play on the TV even if the
     # session default is still a headset.
     [[ -n "$sink" ]] && export PULSE_SINK="$sink"
+
+    # Mesa's device-select layer can sit in front of gamescope's WSI hook and
+    # produce a "non-Gamescope swapchain" dialog. Anti-lag is opt-in but if it
+    # was enabled in the session it does the same. Neither is needed inside
+    # a single-GPU nested session.
+    export NODEVICE_SELECT=1
+    export DISABLE_LAYER_MESA_ANTI_LAG=1
 
     export SDL_VIDEODRIVER=x11
     # Not exec: the EXIT trap has to run so the desktop HDMI device comes back.

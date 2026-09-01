@@ -210,6 +210,13 @@ journalctl --user -u cachy-console-watch -f
 The watcher stands down when your chosen display is switched off, so Big Picture
 stays on the desktop rather than opening somewhere you cannot see.
 
+**A Gamescope WSI Layer Error dialog appears and the controller cannot click
+OK.** The game opened a Vulkan window on the desktop instead of inside
+gamescope, and the cursor was grabbed by the nested session. Console mode now
+starts Steam without the host `WAYLAND_DISPLAY` so that dialog stays on
+gamescope's X11, where the trackpad/right-stick mouse can dismiss it. Exit and
+Steam-button twice to pick up the change.
+
 **It refuses to start.** Starting console mode restarts Steam, which would close
 a running game, so it stops and says so. Quit the game, or set
 `CACHY_CONSOLE_FORCE=1`.
