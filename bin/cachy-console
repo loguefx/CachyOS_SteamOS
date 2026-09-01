@@ -261,7 +261,15 @@ It will not choose a screen for you."
 
     export SDL_VIDEODRIVER=x11
     # Not exec: the EXIT trap has to run so the desktop HDMI device comes back.
-    "${argv[@]}"
+    # gamescope often forks to gamescope-wl and the parent exits; wait until
+    # that compositor is actually gone or HDMI audio would switch back early
+    # and `cachy-console exit` would look like a no-op.
+    "${argv[@]}" || true
+    local helper_exit
+    helper_exit="$(find_helper "$NAME-exit")"
+    while "$helper_exit" --running >/dev/null 2>&1; do
+        sleep 0.4
+    done
 }
 
 # ---- setup --------------------------------------------------------------

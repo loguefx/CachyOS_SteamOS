@@ -75,6 +75,14 @@ for tool in cachy-console cachy-console-display cachy-console-watch \
     printf '  %s -> %s\n' "$tool" "$BIN_DIR"
 done
 
+# Library tiles from the older projector scripts still call this name.
+cat > "$BIN_DIR/projector-exit" <<'EOF'
+#!/usr/bin/env bash
+exec "$(dirname -- "$(readlink -f -- "$0" || echo "$0")")/cachy-console-exit" "$@"
+EOF
+chmod 755 "$BIN_DIR/projector-exit"
+printf '  %s -> %s (compat)\n' "projector-exit" "$BIN_DIR"
+
 mkdir -p "$APP_DIR"
 install -m644 "$SRC/share/applications/cachy-console.desktop" "$APP_DIR/"
 install -m644 "$SRC/share/applications/cachy-console-settings.desktop" "$APP_DIR/"

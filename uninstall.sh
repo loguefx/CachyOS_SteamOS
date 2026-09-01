@@ -39,6 +39,7 @@ for tool in cachy-console cachy-console-display cachy-console-watch \
         say "  removed $tool"
     fi
 done
+rm -f "$BIN_DIR/projector-exit"
 
 rm -f "$APP_DIR/cachy-console.desktop" "$APP_DIR/cachy-console-settings.desktop"
 rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/cachy-console-session-env.desktop"

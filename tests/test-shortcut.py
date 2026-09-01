@@ -75,6 +75,11 @@ check("ours is present", final["shortcuts"]["1"]["AppName"], NAME)
 
 index = ies.find_entry(final["shortcuts"], EXE, NAME)
 check("ours is findable for update and revert", index, "1")
+
+legacy = {"shortcuts": {"0": ies.build_entry("/home/me/.local/bin/projector-exit",
+                                             "Exit Game Mode")}}
+check("an old Exit Game Mode / projector-exit tile is the same entry",
+      ies.find_entry(legacy["shortcuts"], EXE, NAME), "0")
 del final["shortcuts"][index]
 renumbered = {str(n): v for n, v in enumerate(final["shortcuts"].values())}
 check("reverting leaves only their game",

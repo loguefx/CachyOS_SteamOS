@@ -16,6 +16,9 @@
 # It ends console mode by stopping gamescope. Steam is gamescope's child, so
 # both close and the desktop comes back; cachy-console-watch then restarts the
 # ordinary Steam client so the Steam button works again.
+#
+#   cachy-console-exit           stop the session
+#   cachy-console-exit --running exit 0 if a console session is up
 set -euo pipefail
 
 GRACE=10
@@ -46,6 +49,30 @@ alive_gamescope() {
     is_gamescope "$1" && ! is_zombie "$1"
 }
 
+is_console_cmdline() {
+    # Console mode is the gamescope that launched Steam Big Picture.
+    # gamescopereaper's cmdline also mentions steam -gamepadui, but its
+    # comm is not gamescope, so it never reaches this check.
+    local cmd=$1
+    [[ "$cmd" == *gamepadui* || "$cmd" == *" --steam "* || "$cmd" == *"--steam" ]]
+}
+
+cmdline_of() {
+    tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null || true
+}
+
+console_gamescope_pids() {
+    local pid comm cmd
+    for pid in /proc/[0-9]*; do
+        pid="${pid#/proc/}"
+        [[ "$pid" == *[0-9]* && "$pid" != *[^0-9]* ]] || continue
+        alive_gamescope "$pid" || continue
+        cmd="$(cmdline_of "$pid")"
+        is_console_cmdline "$cmd" || continue
+        printf '%s\n' "$pid"
+    done
+}
+
 ppid_of() {
     local line
     while read -r line; do
@@ -73,44 +100,47 @@ find_ancestor() {
     return 1
 }
 
-find_session() {
-    local -a pids=()
-    local pid
-    for pid in $(pgrep -u "$UID" -f 'gamescope.*steam -gamepadui' 2>/dev/null || true); do
-        alive_gamescope "$pid" && pids+=("$pid")
-    done
-    if (( ${#pids[@]} == 1 )); then
-        printf '%s\n' "${pids[0]}"
-        return 0
-    fi
-    (( ${#pids[@]} > 1 )) && log "found ${#pids[@]} sessions; not guessing which to end."
-    return 1
+stop_pid() {
+    local pid=$1
+    log "leaving console mode (gamescope pid $pid)"
+    # Detached on purpose: when this runs from inside the session, gamescope's
+    # reaper takes down our process group as soon as it starts shutting down, so
+    # the signal has to come from something that outlives us. Steam also
+    # expects the thing it launched to return promptly.
+    setsid bash -c '
+        pid=$1 grace=$2
+        sleep 0.4
+        kill -TERM "$pid" 2>/dev/null || exit 0
+        for _ in $(seq "$grace"); do
+            kill -0 "$pid" 2>/dev/null || exit 0
+            sleep 1
+        done
+        kill -KILL "$pid" 2>/dev/null || true
+    ' _ "$pid" "$GRACE" >/dev/null 2>&1 < /dev/null &
 }
 
-if target="$(find_ancestor)"; then
-    :
-elif target="$(find_session)"; then
-    :
+if [[ "${1-}" == --running ]]; then
+    [[ -n "$(console_gamescope_pids)" ]]
+    exit $?
+fi
+
+if [[ "${1-}" == -h || "${1-}" == --help ]]; then
+    sed -n '2,22p' "$0" | sed 's/^# \?//'
+    exit 0
+fi
+
+targets=()
+if ancestor="$(find_ancestor)"; then
+    targets=("$ancestor")
 else
+    mapfile -t targets < <(console_gamescope_pids)
+fi
+if (( ${#targets[@]} == 0 )) || [[ -z "${targets[0]:-}" ]]; then
     log "console mode is not running; nothing to do."
     exit 0
 fi
 
-log "leaving console mode (gamescope pid $target)"
-
-# Detached on purpose: when this runs from inside the session, gamescope's
-# reaper takes down our process group as soon as it starts shutting down, so the
-# signal has to come from something that outlives us. Steam also expects the
-# thing it launched to return promptly.
-setsid bash -c '
-    pid=$1 grace=$2
-    sleep 0.5
-    kill -TERM "$pid" 2>/dev/null || exit 0
-    for _ in $(seq "$grace"); do
-        kill -0 "$pid" 2>/dev/null || exit 0
-        sleep 1
-    done
-    kill -KILL "$pid" 2>/dev/null || true
-' _ "$target" "$GRACE" >/dev/null 2>&1 < /dev/null &
-
+for target in "${targets[@]}"; do
+    [[ -n "$target" ]] && stop_pid "$target"
+done
 exit 0

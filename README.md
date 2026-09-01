@@ -126,6 +126,8 @@ Favourite it, or pin it to your home shelf, and it becomes a one-click exit.
 
 Run `cachy-console shortcut` while **Steam is closed** — Steam rewrites its
 shortcuts file from memory when it exits and would otherwise discard the entry.
+An older "Exit Game Mode" tile that still pointed at `projector-exit` is updated
+to `cachy-console-exit` by that same command.
 
 ## Configuration
 

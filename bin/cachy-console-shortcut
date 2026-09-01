@@ -175,11 +175,23 @@ def save(path, obj, dry_run):
     print(f"  wrote {len(payload)} bytes to {path}")
 
 
+# Older installs used the personal projector scripts. The library tile still
+# says "Exit Game Mode" and points at projector-exit; treat that as this entry.
+LEGACY_NAMES = ("Exit Game Mode", "Exit Console Mode", DEFAULT_NAME)
+LEGACY_EXE_MARKERS = ("projector-exit", "cachy-console-exit")
+
+
 def find_entry(shortcuts, exe, name):
     for index, entry in shortcuts.items():
         if not isinstance(entry, dict):
             continue
-        if entry.get("AppName") == name or exe in str(entry.get("Exe", "")):
+        app = entry.get("AppName") or ""
+        stored = str(entry.get("Exe", ""))
+        if app == name or exe in stored:
+            return index
+        if app in LEGACY_NAMES:
+            return index
+        if any(marker in stored for marker in LEGACY_EXE_MARKERS):
             return index
     return None
 
@@ -266,8 +278,11 @@ def main():
         else:
             entry = build_entry(args.exe, args.name)
             if existing is not None:
+                old_name = shortcuts[existing].get("AppName") or args.name
+                if old_name in LEGACY_NAMES and old_name != args.name:
+                    entry = build_entry(args.exe, old_name)
                 shortcuts[existing] = entry
-                print(f"  updating existing entry {existing} -> {args.name!r}")
+                print(f"  updating existing entry {existing} -> {entry['AppName']!r} ({args.exe})")
             else:
                 index = next_index(shortcuts)
                 shortcuts[index] = entry
