@@ -548,7 +548,8 @@ while (( $# )); do
                             COMMAND="$1" ;;
         --display)          DISPLAY_OVERRIDE="${2-}"; shift ;;
         --display=*)        DISPLAY_OVERRIDE="${1#*=}" ;;
-        --dry-run)          DRY_RUN=1 ;;
+        # Also forwarded: `shortcut --dry-run` would otherwise write for real.
+        --dry-run)          DRY_RUN=1; ARGS+=("$1") ;;
         *)                  ARGS+=("$1") ;;
     esac
     shift

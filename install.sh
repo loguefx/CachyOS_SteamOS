@@ -86,6 +86,14 @@ printf '  %s -> %s (compat)\n' "projector-exit" "$BIN_DIR"
 mkdir -p "$APP_DIR"
 install -m644 "$SRC/share/applications/cachy-console.desktop" "$APP_DIR/"
 install -m644 "$SRC/share/applications/cachy-console-settings.desktop" "$APP_DIR/"
+# Plasma's app menu uses a PATH without ~/.local/bin, so TryExec would hide
+# the picker unless these point at the files we just installed.
+sed -i "s|^Exec=cachy-console$|Exec=$BIN_DIR/cachy-console|" \
+    "$APP_DIR/cachy-console.desktop"
+sed -i "s|^Exec=cachy-console settings$|Exec=$BIN_DIR/cachy-console settings|" \
+    "$APP_DIR/cachy-console-settings.desktop"
+sed -i "s|^TryExec=cachy-console-settings$|TryExec=$BIN_DIR/cachy-console-settings|" \
+    "$APP_DIR/cachy-console-settings.desktop"
 printf '  %s -> %s\n' "desktop entries" "$APP_DIR"
 
 # Plasma often does not copy DISPLAY/XAUTHORITY into systemd --user. This
