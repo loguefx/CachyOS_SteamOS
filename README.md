@@ -140,17 +140,40 @@ to `cachy-console-exit` by that same command.
 **The Discord already open on your desktop cannot be moved into console mode.**
 A window belongs to the compositor its client connected to, and gamescope is a
 separate nested one — the same reason Big Picture has to be relaunched rather
-than moved. Discord also keeps a single-instance lock, so starting it inside
-gamescope while the desktop copy runs just raises that copy and exits.
-
-So it is one Discord at a time, which follows you in and out. Quit the desktop
-one, then launch it from your library inside console mode:
+than moved. So it is one Discord at a time, which follows you in and out:
 
 ```bash
 cachy-console shortcut --name Discord --exe /usr/bin/discord   # Steam closed
 ```
 
-That command also gives the tile its picture. A shortcut Steam has no artwork
+The tile launches through `cachy-console-app`, which handles the two things a
+desktop application needs before it behaves like a library entry.
+
+It quits the copy running on your desktop first. Discord keeps a
+single-instance lock, so a second copy hands its arguments to the first one,
+prints "Quitting secondary instance" and exits about a second later — Steam
+sees the process it started exit almost immediately and puts the tile back to
+"Play", while the window it raised is on the desktop, behind console mode. The
+tile looks like it failed to start. You do not have to remember to quit Discord
+before switching any more; it is quit for you, with the signal it treats as a
+clean shutdown.
+
+And it quits Discord for real when you close the window. Discord's close button
+does not quit it: unless you turn `MINIMIZE_TO_TRAY` off, which is on by
+default, it hides the window and keeps running. Console mode has no tray, so
+the window would be gone for good while Steam still showed the tile running
+with a Stop button — and the hidden copy would still hold the lock, so the next
+launch would fail in the way described above and stay broken until you found a
+process with no window and killed it. Instead, the wrapper watches the windows
+gamescope reports as focusable, and once Discord has shown one and then has
+none left, it quits it. Steam sees the exit, the tile goes back to "Play", and
+Big Picture has the screen again.
+
+This applies to any tile you add this way, not just Discord. Pass `--no-wrap`
+to launch a program directly, and `--keep-running` in the launch options for
+something that is meant to live in a tray.
+
+Adding the entry also gives the tile its picture. A shortcut Steam has no artwork
 for is drawn as a grey placeholder with the name printed across it, which from
 a sofa is barely distinguishable from the entry beside it. `cachy-console-art`
 finds the program's installed icon under `/usr/share/icons`, takes the

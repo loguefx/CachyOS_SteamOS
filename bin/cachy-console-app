@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""Run a desktop application inside console mode, from a Steam library tile.
+
+gamescope cannot adopt a window that belongs to your desktop, so an application
+you want to reach from the couch has to be started *inside* the session. A
+non-Steam shortcut does start it there, but two habits of ordinary desktop
+applications make a bare shortcut misbehave, and both of them look to the user
+like the tile is simply broken.
+
+The first is single-instance handling. Discord, like most Electron
+applications, takes a lock in its config directory: a second copy sees the
+lock, hands its arguments to the copy that is already running, prints
+"Quitting secondary instance" and exits zero about a second later. Steam sees
+the process it launched exit almost at once and puts the tile back to "Play",
+while the window that did get raised belongs to the desktop copy, on a screen
+console mode is not showing. Nothing appears, so the tile looks like it failed
+to start. This quits the copies already running first, and only then starts
+ours, so the lock is free and the window is one gamescope owns.
+
+The second is closing to a tray. Discord's close button does not quit it; it
+hides the window and keeps the process, unless MINIMIZE_TO_TRAY is turned off,
+and that setting defaults to on. Console mode has no tray, so the window is
+gone for good while the process lives on: Steam still shows the tile running
+with a Stop button, and gamescope has one fewer window to focus. Worse, the
+hidden copy still holds the single-instance lock, so the *next* launch fails in
+the first way described above and the tile stays broken until someone finds and
+kills a process with no window. This watches the windows gamescope says it can
+focus and, once the application has shown one and then has none left, quits it
+for real. Steam sees the exit, the tile goes back to "Play", and Big Picture
+has the screen to itself again.
+
+Usage:
+    cachy-console-app [options] -- PROGRAM [ARGS...]
+
+Steam runs it through the tile's launch options, which cachy-console-shortcut
+writes for you:
+
+    "$HOME/.local/bin/cachy-console-app" -- %command%
+"""
+
+import argparse
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+TAG = "cachy-console-app"
+
+# gamescope does not implement _NET_CLIENT_LIST -- its _NET_SUPPORTED lists only
+# _NET_ACTIVE_WINDOW -- so the windows it advertises as focusable are the only
+# window list a session offers. _NET_ACTIVE_WINDOW is no substitute: it keeps
+# naming a window that has already been unmapped, which is exactly the moment we
+# need to notice. On an ordinary desktop the usual list is there instead, which
+# is what makes this runnable from a terminal to try it out.
+GAMESCOPE_WINDOW_LIST = "GAMESCOPE_FOCUSABLE_WINDOWS"
+DESKTOP_WINDOW_LIST = "_NET_CLIENT_LIST"
+
+# /proc/PID/comm is truncated to this many characters, so a long program name
+# can only ever be compared by its prefix.
+COMM_MAX = 15
+
+NUMBER_RE = re.compile(r"0x[0-9a-fA-F]+|\d+")
+
+
+def log(msg):
+    print(f"[{TAG}] {msg}", flush=True)
+
+
+# ---- reading X11 properties ---------------------------------------------
+
+
+def run(argv, timeout=5):
+    """Output of a command, or None if it failed or could not be run."""
+    try:
+        res = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return res.stdout if res.returncode == 0 else None
+
+
+def prop_exists(text):
+    """Whether xprop found the property at all.
+
+    A missing property is still a successful run, reported as "not found." or
+    "no such atom", and it has to be told apart from a property that is present
+    but empty -- which is precisely what the focusable list looks like when an
+    application has just hidden its last window.
+    """
+    if not text:
+        return False
+    return "not found" not in text and "no such atom" not in text
+
+
+def numbers(text):
+    """The numbers in an xprop value, in order.
+
+    Two shapes turn up: `NAME(CARDINAL) = 1, 2` for gamescope's list and
+    `NAME(WINDOW): window id # 0x1e00035` for the desktop's, so the type in
+    brackets is dropped and whatever follows is scanned for ids in either base.
+    """
+    if not prop_exists(text):
+        return []
+    _, sep, rest = text.partition(")")
+    if not sep:
+        rest = text
+    out = []
+    for token in NUMBER_RE.findall(rest):
+        out.append(int(token, 16) if token.lower().startswith("0x") else int(token))
+    return out
+
+
+def strings(text):
+    """The quoted strings in an xprop value, lowercased. For WM_CLASS."""
+    if not prop_exists(text):
+        return set()
+    _, _, value = text.partition("=")
+    return {part.strip().strip('"').lower() for part in value.split(",") if part.strip()}
+
+
+class Windows:
+    """The windows a display is showing, however that display reports them."""
+
+    def __init__(self, display, xprop="xprop"):
+        self.display = display
+        self.xprop = xprop
+        # Decided once, on the first read that finds one: a display does not
+        # change from a gamescope into a desktop halfway through a session.
+        self.atom = None
+        self.owners = {}
+
+    def _prop(self, args):
+        return run([self.xprop, "-display", self.display, *args])
+
+    def listed(self):
+        """Window ids on the display, or None if the X server is unreachable."""
+        candidates = (self.atom,) if self.atom else (GAMESCOPE_WINDOW_LIST,
+                                                     DESKTOP_WINDOW_LIST)
+        for atom in candidates:
+            out = self._prop(["-root", atom])
+            if out is None:
+                return None
+            if prop_exists(out):
+                self.atom = atom
+                # gamescope repeats ids in its list; count each window once.
+                return list(dict.fromkeys(numbers(out)))
+        return None
+
+    def owner(self, window):
+        """(pid, classes) for a window, cached: neither ever changes."""
+        if window not in self.owners:
+            pids = numbers(self._prop(["-id", str(window), "_NET_WM_PID"]))
+            classes = strings(self._prop(["-id", str(window), "WM_CLASS"]))
+            self.owners[window] = (pids[0] if pids else None, classes)
+        return self.owners[window]
+
+    def forget(self, live):
+        for window in [w for w in self.owners if w not in live]:
+            del self.owners[window]
+
+
+def window_is_ours(pid, classes, our_pids, our_classes):
+    """Whether a window belongs to the application we launched.
+
+    The pid is the reliable half, but it is the pid of whichever process in the
+    application actually owns the window, which for anything Chromium-based is
+    not the one we started -- hence matching against the whole tree below us.
+    WM_CLASS covers a window that never sets _NET_WM_PID at all.
+    """
+    if pid is not None and pid in our_pids:
+        return True
+    return bool(classes & our_classes)
+
+
+def count_ours(windows, our_pids, our_classes):
+    """How many of the display's windows are ours, or None if X is gone."""
+    listed = windows.listed()
+    if listed is None:
+        return None
+    windows.forget(set(listed))
+    found = 0
+    for window in listed:
+        pid, classes = windows.owner(window)
+        if window_is_ours(pid, classes, our_pids, our_classes):
+            found += 1
+    return found
+
+
+# ---- processes ----------------------------------------------------------
+
+
+def read_text(path):
+    try:
+        with open(path) as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
+def pids_in(proc):
+    try:
+        return sorted(int(e) for e in os.listdir(proc) if e.isdigit())
+    except OSError:
+        return []
+
+
+def parent_of(pid, proc="/proc"):
+    for line in read_text(f"{proc}/{pid}/status").splitlines():
+        if line.startswith("PPid:"):
+            rest = line.split(None, 1)
+            if len(rest) > 1 and rest[1].strip().isdigit():
+                return int(rest[1].strip())
+            return None
+    return None
+
+
+def descendants(pid, proc="/proc"):
+    """This pid and every process under it."""
+    children = {}
+    for other in pids_in(proc):
+        parent = parent_of(other, proc)
+        if parent is not None:
+            children.setdefault(parent, []).append(other)
+    out, pending = set(), [pid]
+    while pending:
+        current = pending.pop()
+        if current in out:
+            continue
+        out.add(current)
+        pending.extend(children.get(current, []))
+    return out
+
+
+def instance_names(program):
+    """What a running copy of this program is likely to call itself.
+
+    /proc's comm is the name of the binary that is executing, which for a
+    launcher script is not the name of the script: /usr/bin/discord is a shell
+    wrapper that execs ~/.config/discord/app-VERSION/Discord, so the process to
+    look for is called "Discord", not "discord". Comparing basenames without
+    case covers that, and following the link covers the other common shape, a
+    symlink into /opt.
+    """
+    names = {os.path.basename(program).lower()}
+    try:
+        names.add(os.path.basename(os.path.realpath(program)).lower())
+    except OSError:
+        pass
+    return {name for name in names if name}
+
+
+def comm_matches(comm, names):
+    comm = comm.strip().lower()
+    if not comm:
+        return False
+    if comm in names:
+        return True
+    # A name longer than comm can hold only ever matches by its prefix.
+    return len(comm) >= COMM_MAX and any(name.startswith(comm) for name in names)
+
+
+def is_helper(cmdline):
+    """Whether this is one of an application's own subprocesses.
+
+    Chromium-based applications run a crowd of them from the same executable --
+    zygotes, the GPU process, one renderer per window -- all of which share the
+    main process's name and are marked by a --type= argument. Signalling one
+    would crash the application rather than close it, and counting them would
+    make a single running copy look like six. The main process takes its own
+    helpers down with it, so skipping them loses nothing.
+    """
+    return " --type=" in f" {cmdline}"
+
+
+def running_instances(names, ignore=(), proc="/proc"):
+    """PIDs of copies of the program already running: main processes only."""
+    found = []
+    ignore = set(ignore)
+    for pid in pids_in(proc):
+        if pid in ignore:
+            continue
+        if not comm_matches(read_text(f"{proc}/{pid}/comm"), names):
+            continue
+        if is_helper(read_text(f"{proc}/{pid}/cmdline").replace("\0", " ")):
+            continue
+        found.append(pid)
+    return found
+
+
+def still_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def stop(pids, grace, sleep=time.sleep, send=os.kill, alive=still_alive, step=0.25):
+    """Ask these processes to quit, then insist. True if asking was enough.
+
+    SIGTERM is a real quit for the applications this is aimed at: Electron turns
+    it into the same shutdown the close button would perform if it were not
+    hiding to a tray, so the lock in the config directory is released properly
+    and the next launch is not a secondary instance. The kill is only there for
+    something already wedged.
+    """
+    pids = [pid for pid in pids if alive(pid)]
+    for pid in pids:
+        try:
+            send(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    waited = 0.0
+    while pids and waited < grace:
+        sleep(step)
+        waited += step
+        pids = [pid for pid in pids if alive(pid)]
+    if not pids:
+        return True
+    for pid in pids:
+        try:
+            send(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    return False
+
+
+# ---- deciding that the last window has gone ------------------------------
+
+
+class CloseWatch:
+    """Decides when an application has put its last window away.
+
+    Arming only once a window has been seen is the point of this. An
+    application can take a while to map its first one -- Discord shows a splash,
+    checks for updates, and only then opens the real window -- and quitting it
+    during that would look exactly like the crash we are trying to prevent.
+    Something that never opens a window at all is left alone entirely, so
+    wrapping a program that is not meant to have one does no harm.
+
+    The grace period covers a window that goes away for a moment on its own
+    account, which happens when one is recreated to change fullscreen state.
+    """
+
+    def __init__(self, grace):
+        self.grace = grace
+        self.seen = False
+        self.gone_since = None
+
+    def step(self, has_window, now):
+        if has_window:
+            self.seen = True
+            self.gone_since = None
+            return False
+        if not self.seen:
+            return False
+        if self.gone_since is None:
+            self.gone_since = now
+            return False
+        return now - self.gone_since >= self.grace
+
+
+# ---- running it ----------------------------------------------------------
+
+
+def split_command(argv):
+    """Our own options end at the first `--`; the rest is the program to run.
+
+    Steam builds the command line as `cachy-console-app -- %command%`, so the
+    separator is always there in practice. Without one there is nothing to
+    separate, so everything is the program.
+    """
+    if "--" in argv:
+        cut = argv.index("--")
+        return argv[:cut], argv[cut + 1:]
+    return [], argv
+
+
+def parse_args(mine):
+    ap = argparse.ArgumentParser(
+        prog=TAG, description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--wm-class", action="append", default=[], metavar="CLASS",
+                    help="also treat windows of this WM_CLASS as the "
+                         "application's (default: the program's own name)")
+    ap.add_argument("--start-dir", default=None, metavar="DIR",
+                    help="working directory (default: your home)")
+    ap.add_argument("--close-grace", type=float, default=4.0, metavar="SECONDS",
+                    help="how long the application may have no windows before "
+                         "it counts as closed (default 4)")
+    ap.add_argument("--quit-grace", type=float, default=15.0, metavar="SECONDS",
+                    help="how long to wait for a polite quit before killing "
+                         "(default 15)")
+    ap.add_argument("--interval", type=float, default=1.0, metavar="SECONDS",
+                    help="seconds between window checks (default 1)")
+    ap.add_argument("--keep-others", action="store_true",
+                    help="do not quit copies already running, even though the "
+                         "launch will then be a secondary instance")
+    ap.add_argument("--keep-running", action="store_true",
+                    help="do not quit the application when its last window "
+                         "closes, for something that lives in a tray on purpose")
+    return ap.parse_args(mine)
+
+
+def main():
+    mine, command = split_command(sys.argv[1:])
+    if any(arg in ("-h", "--help") for arg in mine + command):
+        parse_args(["--help"])
+    args = parse_args(mine)
+
+    if not command:
+        print(f"{TAG}: nothing to run. Usage: {TAG} [options] -- PROGRAM [ARGS]",
+              file=sys.stderr)
+        return 2
+
+    program = command[0]
+    name = os.path.basename(program)
+    names = instance_names(program)
+    classes = set(names) | {c.lower() for c in args.wm_class}
+
+    if not args.keep_others:
+        others = running_instances(names, ignore={os.getpid()})
+        if others:
+            listed = ", ".join(str(pid) for pid in others)
+            log(f"{name} is already running outside console mode (pid {listed}); "
+                f"quitting it, because a second copy would only hand its window "
+                f"to the first one and exit")
+            if not stop(others, args.quit_grace):
+                log(f"{name} had to be killed; it may complain about an unclean "
+                    f"shutdown next time")
+
+    env = dict(os.environ)
+    # Electron chooses its display server from the environment. Console mode
+    # already unsets WAYLAND_DISPLAY, so that gamescope's X11 is the only thing
+    # left to pick, but saying so outright costs nothing and covers a session
+    # that leaked one back in.
+    env.setdefault("ELECTRON_OZONE_PLATFORM_HINT", "x11")
+    # Never the program's own directory: for anything in /usr/bin that is a
+    # read-only working directory, and an application that writes beside itself
+    # -- a crash dump, a log -- fails in a way that has nothing to do with us.
+    cwd = args.start_dir or os.path.expanduser("~")
+    if not os.path.isdir(cwd):
+        cwd = "/"
+
+    try:
+        proc = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL)
+    except OSError as exc:
+        print(f"{TAG}: cannot run {program}: {exc}", file=sys.stderr)
+        return 127
+    log(f"started {name} (pid {proc.pid}) in {cwd}")
+
+    stopping = {"now": False}
+
+    def on_signal(_signum, _frame):
+        stopping["now"] = True
+
+    # Steam's Stop button and gamescope's teardown both arrive as a signal. They
+    # have to take the application with them, or it survives the session with no
+    # window and no way to reach it.
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, on_signal)
+
+    display = os.environ.get("DISPLAY", "")
+    windows = Windows(display) if display and not args.keep_running else None
+    if display and args.keep_running:
+        log("not watching windows; this tile stays running until Steam stops it")
+    elif not display:
+        log("DISPLAY is not set, so windows cannot be watched: if this "
+            "application closes to a tray, Steam will keep showing it as running")
+    watch = CloseWatch(args.close_grace)
+    reason = None
+
+    while True:
+        code = proc.poll()
+        if code is not None:
+            log(f"{name} exited with status {code}")
+            return code
+        if stopping["now"]:
+            reason = "console mode is shutting down"
+            break
+        if windows is not None:
+            ours = count_ours(windows, descendants(proc.pid), classes)
+            if ours is None:
+                reason = "the display went away"
+                break
+            if ours and not watch.seen:
+                log(f"{name} has a window; it will be quit when that closes")
+            if watch.step(ours > 0, time.monotonic()):
+                reason = ("it closed its last window but kept running, which "
+                          "in a session with no tray means it is gone for good")
+                break
+        time.sleep(args.interval)
+
+    log(f"quitting {name}: {reason}")
+    stop([proc.pid], args.quit_grace)
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    # The application may have left parts of itself behind, re-parented away
+    # from us. Leaving one running would hold the single-instance lock and break
+    # the next launch, which is the failure this whole wrapper exists to avoid.
+    leftover = running_instances(names, ignore={os.getpid()})
+    if leftover:
+        log(f"{name} left {len(leftover)} process(es) behind; quitting those too")
+        stop(leftover, args.quit_grace)
+    # Steam reads a non-zero status as the tile having failed, and a tile the
+    # user closed on purpose has not.
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

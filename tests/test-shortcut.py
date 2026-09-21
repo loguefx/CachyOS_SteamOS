@@ -113,6 +113,51 @@ check("a Discord run leaves an old projector-exit tile alone",
       ies.find_entry(old, DISCORD, "Discord"), None)
 
 print()
+print("launching a program through the wrapper:")
+# A desktop application in a Steam library needs cachy-console-app around it:
+# without it a second copy hands its window to the desktop copy and exits, and
+# closing the window only hides it while Steam keeps showing the tile running.
+WRAPPER = "/home/me/.local/bin/cachy-console-app"
+wrapped = ies.build_entry(DISCORD, "Discord", "", WRAPPER)
+check("the wrapper goes in the launch options",
+      wrapped["LaunchOptions"], f'"{WRAPPER}" -- %command%')
+# %command% is Steam's placeholder for the entry's own Exe, so the tile still
+# points at the real program.
+check("the entry still runs the program itself", wrapped["Exe"], f'"{DISCORD}"')
+# The appid is the crc32 of Exe plus AppName. Moving the program to the wrapper
+# would renumber the tile and orphan its artwork, its controller layout and any
+# AUDIO_NEVER_MUTE entry naming it.
+check("so wrapping does not move the appid",
+      wrapped["appid"], ies.build_entry(DISCORD, "Discord")["appid"])
+check("which is the id the user already has", wrapped["appid"], 3214031495)
+
+# The exit tile opens no window and is meant to return at once, so a wrapper
+# waiting for a window to appear would be waiting forever.
+exit_tile = ies.build_entry(EXE, NAME, "", WRAPPER)
+check("the exit tile is never wrapped", exit_tile["LaunchOptions"], "")
+legacy_tile = ies.build_entry("/home/me/.local/bin/projector-exit",
+                              "Exit Game Mode", "", WRAPPER)
+check("nor is the old projector-exit tile", legacy_tile["LaunchOptions"], "")
+check("and --no-wrap leaves any tile alone",
+      ies.build_entry(DISCORD, "Discord", "", None)["LaunchOptions"], "")
+
+print()
+print("where a tile starts:")
+# Steam's own default is the program's directory. For /usr/bin that is not
+# writable, and an application that drops a log or a crash file beside itself
+# fails for a reason that has nothing to do with console mode.
+home = os.path.expanduser("~")
+check("a program in /usr/bin starts in your home instead",
+      wrapped["StartDir"], f'"{home}/"')
+check("and so does one in /opt",
+      ies.build_entry("/opt/thing/thing", "Thing")["StartDir"], f'"{home}/"')
+check("a program somewhere of your own keeps its own directory",
+      ies.build_entry("/home/me/.local/bin/cachy-console-exit", NAME)["StartDir"],
+      '"/home/me/.local/bin/"')
+check("the working directory is not part of the appid",
+      ies.build_entry(DISCORD, "Discord")["appid"], 3214031495)
+
+print()
 print("first run, with no library yet:")
 check("a missing file reads as an empty library",
       ies.load(os.path.join(tempfile.mkdtemp(), "absent.vdf")), {"shortcuts": {}})

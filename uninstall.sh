@@ -33,7 +33,8 @@ systemctl --user daemon-reload 2>/dev/null || true
 say "== commands =="
 for tool in cachy-console cachy-console-display cachy-console-watch \
             cachy-console-audio cachy-console-exit cachy-console-shortcut \
-            cachy-console-art cachy-console-settings cachy-console-session; do
+            cachy-console-app cachy-console-art cachy-console-settings \
+            cachy-console-session; do
     if [[ -e "$BIN_DIR/$tool" ]]; then
         rm -f "$BIN_DIR/$tool"
         say "  removed $tool"

@@ -20,8 +20,20 @@ owned by your desktop, so it has to be started inside the session:
 
     cachy-console shortcut --name Discord --exe /usr/bin/discord
 
+Such an entry is launched through cachy-console-app rather than directly,
+because a desktop application dropped into a Steam library needs two things
+Steam will not do for it: the copy already running on the desktop has to be
+quit, or the new one hands its window to that copy and exits as a secondary
+instance, and the application has to be quit for real once its window closes,
+since a session with no tray cannot bring back something that merely hid
+itself. That goes in the tile's launch options rather than replacing its Exe,
+so the appid Steam derives from the path does not move and anything keyed to it
+-- an AUDIO_NEVER_MUTE entry, a controller layout, the artwork below -- keeps
+matching. The exit tile is never wrapped: it opens no window and is meant to
+return immediately.
+
 Usage:
-    cachy-console shortcut [--dry-run] [--revert] [--force]
+    cachy-console shortcut [--dry-run] [--revert] [--force] [--no-wrap]
                            [--name NAME] [--exe PATH]
                            [--icon PATH] [--no-art]
 """
@@ -131,14 +143,13 @@ def shortcut_appid(exe, name):
     return zlib.crc32((exe + name).encode("utf-8")) | 0x80000000
 
 
-def default_exe():
-    """Where cachy-console-exit lives.
+def sibling(name):
+    """Where one of our own helpers lives.
 
     Steam stores an absolute path in shortcuts.vdf and launches it with its own
     environment, so this has to be resolved now rather than left to a PATH that
     Steam may not share.
     """
-    name = "cachy-console-exit"
     here = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
     if os.access(here, os.X_OK):
         return here
@@ -146,6 +157,10 @@ def default_exe():
     if found:
         return found
     return os.path.expanduser(f"~/.local/bin/{name}")
+
+
+def default_exe():
+    return sibling("cachy-console-exit")
 
 
 def steam_running():
@@ -239,18 +254,52 @@ def next_index(shortcuts):
     return str(max(used) + 1 if used else 0)
 
 
-def build_entry(exe, name, icon=""):
+# Directories that are not the user's to write into, so not somewhere to leave
+# a program sitting while it runs.
+SYSTEM_PREFIXES = ("/usr/", "/bin/", "/sbin/", "/opt/", "/nix/")
+
+
+def start_dir(exe):
+    """The working directory the tile should start in.
+
+    Steam's own default for a shortcut is the program's own directory, which
+    for anything in /usr/bin is a directory nobody can write to. Most programs
+    do not care; one that drops a log or a crash file beside itself fails for a
+    reason that has nothing to do with console mode. So a program living
+    somewhere system-owned starts in the user's home instead.
+    """
+    where = os.path.dirname(exe)
+    if not where or any(f"{where}/".startswith(prefix) for prefix in SYSTEM_PREFIXES):
+        return os.path.expanduser("~")
+    return where
+
+
+def launch_options(exe, name, wrapper):
+    """How Steam should run this tile.
+
+    %command% is Steam's placeholder for the entry's own Exe and arguments, so
+    putting the wrapper here runs the program through it without the library
+    entry pointing anywhere else. That is the whole reason it goes in the
+    launch options: the appid is derived from the Exe, and moving the Exe to
+    the wrapper would renumber the tile and orphan its artwork and settings.
+    """
+    if wrapper is None or manages_exit_entry(exe, name):
+        return ""
+    return f'"{wrapper}" -- %command%'
+
+
+def build_entry(exe, name, icon="", wrapper=None):
     quoted = f'"{exe}"'       # Steam stores Exe and StartDir quoted
     return {
         "appid": shortcut_appid(quoted, name),
         "AppName": name,
         "Exe": quoted,
-        "StartDir": f'"{os.path.dirname(exe)}/"',
+        "StartDir": f'"{start_dir(exe)}/"',
         # Separate from the grid artwork: this is the small icon Steam shows
         # in list views and in the running-game banner.
         "icon": icon,
         "ShortcutPath": "",
-        "LaunchOptions": "",
+        "LaunchOptions": launch_options(exe, name, wrapper),
         "IsHidden": 0,
         "AllowDesktopConfig": 1,
         "AllowOverlay": 1,
@@ -280,6 +329,10 @@ def main():
                                    "(default: the program's installed icon)")
     ap.add_argument("--no-art", action="store_true",
                     help="add the entry but leave its tile blank")
+    ap.add_argument("--no-wrap", action="store_true",
+                    help="launch the program directly, without the helper that "
+                         "frees its single-instance lock and quits it when its "
+                         "window closes")
     args = ap.parse_args()
 
     if not args.dry_run and steam_running() and not args.force:
@@ -310,6 +363,11 @@ def main():
             icon = artwork.install(args.exe, args.name, args.icon,
                                    args.dry_run) or icon
 
+    wrapper = None if args.no_wrap else sibling("cachy-console-app")
+    options = launch_options(args.exe, args.name, wrapper)
+    if options:
+        print(f"launching through {wrapper}")
+
     for path in paths:
         account = os.path.basename(os.path.dirname(os.path.dirname(path)))
         print(f"account {account}:")
@@ -332,11 +390,11 @@ def main():
             obj["shortcuts"] = {str(n): v for n, v in enumerate(shortcuts.values())}
             print(f"  removing {args.name!r}")
         else:
-            entry = build_entry(args.exe, args.name, icon)
+            entry = build_entry(args.exe, args.name, icon, wrapper)
             if existing is not None:
                 old_name = shortcuts[existing].get("AppName") or args.name
                 if old_name in LEGACY_NAMES and old_name != args.name:
-                    entry = build_entry(args.exe, old_name, icon)
+                    entry = build_entry(args.exe, old_name, icon, wrapper)
                 shortcuts[existing] = entry
                 print(f"  updating existing entry {existing} -> {entry['AppName']!r} ({args.exe})")
             else:
