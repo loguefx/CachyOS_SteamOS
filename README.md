@@ -254,6 +254,18 @@ console mode only, so the device is still a gamepad on the desktop:
 cachy-console controllers   # names, USB ids, and which slot each one holds
 ```
 
+**Why the preload goes on Steam, not on gamescope.** `LD_PRELOAD` is set on the
+`env` that gamescope execs rather than exported into gamescope itself, and that
+placement is load-bearing. gamescope carries `CAP_SYS_NICE` for realtime
+scheduling, and file capabilities put a process into glibc's secure-execution
+mode, where `LD_PRELOAD` is only honoured for set-user-ID libraries. glibc does
+not merely ignore it there — it *strips* it from the environment so it cannot
+reach children. An exported `LD_PRELOAD` therefore reached neither gamescope nor
+the Steam it started, and the trackpad moved nothing whatsoever, with the only
+clue a single `cannot be preloaded` line. Realtime frame pacing and the trackpad
+fix are both wanted, so the preload is handed to `env`, which has no
+capabilities, and lands on Steam alone — the only process making XTEST calls.
+
 **The trackpad prompt.** Steam drives the controller trackpad through XTEST. On
 Wayland, XWayland turns that into an xdg-desktop-portal request — the "allow
 remote interaction" dialog — and the permission dies with the Steam process, so
@@ -313,6 +325,18 @@ cachy-console controllers   # the one on js0 is player one
 
 Put that device's USB id in `IGNORE_CONTROLLERS`, then exit and Steam-button
 twice. It stays a gamepad on the desktop.
+
+**No cursor at all from the trackpad.** Check for this line when console mode
+starts:
+
+```
+ERROR: ld.so: object 'libextest.so' from LD_PRELOAD cannot be preloaded
+```
+
+It means the preload was refused, so nothing is translating Steam's XTEST calls
+and there is no cursor to move — XTEST on its own moves nothing inside
+gamescope. The usual cause is the preload being set on a process that carries
+file capabilities; see "Why the preload goes on Steam" above.
 
 ## Not supported
 

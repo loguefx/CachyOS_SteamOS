@@ -174,15 +174,16 @@ extest_available() {
     [[ -e /usr/lib32/libextest.so || -e /usr/lib/libextest.so ]]
 }
 
-use_extest() {
+extest_wanted() {
+    is_on "$CFG_TRACKPAD_FIX" && extest_available
+}
+
+warn_extest() {
     is_on "$CFG_TRACKPAD_FIX" || return 0
-    if ! extest_available; then
-        warn "libextest is not installed, so the controller trackpad will keep"
-        warn "asking for permission to move the cursor."
-        warn "install it with: paru -S libextest-git   (or yay -S libextest-git)"
-        return 0
-    fi
-    export LD_PRELOAD="${EXTEST_LIB}${LD_PRELOAD:+:$LD_PRELOAD}"
+    extest_available && return 0
+    warn "libextest is not installed, so the controller trackpad will keep"
+    warn "asking for permission to move the cursor."
+    warn "install it with: paru -S libextest-git   (or yay -S libextest-git)"
 }
 
 # ---- gamescope ----------------------------------------------------------
@@ -232,8 +233,19 @@ gamescope_argv() {
     # Strip WAYLAND_DISPLAY and force toolkit dialogs onto gamescope's X11.
     out+=(-- env -u WAYLAND_DISPLAY
           GDK_BACKEND=x11
-          QT_QPA_PLATFORM=xcb
-          steam -gamepadui)
+          QT_QPA_PLATFORM=xcb)
+
+    # The preload is set on Steam here rather than exported, because gamescope
+    # carries CAP_SYS_NICE for realtime scheduling and file capabilities put a
+    # process into glibc's secure-execution mode. There LD_PRELOAD is not merely
+    # ignored -- glibc strips it from the environment so it cannot reach
+    # children -- so exporting it reached neither gamescope nor the Steam it
+    # starts, and the trackpad moved nothing at all. Handing it to env, which has
+    # no capabilities, sets it on Steam alone, which is the only process that
+    # makes XTEST calls anyway.
+    extest_wanted && out+=("LD_PRELOAD=${EXTEST_LIB}${LD_PRELOAD:+:$LD_PRELOAD}")
+
+    out+=(steam -gamepadui)
 }
 
 start_console() {
@@ -266,7 +278,7 @@ It will not choose a screen for you."
     fi
 
     say "Console mode on $CONNECTOR at ${WIDTH}x${HEIGHT}@${REFRESH}Hz."
-    use_extest
+    warn_extest
     stop_steam
 
     # One GPU HDMI profile is visible at a time. Steam's audio list is that
