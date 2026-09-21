@@ -41,7 +41,7 @@ CFG_RESOLUTION=auto
 CFG_REFRESH=auto
 CFG_HDR=off
 CFG_VRR=on
-CFG_TRACKPAD_FIX=on
+CFG_TRACKPAD_FIX=off
 CFG_AUDIO_DEVICE=""
 CFG_AUDIO_INPUT_DEVICE=""
 CFG_IGNORE_CONTROLLERS=""
@@ -165,11 +165,17 @@ Quit the game first, or set CACHY_CONSOLE_FORCE=1 to override."
     sleep 2
 }
 
-# Steam drives the controller trackpad through XTEST. On Wayland, XWayland turns
-# the first XTEST call into an xdg-desktop-portal RemoteDesktop request -- the
-# "allow remote interaction" dialog -- and the permission dies with the Steam
-# process, so it returns on every restart. extest implements those XTEST calls
-# against /dev/uinput instead, so there is nothing to approve.
+# Steam drives the controller trackpad through XTEST, and extest reimplements
+# those calls against /dev/uinput so a desktop Wayland session does not turn the
+# first one into an xdg-desktop-portal "allow remote interaction" prompt.
+#
+# Off by default, because inside gamescope it is the wrong answer and actively
+# breaks the trackpad. gamescope emulates input itself -- it logs "Successfully
+# initialized libei for input emulation" -- so XTEST aimed at its XWayland lands
+# on its own cursor and the trackpad simply works. extest intercepts those calls
+# first and replays them against the *host* seat, in host coordinates, which
+# leaves gamescope's cursor untouched and nothing to click. Only turn this on for
+# a gamescope too old to emulate input, where the portal prompt appears instead.
 extest_available() {
     [[ -e /usr/lib32/libextest.so || -e /usr/lib/libextest.so ]]
 }
@@ -178,12 +184,27 @@ extest_wanted() {
     is_on "$CFG_TRACKPAD_FIX" && extest_available
 }
 
+# Whether gamescope can emulate input, which is what lets the trackpad move its
+# cursor without help. Read from the link against libeis rather than from a
+# version number, since distributions differ on when the feature arrived.
+gamescope_emulates_input() {
+    have gamescope || return 1
+    local libs
+    libs="$(ldd "$(command -v gamescope)" 2>/dev/null || true)"
+    [[ "$libs" == *libeis.so* ]]
+}
+
 warn_extest() {
     is_on "$CFG_TRACKPAD_FIX" || return 0
-    extest_available && return 0
-    warn "libextest is not installed, so the controller trackpad will keep"
-    warn "asking for permission to move the cursor."
-    warn "install it with: paru -S libextest-git   (or yay -S libextest-git)"
+    if ! extest_available; then
+        warn "TRACKPAD_FIX is on but libextest is not installed."
+        warn "install it with: paru -S libextest-git   (or yay -S libextest-git)"
+        return 0
+    fi
+    gamescope_emulates_input || return 0
+    warn "TRACKPAD_FIX is on, but this gamescope emulates input itself, so extest"
+    warn "will replay the trackpad on the desktop and console mode will have no"
+    warn "cursor at all. Set TRACKPAD_FIX=off unless you know you need it."
 }
 
 # ---- gamescope ----------------------------------------------------------
@@ -384,8 +405,11 @@ VRR=$CFG_VRR
 # HDR. Only worth turning on if the display and your games support it.
 HDR=$CFG_HDR
 
-# Stop the Steam controller's trackpad from asking permission to move the
-# cursor every time Steam restarts. Needs libextest installed.
+# Preload extest so Steam's trackpad XTEST calls become uinput events, which a
+# desktop Wayland session needs to avoid an "allow remote interaction" prompt.
+# Leave this off: gamescope emulates input itself, so the trackpad already moves
+# its cursor, and extest would replay the calls on the desktop instead -- no
+# cursor in console mode at all. Only for a gamescope too old to emulate input.
 TRACKPAD_FIX=$CFG_TRACKPAD_FIX
 
 # Open console mode when you press the Steam button twice on a controller.
@@ -536,29 +560,38 @@ status() {
     fi
 
     say
-    say "== controller =="
-    if extest_available; then
-        say "  libextest is installed, so the trackpad will not ask for permission."
+    say "== trackpad =="
+    if gamescope_emulates_input; then
+        say "  gamescope emulates input, so it moves the trackpad cursor itself."
+    else
+        say "  this gamescope does not emulate input (no libeis), so the trackpad"
+        say "  needs TRACKPAD_FIX=on to move a cursor."
+    fi
+    if is_on "$CFG_TRACKPAD_FIX"; then
+        if ! extest_available; then
+            warn "TRACKPAD_FIX is on but libextest is not installed."
+            say "       paru -S libextest-git"
+            warnings=$(( warnings + 1 ))
+        elif gamescope_emulates_input; then
+            warn "TRACKPAD_FIX is on while gamescope emulates input. extest replays"
+            warn "the trackpad on the desktop instead, so console mode gets no"
+            warn "cursor. Set TRACKPAD_FIX=off."
+            warnings=$(( warnings + 1 ))
+        fi
         # A bare soname resolves through the linker cache. Captured rather than
         # piped into grep -q, which SIGPIPEs ldconfig and trips pipefail.
         local cache
         cache="$(ldconfig -p 2>/dev/null || true)"
-        if [[ "$EXTEST_LIB" != /* && "$cache" != *"$EXTEST_LIB"* ]]; then
+        if extest_available && [[ "$EXTEST_LIB" != /* && "$cache" != *"$EXTEST_LIB"* ]]; then
             warn "$EXTEST_LIB is not in the linker cache; run: sudo ldconfig"
             warnings=$(( warnings + 1 ))
         fi
+        if [[ ! -w /dev/uinput ]]; then
+            warn "/dev/uinput is not writable, so extest cannot inject input."
+            warnings=$(( warnings + 1 ))
+        fi
     else
-        say "  libextest is NOT installed."
-        say "     Without it, the Steam controller's trackpad asks permission to"
-        say "     move the cursor every time Steam restarts. Install with:"
-        say "       paru -S libextest-git"
-        warnings=$(( warnings + 1 ))
-    fi
-    if [[ -w /dev/uinput ]]; then
-        say "  /dev/uinput is writable."
-    else
-        warn "/dev/uinput is not writable, so libextest cannot inject input."
-        warnings=$(( warnings + 1 ))
+        say "  TRACKPAD_FIX is off."
     fi
 
     say

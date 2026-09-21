@@ -175,7 +175,7 @@ edit by hand:
 | `REFRESH` | `auto` | Follow the display's current setting, or force e.g. `120` |
 | `VRR` | `on` | FreeSync / G-Sync inside console mode |
 | `HDR` | `off` | Only worth enabling if display and games support it |
-| `TRACKPAD_FIX` | `on` | Preload libextest so the trackpad stops asking permission |
+| `TRACKPAD_FIX` | `off` | Preload libextest for the trackpad. Only for a gamescope that cannot emulate input; on a modern one it sends the cursor to the desktop instead |
 | `STEAM_BUTTON` | `on` | Let the Steam button open console mode |
 | `AUDIO_FOCUS` | `on` | Mute games you are not looking at |
 | `AUDIO_DEVICE` | *(follows display)* | HDMI monitor name (`Optoma UHD`) or device (`RODECaster Duo`). Kept until you change it in **Cachy Console** settings |
@@ -254,17 +254,25 @@ console mode only, so the device is still a gamepad on the desktop:
 cachy-console controllers   # names, USB ids, and which slot each one holds
 ```
 
-**Why the preload goes on Steam, not on gamescope.** `LD_PRELOAD` is set on the
-`env` that gamescope execs rather than exported into gamescope itself, and that
-placement is load-bearing. gamescope carries `CAP_SYS_NICE` for realtime
-scheduling, and file capabilities put a process into glibc's secure-execution
-mode, where `LD_PRELOAD` is only honoured for set-user-ID libraries. glibc does
-not merely ignore it there — it *strips* it from the environment so it cannot
-reach children. An exported `LD_PRELOAD` therefore reached neither gamescope nor
-the Steam it started, and the trackpad moved nothing whatsoever, with the only
-clue a single `cannot be preloaded` line. Realtime frame pacing and the trackpad
-fix are both wanted, so the preload is handed to `env`, which has no
-capabilities, and lands on Steam alone — the only process making XTEST calls.
+**The trackpad, and why `TRACKPAD_FIX` is off.** Steam moves the trackpad cursor
+by making XTEST calls against whatever X server it is on, and gamescope's own
+XWayland handles them: gamescope is linked against `libeis` and logs
+`Successfully initialized libei for input emulation`, so an XTEST call lands on
+gamescope's cursor and the trackpad just works. extest intercepts those calls
+before they get there and replays them against the *host* seat in host
+coordinates — it will happily report your desktop's monitors while doing it —
+which leaves gamescope's cursor untouched and nothing to click. So the fix for a
+desktop session is the thing that breaks a gamescope one, and it stays off unless
+your gamescope is too old to emulate input. `cachy-console status` reads the
+`libeis` link and says which case you are in.
+
+If you do turn it on, note where the preload is set: on the `env` that gamescope
+execs, never exported. gamescope carries `CAP_SYS_NICE` for realtime scheduling,
+and file capabilities put a process into glibc's secure-execution mode, where
+`LD_PRELOAD` is only honoured for set-user-ID libraries. glibc does not merely
+ignore it there, it *strips* it from the environment so it cannot reach children
+— so an exported one reaches neither gamescope nor the Steam it starts, with the
+only clue a single `cannot be preloaded` line.
 
 **The trackpad prompt.** Steam drives the controller trackpad through XTEST. On
 Wayland, XWayland turns that into an xdg-desktop-portal request — the "allow
@@ -326,17 +334,21 @@ cachy-console controllers   # the one on js0 is player one
 Put that device's USB id in `IGNORE_CONTROLLERS`, then exit and Steam-button
 twice. It stays a gamepad on the desktop.
 
-**No cursor at all from the trackpad.** Check for this line when console mode
-starts:
+**No cursor at all from the trackpad.** Usually `TRACKPAD_FIX=on` on a gamescope
+that emulates input, which sends the trackpad to the desktop instead:
 
-```
-ERROR: ld.so: object 'libextest.so' from LD_PRELOAD cannot be preloaded
+```bash
+cachy-console status   # the "trackpad" section says which case you are in
 ```
 
-It means the preload was refused, so nothing is translating Steam's XTEST calls
-and there is no cursor to move — XTEST on its own moves nothing inside
-gamescope. The usual cause is the preload being set on a process that carries
-file capabilities; see "Why the preload goes on Steam" above.
+Set `TRACKPAD_FIX=off`, then exit and Steam-button twice. If it is already off,
+check for `cannot be preloaded` in the startup output — that means the opposite
+problem, a preload that was refused rather than one that hijacked the cursor.
+
+| gamescope | `TRACKPAD_FIX=off` | `TRACKPAD_FIX=on` |
+| --- | --- | --- |
+| linked against `libeis` | cursor works | no cursor |
+| not linked | no cursor | cursor works |
 
 ## Not supported
 
