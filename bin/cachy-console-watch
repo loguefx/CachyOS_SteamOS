@@ -36,6 +36,11 @@ import subprocess
 import sys
 import time
 
+# Turned off on purpose, as opposed to having stopped working. The service is set
+# to come back from anything else, including a plain kill, so it needs a way to
+# say "do not" that systemd can tell apart from exiting cleanly.
+EXIT_DISABLED = 78
+
 # WM_CLASS of Steam's own windows (desktop client and Big Picture alike).
 STEAM_CLASSES = {"steam", "steamwebhelper"}
 # WM_CLASS of a running game, e.g. steam_app_1623730.
@@ -455,7 +460,7 @@ def main():
     # something the user has to remember to disable in systemd as well.
     if config.get("STEAM_BUTTON", "on").lower() in ("off", "no", "0", "false"):
         log("STEAM_BUTTON is off in the config; nothing to do.")
-        return 0
+        return EXIT_DISABLED
     display = args.display
     display_locked = bool(args.display)
     if not display_locked:

@@ -4,12 +4,22 @@ Documentation=https://github.com/loguefx/CachyOS_SteamOS
 # Needs DISPLAY and XAUTHORITY to read which app gamescope has focused.
 PartOf=graphical-session.target
 After=graphical-session.target
+StartLimitIntervalSec=5min
+StartLimitBurst=10
 
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/cachy-console-session %h/.local/bin/cachy-console-audio
-Restart=on-failure
+# always, not on-failure: exiting cleanly still leaves games sharing the speakers
+# with nothing to sort them out, and nothing to say why.
+Restart=always
 RestartSec=5
+# Except when the config turns it off, which is the one exit worth respecting.
+# Both halves are needed: RestartPreventExitStatus stops the restarting, and
+# SuccessExitStatus stops a deliberate opt-out from being reported as a
+# failure the user is meant to go and look into.
+RestartPreventExitStatus=78
+SuccessExitStatus=78
 # On stop it unmutes everything it muted, so it has to receive the signal and
 # run that cleanup rather than being killed outright.
 KillSignal=SIGTERM

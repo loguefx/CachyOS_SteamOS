@@ -40,6 +40,11 @@ POLL = 0.5                     # while a session is running
 IDLE_POLL = 2.0                # while nothing is going on
 X11_SOCKET_DIR = "/tmp/.X11-unix"
 
+# Turned off on purpose, as opposed to having stopped working. The service is set
+# to come back from anything else, including a plain kill, so it needs a way to
+# say "do not" that systemd can tell apart from exiting cleanly.
+EXIT_DISABLED = 78
+
 # Steam's own ids: the client, and Big Picture itself. Their sounds are part of
 # the interface, so they keep playing while a game is focused.
 NON_GAME_APPIDS = {0, 7, 769}
@@ -644,7 +649,7 @@ def main():
 
     if not audio_focus_enabled():
         log("AUDIO_FOCUS is off in the config; nothing to do.")
-        return 0
+        return EXIT_DISABLED
 
     focus = AudioFocus(verbose=args.verbose, dry_run=args.dry_run)
 

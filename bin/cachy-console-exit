@@ -13,16 +13,34 @@
 #   in your Steam library              controller
 #   a keyboard shortcut                bound to this command
 #
-# It ends console mode by stopping gamescope. Steam is gamescope's child, so
-# both close and the desktop comes back; cachy-console-watch then restarts the
-# ordinary Steam client so the Steam button works again.
+# It ends console mode by asking Steam to shut down. Steam is gamescope's primary
+# child, so gamescope follows it out on its own, and Steam gets to save what it
+# was doing instead of dying mid-write. Signalling gamescope is still here as a
+# fallback, because a Steam busy with a running game does not always answer, but
+# it is no longer the first thing tried: gamescope sat on SIGTERM for the whole
+# grace period and then had to be killed, which took ten seconds the user spent
+# looking at a screen that had not changed, and left Steam convinced it had
+# crashed. cachy-console then restarts the ordinary desktop client so the Steam
+# button works again.
+#
+# With no session to end it closes Big Picture instead, because the Steam button
+# opens Big Picture on the desktop whenever the watcher is not running to turn it
+# into one, and this tile is in the same library either way.
 #
 #   cachy-console-exit           stop the session
 #   cachy-console-exit --running exit 0 if a console session is up
 set -euo pipefail
 
-GRACE=10
+# How long Steam gets to close itself before gamescope is signalled. It takes a
+# couple of seconds in practice; the rest is headroom for a slow shutdown. Both
+# waits are overridable so the tests need not sit through them.
+QUIT="${CACHY_CONSOLE_QUIT:-8}"
+GRACE="${CACHY_CONSOLE_GRACE:-10}"
 TAG="cachy-console-exit"
+
+# Where to look for running processes. Only the tests set this; they have no way
+# to put a gamescope into the real /proc.
+PROC="${CACHY_CONSOLE_PROC:-/proc}"
 
 log() { printf '%s: %s\n' "$TAG" "$*" >&2; }
 
@@ -30,7 +48,7 @@ log() { printf '%s: %s\n' "$TAG" "$*" >&2; }
 # finds nothing while a session is plainly running.
 is_gamescope() {
     local comm
-    comm="$(cat "/proc/$1/comm" 2>/dev/null)" || return 1
+    comm="$(cat "$PROC/$1/comm" 2>/dev/null)" || return 1
     [[ "$comm" == gamescope || "$comm" == gamescope-wl ]]
 }
 
@@ -41,7 +59,7 @@ is_zombie() {
     while read -r line; do
         [[ "$line" == State:* ]] || continue
         [[ "$line" == *Z* ]] && return 0 || return 1
-    done < "/proc/$1/status" 2>/dev/null
+    done 2>/dev/null < "$PROC/$1/status"
     return 1
 }
 
@@ -58,13 +76,13 @@ is_console_cmdline() {
 }
 
 cmdline_of() {
-    tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null || true
+    tr '\0' ' ' < "$PROC/$1/cmdline" 2>/dev/null || true
 }
 
 console_gamescope_pids() {
     local pid comm cmd
-    for pid in /proc/[0-9]*; do
-        pid="${pid#/proc/}"
+    for pid in "$PROC"/[0-9]*; do
+        pid="${pid##*/}"
         [[ "$pid" == *[0-9]* && "$pid" != *[^0-9]* ]] || continue
         alive_gamescope "$pid" || continue
         cmd="$(cmdline_of "$pid")"
@@ -80,7 +98,7 @@ ppid_of() {
             printf '%s\n' "${line#PPid:}" | tr -d '[:space:]'
             return 0
         fi
-    done < "/proc/$1/status"
+    done 2>/dev/null < "$PROC/$1/status"
     return 1
 }
 
@@ -100,6 +118,8 @@ find_ancestor() {
     return 1
 }
 
+steam_running() { pgrep -x steam >/dev/null 2>&1; }
+
 stop_pid() {
     local pid=$1
     log "leaving console mode (gamescope pid $pid)"
@@ -108,15 +128,37 @@ stop_pid() {
     # the signal has to come from something that outlives us. Steam also
     # expects the thing it launched to return promptly.
     setsid bash -c '
-        pid=$1 grace=$2
+        pid=$1 quit=$2 grace=$3
+        # Long enough for the tile to have returned, so Steam is not asked to
+        # close while it still counts us as a running game.
         sleep 0.4
+        kill -0 "$pid" 2>/dev/null || exit 0
+
+        # The polite way out, and the quick one. gamescope stops when its primary
+        # child does, so closing Steam closes the session.
+        if command -v steam >/dev/null 2>&1; then
+            steam -shutdown >/dev/null 2>&1 &
+            for _ in $(seq "$quit"); do
+                kill -0 "$pid" 2>/dev/null || exit 0
+                sleep 1
+            done
+        fi
+
         kill -TERM "$pid" 2>/dev/null || exit 0
         for _ in $(seq "$grace"); do
             kill -0 "$pid" 2>/dev/null || exit 0
             sleep 1
         done
         kill -KILL "$pid" 2>/dev/null || true
-    ' _ "$pid" "$GRACE" >/dev/null 2>&1 < /dev/null &
+    ' _ "$pid" "$QUIT" "$GRACE" >/dev/null 2>&1 < /dev/null &
+}
+
+# Steam's own way back to the desktop client. Detached for the same reason as
+# stop_pid: Steam is running this tile, and we are asking Steam to change what it
+# is showing, which it does by tearing down the window our caller came from.
+leave_big_picture() {
+    log "no console session; asking Steam to leave Big Picture."
+    setsid steam steam://close/bigpicture >/dev/null 2>&1 < /dev/null &
 }
 
 if [[ "${1-}" == --running ]]; then
@@ -125,7 +167,7 @@ if [[ "${1-}" == --running ]]; then
 fi
 
 if [[ "${1-}" == -h || "${1-}" == --help ]]; then
-    sed -n '2,22p' "$0" | sed 's/^# \?//'
+    sed -n '2,31p' "$0" | sed 's/^# \?//'
     exit 0
 fi
 
@@ -136,7 +178,13 @@ else
     mapfile -t targets < <(console_gamescope_pids)
 fi
 if (( ${#targets[@]} == 0 )) || [[ -z "${targets[0]:-}" ]]; then
-    log "console mode is not running; nothing to do."
+    # Only with a client already up. Any steam:// URL starts Steam if it has to,
+    # and an exit that launches Steam is the opposite of what was asked for.
+    if steam_running; then
+        leave_big_picture
+    else
+        log "console mode is not running; nothing to do."
+    fi
     exit 0
 fi
 

@@ -126,6 +126,20 @@ The library entry is the one you want on a couch: it appears among your games,
 so you can launch it with the controller and end up back at your desktop.
 Favourite it, or pin it to your home shelf, and it becomes a one-click exit.
 
+Leaving asks Steam to close itself rather than signalling gamescope. Steam is
+gamescope's primary child, so the session follows it out, which takes a couple of
+seconds instead of the ten that signalling took — gamescope ignores `SIGTERM`, so
+it had to be killed once the grace period ran out, and Steam came back up
+convinced it had crashed. Signals are still the fallback for a Steam that will
+not answer, which is mostly a Steam with a game still running.
+
+If there is no session to leave, it closes Big Picture instead. That happens when
+Big Picture is open on the desktop rather than in gamescope — the Steam button
+does not launch anything, it asks the client that is already running to switch to
+Big Picture, so with the watcher stopped you get Big Picture on whichever screen
+the desktop client chose. The tile is in the same library either way, and
+answering "console mode is not running" left you in Big Picture with no way out.
+
 Either way you get your ordinary Steam back with it, minimised to the tray, so
 the next double press on the Steam button opens console mode again without your
 having to go and start Steam first. Turn that off with `RESTART_STEAM=off`.
@@ -351,6 +365,23 @@ it returns on every restart. libextest implements those calls against
 **It opened on the wrong screen.** Search for **Cachy Console**, save the
 display you want, then if gamescope is already running exit and Steam-button
 twice so the next session uses it.
+
+**It opened on the wrong screen and "Exit Console Mode" does nothing.** Those two
+together mean it is not console mode at all: it is Big Picture on the desktop,
+and there is no session for the tile to end. A double press on the Steam button
+does not launch anything — it asks the running client to switch to Big Picture —
+so when the watcher is not there to turn that into a session, you get Big Picture
+wherever the desktop client put it, usually the primary screen. Check with
+`cachy-console status`, which says so in the services section, and start it again
+if it has stopped:
+
+```bash
+systemctl --user start cachy-console-watch
+```
+
+The services come back on their own now, including from a plain kill, so this
+should be self-correcting; it was not before, and the symptoms pointed at
+displays rather than at a service.
 
 **Audio is on the wrong monitor.** Search for **Cachy Console** and pick the
 audio output (the projector, a headset, or another HDMI screen). That choice

@@ -5,12 +5,27 @@ Documentation=https://github.com/loguefx/CachyOS_SteamOS
 # DISPLAY and XAUTHORITY, which the desktop imports into the user manager.
 PartOf=graphical-session.target
 After=graphical-session.target
+# Restarting for the whole login is the point, but a restart loop against
+# something genuinely broken should give up instead of spinning all session.
+StartLimitIntervalSec=5min
+StartLimitBurst=10
 
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/cachy-console-session %h/.local/bin/cachy-console-watch
-Restart=on-failure
+# always, not on-failure: this watcher exiting cleanly still means the Steam
+# button has quietly stopped working, and nothing says so. Anything that kills it
+# -- a stray pkill, an OOM, a crash on a display that went away -- used to leave
+# it dead for the rest of the login, with the only symptom being that a double
+# press opens Big Picture on the desktop instead of on the television.
+Restart=always
 RestartSec=5
+# Except when the config turns it off, which is the one exit worth respecting.
+# Both halves are needed: RestartPreventExitStatus stops the restarting, and
+# SuccessExitStatus stops a deliberate opt-out from being reported as a
+# failure the user is meant to go and look into.
+RestartPreventExitStatus=78
+SuccessExitStatus=78
 # Only stop the watcher itself. The default control-group mode would take the
 # whole console-mode session, and any game running in it, down with us.
 KillMode=process

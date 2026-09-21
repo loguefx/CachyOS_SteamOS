@@ -733,13 +733,41 @@ status() {
 
     say
     say "== services =="
-    local unit
+    local unit enabled active
     for unit in "$NAME-watch" "$NAME-audio"; do
         if systemctl --user list-unit-files "$unit.service" >/dev/null 2>&1 &&
            [[ -n "$(systemctl --user list-unit-files "$unit.service" --no-legend 2>/dev/null)" ]]; then
-            printf '  %-24s %s / %s\n' "$unit" \
-                "$(systemctl --user is-enabled "$unit.service" 2>/dev/null || echo disabled)" \
-                "$(systemctl --user is-active "$unit.service" 2>/dev/null || echo inactive)"
+            # `|| true` rather than `|| echo inactive`: both of these print the
+            # state and *also* exit non-zero for anything but enabled and active,
+            # so a fallback that echoed appended a second copy and split the line
+            # in two. The status still has to be swallowed, or set -e takes the
+            # whole report down at the first service that is not running.
+            enabled="$(systemctl --user is-enabled "$unit.service" 2>/dev/null)" || true
+            active="$(systemctl --user is-active "$unit.service" 2>/dev/null)" || true
+            printf '  %-24s %s / %s\n' "$unit" "${enabled:-unknown}" "${active:-unknown}"
+            # Enabled but not running is the state worth spelling out. It looks
+            # like everything is set up, and the symptoms point somewhere else
+            # entirely: the Steam button opens Big Picture on the desktop and on
+            # the wrong screen, games talk over each other, and none of it
+            # mentions a service.
+            #
+            # 78 is how the services say they were turned off in the config, so
+            # that reads as the setting it is rather than as a fault.
+            if [[ "$enabled" == enabled && "$active" != active ]] &&
+               [[ "$(systemctl --user show "$unit.service" -p ExecMainStatus --value 2>/dev/null)" == 78 ]]; then
+                say "      off in your config, which is why it is not running."
+            elif [[ "$enabled" == enabled && "$active" != active ]]; then
+                case "$unit" in
+                    "$NAME-watch")
+                        say "      not running, so the Steam button opens Big Picture on the"
+                        say "      desktop instead of console mode. Start it with:"
+                        say "        systemctl --user start $unit" ;;
+                    "$NAME-audio")
+                        say "      not running, so nothing mutes background games or holds"
+                        say "      voice chat on console mode's devices. Start it with:"
+                        say "        systemctl --user start $unit" ;;
+                esac
+            fi
         else
             printf '  %-24s %s\n' "$unit" "not installed"
         fi
