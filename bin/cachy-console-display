@@ -33,6 +33,7 @@ Subcommands:
   audio-list            audio outputs and which one is saved for console mode
   audio-set NAME        save the audio output console mode will use
   audio-route           switch to the saved audio output (Steam's list)
+  audio-resolve         the sink name to play through, switching nothing
   audio-restore         put the previous HDMI profile back after console mode
   audio-input-list      microphones and which one is saved
   audio-input-set NAME  save the microphone console mode will use
@@ -931,6 +932,20 @@ def cmd_audio_input_set(args):
     return 0
 
 
+def cmd_audio_resolve(args):
+    """The sink name console mode should play through, without switching to it.
+
+    The read-only half of audio-route, for callers that need to know the target
+    but must not change the profile -- the audio daemon pins streams to it while
+    a session is running, and switching underneath a running session would be a
+    side effect nobody asked for.
+    """
+    target = match_audio()
+    if target and target.get("sink"):
+        print(target["sink"])
+    return 0
+
+
 def cmd_audio_input_resolve(args):
     """The source name for PULSE_SOURCE, or nothing to leave input alone."""
     name = match_audio_input()
@@ -1153,6 +1168,10 @@ def main():
                        help="save the audio output console mode will use")
     p.add_argument("device")
     p.set_defaults(func=cmd_audio_set)
+
+    sub.add_parser("audio-resolve",
+                   help="print the sink console mode plays through") \
+        .set_defaults(func=cmd_audio_resolve)
 
     sub.add_parser("audio-input-list",
                    help="microphones and which one is saved") \

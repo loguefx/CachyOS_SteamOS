@@ -44,13 +44,26 @@ class World:
     """A fake machine: some streams, some games, a focused app."""
 
     def __init__(self, streams=(), owners=None, focus=None, session=True,
-                 never=()):
+                 never=(), capture=(), devices=(None, None), names=None,
+                 pin=True):
         self.streams = list(streams)
         self.owners = dict(owners or {})     # pid -> appid (None = not a game)
         self.focus = focus
         self.session = session
         self.mute_calls = []
         self.logs = []
+        self.capture = list(capture)
+        self.devices = devices               # (sink, source) console mode wants
+        self.names = dict(names or {})       # (kind, index) -> device name
+        self.moves = []
+
+        pa.source_outputs = lambda: list(self.capture)
+        pa.pin_voice_enabled = lambda: pin
+        pa.device_names = lambda: dict(self.names)
+        pa.move_stream = self._move
+        # Resolving the target shells out to cachy-console-display, which is not
+        # what these tests are about: they are about what gets moved where.
+        pa.AudioFocus.console_devices = lambda _self: self.devices
 
         pa.sink_inputs = lambda: list(self.streams)
         pa.steam_appid = lambda pid, limit=24: self.owners.get(pid)
@@ -65,6 +78,27 @@ class World:
         appids = {int(n) for n in never if str(n).isdigit()}
         pa.never_mute = lambda: (names, appids)
         pa.process_names = lambda pid: set()
+
+    def _move(self, kind, index, device, dry_run):
+        """pactl move-sink-input / move-source-output, as a fake.
+
+        A stream records the device *index* it sits on while the config names
+        devices, so the fake has to keep both sides consistent or a moved stream
+        would look unmoved and be moved again forever.
+        """
+        self.moves.append((kind, index, device))
+        if dry_run:
+            return True
+        target = next((idx for (k, idx), name in self.names.items()
+                       if k == kind and name == device), None)
+        if target is None:
+            target = 1 + max([idx for (k, idx) in self.names if k == kind] or [0])
+            self.names[(kind, target)] = device
+        for group in (self.streams, self.capture):
+            for s in group:
+                if s.index == index:
+                    s.device = target
+        return True
 
     def _set_mute(self, index, muted, dry_run):
         self.mute_calls.append((index, muted))
@@ -83,8 +117,8 @@ class World:
         return sorted(s.index for s in self.streams if s.muted)
 
 
-def stream(index, pid, name="game", muted=False):
-    return pa.Stream(index, pid, muted, name)
+def stream(index, pid, name="game", muted=False, device=None):
+    return pa.Stream(index, pid, muted, name, device)
 
 
 # Two games and a browser: pids 100 and 200 are games, 900 is Firefox.
@@ -276,6 +310,108 @@ check("a stream that vanished mid-poll is not reported as a failure",
       [m for m in world.logs if "could not" in m], [])
 
 print()
+print("keeping voice chat on console mode's devices:")
+
+# Discord keeps its own output and input choice, so inheriting PULSE_SINK only
+# decides where it starts. Moving the stream is the part it cannot overrule.
+DISCORD = 3214031495
+TV = "alsa_output.pci-0000_0c_00.1.hdmi-stereo"
+MIC = "alsa_input.usb-HyperX_Cloud_III_S.mono-fallback"
+DESK = "alsa_output.usb-RODECaster_Duo.analog-stereo"
+DESK_MIC = "alsa_input.usb-RODECaster_Duo.analog-stereo"
+
+BOTH = {("sinks", 1): TV, ("sinks", 2): DESK,
+        ("sources", 1): MIC, ("sources", 2): DESK_MIC}
+
+
+def voice_world(**kw):
+    kw.setdefault("streams", [stream(10, 500, "Discord", device=2)])
+    kw.setdefault("capture", [stream(11, 500, "Discord", device=2)])
+    kw.setdefault("owners", {500: DISCORD})
+    kw.setdefault("never", ("Discord",))
+    kw.setdefault("devices", (TV, MIC))
+    kw.setdefault("names", BOTH)
+    kw.setdefault("focus", None)
+    return World(**kw), pa.AudioFocus()
+
+
+world, focus = voice_world()
+focus.poll()
+check("voice chat on the wrong output is moved to console mode's own",
+      [m for m in world.moves if m[0] == "sinks"], [("sinks", 10, TV)])
+check("and its microphone is moved to the chosen one too",
+      [m for m in world.moves if m[0] == "sources"], [("sources", 11, MIC)])
+
+# The whole point of re-checking every poll is that a second poll is quiet.
+world.moves.clear()
+focus.poll()
+check("a stream already on the right device is left alone", world.moves, [])
+
+# Discord changing its own setting mid-call is exactly the case this exists for.
+world.streams[0].device = 2
+focus.poll()
+check("a stream that wanders back is moved again",
+      world.moves, [("sinks", 10, TV)])
+
+world, focus = voice_world(streams=[stream(10, 500, "Discord", device=1)],
+                           capture=[stream(11, 500, "Discord", device=1)])
+focus.poll()
+check("nothing is moved when it already started in the right place",
+      world.moves, [])
+
+# Pinning must not become a general "move everything" policy: a game's own
+# audio setup is not this daemon's business.
+world, focus = voice_world(
+    streams=[stream(10, 500, "Discord", device=2), stream(1, 100, "GameA", device=2)],
+    capture=[], owners={500: DISCORD, 100: GAME_A})
+focus.poll()
+check("a game on another output is never moved", world.moves, [("sinks", 10, TV)])
+
+# A single game plus voice chat mutes nothing, which is precisely when pinning
+# still has to happen.
+world, focus = voice_world(
+    streams=[stream(10, 500, "Discord", device=2), stream(1, 100, "GameA", device=1)],
+    capture=[], owners={500: DISCORD, 100: GAME_A})
+focus.poll()
+check("pinning happens even though nothing is muted", world.moves,
+      [("sinks", 10, TV)])
+check("and still nothing is muted", world.mute_calls, [])
+
+world, focus = voice_world(pin=False)
+focus.poll()
+check("AUDIO_PIN_VOICE=off moves nothing", world.moves, [])
+
+# Console mode's devices are for console mode. Discord at the desk must be left
+# wherever the user put it.
+world, focus = voice_world(session=False)
+focus.poll()
+check("with no session running, nothing is pinned", world.moves, [])
+
+# Nothing saved means nothing to pin to; leaving streams alone beats guessing.
+world, focus = voice_world(devices=(None, None))
+focus.poll()
+check("no configured device means no move", world.moves, [])
+
+world, focus = voice_world(devices=(TV, None))
+focus.poll()
+check("output can be pinned while input is left to the session",
+      world.moves, [("sinks", 10, TV)])
+
+# Only exempt streams are pinned, so a game named like nothing special is safe.
+world, focus = voice_world(never=())
+focus.poll()
+check("with nothing exempt, nothing is pinned", world.moves, [])
+
+# Exemption by appid has to pin too, since that is how a shortcut is named when
+# its stream label does not match.
+world, focus = voice_world(never=(str(DISCORD),),
+                           streams=[stream(10, 500, "WEBRTC VoiceEngine", device=2)],
+                           capture=[stream(11, 500, "WEBRTC VoiceEngine", device=2)])
+focus.poll()
+check("an appid exemption pins the stream behind it",
+      sorted(world.moves), [("sinks", 10, TV), ("sources", 11, MIC)])
+
+print()
 print("dry run:")
 
 # The real set_mute, so the dry_run branch itself is under test rather than a
@@ -287,12 +423,21 @@ pa.run = lambda args, timeout=5: commands.append(args) or ""
 focus = pa.AudioFocus(dry_run=True)
 focus.poll()
 check("dry run still picks the game to mute", sorted(focus.muted_appids), [GAME_B])
-check("dry run runs no pactl command", commands, [])
+
+# Listing is how the daemon looks at the world and changes nothing, so the
+# invariant under test is that no *mutating* command runs, not that pactl is
+# never spoken to at all.
+def mutations(args_list):
+    return [a[:2] for a in args_list
+            if len(a) > 1 and a[1] not in ("-f", "list") and not a[1].startswith("get-")]
+
+
+check("dry run runs no command that changes anything", mutations(commands), [])
 
 focus = pa.AudioFocus(dry_run=False)
 focus.poll()
 check("a real run does call pactl",
-      [a[:2] for a in commands], [["pactl", "set-sink-input-mute"]])
+      mutations(commands), [["pactl", "set-sink-input-mute"]])
 
 print()
 if FAILURES:

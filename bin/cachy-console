@@ -99,7 +99,7 @@ load_config() {
         case "$key" in
             DISPLAY|DISPLAY_MODEL|RESOLUTION|REFRESH|HDR|VRR|TRACKPAD_FIX|EXTRA_GAMESCOPE_ARGS|AUDIO_DEVICE|AUDIO_INPUT_DEVICE|IGNORE_CONTROLLERS)
                 printf -v "CFG_$key" '%s' "$value" ;;
-            STEAM_BUTTON|AUDIO_FOCUS|AUDIO_NEVER_MUTE) ;;   # read by the services, not by us
+            STEAM_BUTTON|AUDIO_FOCUS|AUDIO_NEVER_MUTE|AUDIO_PIN_VOICE) ;;   # read by the services, not by us
             "") ;;
             *) warn "ignoring unknown setting in $CONFIG_FILE: $key" ;;
         esac
@@ -388,8 +388,17 @@ AUDIO_FOCUS=on
 # appids. Voice chat belongs here: Discord launched from the library is a Steam
 # shortcut like any other, so without this it counts as a game and goes quiet
 # whenever you look at the one you are playing.
+# An appid works as well as a name, and is worth adding for an Electron app
+# like Discord whose audio process is not reliably named after the app.
 # Read by cachy-console-audio.service; restart it after changing this.
 AUDIO_NEVER_MUTE=Discord
+
+# Hold the streams named above on the devices below, moving them if they end up
+# elsewhere. Discord keeps its own output and input choice, so without this it
+# only starts on the right device and its own settings win afterwards. Moving
+# the stream is the one thing an application cannot overrule.
+# Read by cachy-console-audio.service; restart it after changing this.
+AUDIO_PIN_VOICE=on
 
 # Audio output inside console mode. An HDMI monitor name (Optoma UHD) or
 # a device name (RODECaster Duo). Empty follows the saved display.

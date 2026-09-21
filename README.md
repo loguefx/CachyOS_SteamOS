@@ -155,6 +155,14 @@ Note the entry in `AUDIO_NEVER_MUTE`. A library shortcut is a Steam app like any
 other, so without that exemption per-game audio focus counts Discord as a game
 and mutes it the moment you look at the one you are playing.
 
+Discord also keeps its own output and input choice, which means inheriting
+`PULSE_SINK` and `PULSE_SOURCE` only decides where it *starts*: if its saved
+device differs, the next call goes there instead — often a headset at the desk
+while you are across the room. `AUDIO_PIN_VOICE` closes that by moving the
+stream itself, which is the one thing an application cannot overrule, and
+re-checking every poll so a stream that wanders back is moved again. It only
+does this while a session is running, so Discord at your desk is left alone.
+
 ## Configuration
 
 `~/.config/cachy-console/config`, written by `cachy-console settings` and safe to
@@ -172,6 +180,7 @@ edit by hand:
 | `AUDIO_FOCUS` | `on` | Mute games you are not looking at |
 | `AUDIO_DEVICE` | *(follows display)* | HDMI monitor name (`Optoma UHD`) or device (`RODECaster Duo`). Kept until you change it in **Cachy Console** settings |
 | `AUDIO_NEVER_MUTE` | `Discord` | Left audible even though Steam started it. Comma-separated names or appids. Read by the audio service, so restart it after editing |
+| `AUDIO_PIN_VOICE` | `on` | Hold those streams on `AUDIO_DEVICE` / `AUDIO_INPUT_DEVICE`, moving them back if the app sends them elsewhere. Only while a session is running |
 | `AUDIO_INPUT_DEVICE` | *(session default)* | Microphone for console mode, e.g. `HyperX Cloud III S Wireless`. Empty leaves input alone |
 | `IGNORE_CONTROLLERS` | empty | Devices console mode should not treat as gamepads, as `0x31e3/0x1400`, comma separated. List them with `cachy-console controllers` |
 | `EXTRA_GAMESCOPE_ARGS` | empty | Passed straight through, e.g. `--mangoapp` |

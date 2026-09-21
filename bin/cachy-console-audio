@@ -30,6 +30,7 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -66,12 +67,30 @@ def read_config():
     return values
 
 
-def audio_focus_enabled():
-    """Whether the user wants this at all; on by default before setup runs."""
-    value = read_config().get("AUDIO_FOCUS")
+def _enabled(key):
+    """A config flag that defaults to on, before setup has ever run."""
+    value = read_config().get(key)
     if value is None:
         return True
     return value.lower() not in ("off", "no", "0", "false")
+
+
+def audio_focus_enabled():
+    """Whether the user wants this at all; on by default before setup runs."""
+    return _enabled("AUDIO_FOCUS")
+
+
+def pin_voice_enabled():
+    """Whether never-muted streams get held on console mode's own devices."""
+    return _enabled("AUDIO_PIN_VOICE")
+
+
+def find_helper(name):
+    """cachy-console-display, next to this script or on PATH."""
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+    if os.access(here, os.X_OK):
+        return here
+    return shutil.which(name)
 
 
 def never_mute():
@@ -228,18 +247,18 @@ def steam_appid(pid, limit=24):
 # ---- audio --------------------------------------------------------------
 
 class Stream:
-    __slots__ = ("index", "pid", "muted", "name")
+    __slots__ = ("index", "pid", "muted", "name", "device")
 
-    def __init__(self, index, pid, muted, name):
+    def __init__(self, index, pid, muted, name, device=None):
         self.index, self.pid, self.muted, self.name = index, pid, muted, name
+        self.device = device       # sink for playback, source for capture
 
     def __repr__(self):
         return f"<stream {self.index} pid={self.pid} muted={self.muted} {self.name!r}>"
 
 
-def sink_inputs():
-    """Every playback stream PipeWire currently has."""
-    out = run(["pactl", "-f", "json", "list", "sink-inputs"])
+def _streams(kind, device_key):
+    out = run(["pactl", "-f", "json", "list", kind])
     if not out:
         return []
     try:
@@ -258,14 +277,53 @@ def sink_inputs():
             index=item.get("index"),
             pid=pid,
             muted=bool(item.get("mute")),
-            name=props.get("application.name") or props.get("media.name") or "?"))
+            name=props.get("application.name") or props.get("media.name") or "?",
+            device=item.get(device_key)))
     return streams
+
+
+def sink_inputs():
+    """Every playback stream PipeWire currently has."""
+    return _streams("sink-inputs", "sink")
+
+
+def source_outputs():
+    """Every capture stream, which is how voice chat holds a microphone."""
+    return _streams("source-outputs", "source")
 
 
 def set_mute(index, muted, dry_run):
     if dry_run:
         return True
     return run(["pactl", "set-sink-input-mute", str(index), "1" if muted else "0"]) is not None
+
+
+def device_names():
+    """index -> name, for sinks and sources.
+
+    pactl reports the device a stream is on as an index, while the config names
+    devices, so one of the two has to be translated to compare them.
+    """
+    names = {}
+    for kind in ("sinks", "sources"):
+        out = run(["pactl", "-f", "json", "list", kind])
+        if not out:
+            continue
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            continue
+        for item in data:
+            if item.get("index") is not None and item.get("name"):
+                names[(kind, item["index"])] = item["name"]
+    return names
+
+
+def move_stream(kind, index, device, dry_run):
+    if dry_run:
+        return True
+    verb = "move-sink-input" if kind == "sinks" else "move-source-output"
+    return run(["pactl", verb, str(index), device]) is not None
 
 
 def exempt_stream(stream, appid, names, appids):
@@ -355,8 +413,14 @@ class AudioFocus:
         self.never_names, self.never_appids = never_mute()
         self.last_focus = None
         self.last_report = None
+        self.pin_voice = pin_voice_enabled()
+        self.targets = (None, None)    # (sink, source) console mode should use
+        self.targets_checked = 0.0
+        self.complained = set()
         if self.never_names or self.never_appids:
             log(f"never muting: {self.never_listing()}")
+        if self.pin_voice:
+            log("pinning never-muted streams to console mode's own devices")
 
     def never_listing(self):
         return ", ".join(sorted(self.never_names)
@@ -417,16 +481,95 @@ class AudioFocus:
             self.mute_appid(appid, by_app.get(appid, []), False)
         self.muted_appids.clear()
 
-    def prune(self, streams):
-        live = {s.pid for s in streams}
+    def prune(self, *stream_groups):
+        live = {s.pid for group in stream_groups for s in group}
         for cache in (self.appid_cache, self.exempt_cache):
             for pid in [p for p in cache if p not in live]:
                 del cache[pid]
 
+    # ---- keeping voice chat on console mode's devices --------------------
+
+    def console_devices(self):
+        """The sink and source console mode is configured to use.
+
+        Asked of cachy-console-display rather than read from the config, so that
+        a saved display or a device name resolves the same way here as it does
+        when a session starts. Re-asked occasionally because a headset can be
+        plugged in mid-session, but not every poll: this shells out.
+        """
+        now = time.monotonic()
+        if now - self.targets_checked < 10.0:
+            return self.targets
+        self.targets_checked = now
+        helper = find_helper("cachy-console-display")
+        if not helper:
+            if "helper" not in self.complained:
+                log("cachy-console-display not found, so streams cannot be pinned")
+                self.complained.add("helper")
+            self.targets = (None, None)
+            return self.targets
+        sink = (run([helper, "audio-resolve"]) or "").strip() or None
+        source = (run([helper, "audio-input-resolve"]) or "").strip() or None
+        self.targets = (sink, source)
+        return self.targets
+
+    def pin_exempt(self, streams, capture):
+        """Hold never-muted streams on the devices console mode chose.
+
+        Discord keeps its own output and input choice in its settings, so
+        inheriting PULSE_SINK and PULSE_SOURCE only decides where it starts: the
+        moment its saved device differs, it plays somewhere else -- often a
+        headset at the desk while you are across the room. Moving the stream
+        after the fact is the one thing an application cannot overrule, and it
+        is re-checked every poll, so a stream that wanders back gets moved again.
+
+        Only never-muted streams are touched. Games are left where they are,
+        because Steam already launches them with the session's devices and
+        second-guessing a game's own audio setup is not this daemon's business.
+        """
+        if not self.pin_voice:
+            return
+        play = [s for s in streams if self.exempt(s, self.appid_for(s.pid))]
+        talk = [s for s in capture if self.exempt(s, self.appid_for(s.pid))]
+        if not play and not talk:
+            return
+
+        sink, source = self.console_devices()
+        names = None
+        for kind, target, group in (("sinks", sink, play),
+                                    ("sources", source, talk)):
+            if not target or not group:
+                continue
+            if names is None:
+                names = device_names()
+            for stream in group:
+                current = names.get((kind, stream.device))
+                if current == target:
+                    continue
+                if move_stream(kind, stream.index, target, self.dry_run):
+                    log(f"moved {stream.name!r} to {target}")
+                elif any(s.index == stream.index
+                         for s in (sink_inputs() if kind == "sinks"
+                                   else source_outputs())):
+                    # Still there and still would not move: say so once per
+                    # device, rather than every half second.
+                    if (kind, target) not in self.complained:
+                        log(f"could not move {stream.name!r} to {target}")
+                        self.complained.add((kind, target))
+
     def poll(self):
         """One pass. Returns True if a session is active, for pacing."""
         streams = sink_inputs()
-        self.prune(streams)
+        displays = gamescope_displays()
+        capture = source_outputs() if (self.pin_voice and displays) else []
+        self.prune(streams, capture)
+        # Only while a session is actually running, and before the focus logic:
+        # voice chat has to be on the right device even when nothing else is
+        # playing, which is exactly the case where nothing would be muted. On
+        # the desktop the devices chosen for the couch are nobody's business,
+        # so Discord at your desk is left wherever you put it.
+        if displays:
+            self.pin_exempt(streams, capture)
         by_app = self.games(streams)
 
         # One game, or none, cannot drown anything out.
@@ -437,7 +580,6 @@ class AudioFocus:
             self.report(by_app, None)
             return bool(by_app)
 
-        displays = gamescope_displays()
         if not displays:
             if self.muted_appids:
                 log("no gamescope session; restoring")
@@ -537,6 +679,7 @@ def main():
 def status():
     names, appids = never_mute()
     streams = sink_inputs()
+    devices = device_names()
     print(f"playback streams: {len(streams)}")
     listing = ", ".join(sorted(names) + [str(a) for a in sorted(appids)])
     print(f"never muted: {listing or '(nothing; see AUDIO_NEVER_MUTE)'}")
@@ -551,6 +694,22 @@ def status():
                 kind += ", never muted"
         print(f"  [{stream.index}] {stream.name!r} pid={stream.pid} "
               f"muted={stream.muted} -> {kind}")
+        print(f"        on {devices.get(('sinks', stream.device)) or '(unknown)'}")
+
+    helper = find_helper("cachy-console-display")
+    sink = source = None
+    if helper:
+        sink = (run([helper, "audio-resolve"]) or "").strip() or None
+        source = (run([helper, "audio-input-resolve"]) or "").strip() or None
+    print(f"pin voice chat: {'on' if pin_voice_enabled() else 'off'}"
+          f"  (output {sink or 'not set'}, input {source or 'not set'})")
+    capture = source_outputs()
+    print(f"capture streams: {len(capture)}")
+    for stream in capture:
+        appid = steam_appid(stream.pid)
+        mark = " never muted" if exempt_stream(stream, appid, names, appids) else ""
+        print(f"  [{stream.index}] {stream.name!r} pid={stream.pid}{mark}")
+        print(f"        on {devices.get(('sources', stream.device)) or '(unknown)'}")
 
     displays = gamescope_displays()
     print(f"gamescope displays: {displays or 'none'}")
