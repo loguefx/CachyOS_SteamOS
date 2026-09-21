@@ -61,7 +61,51 @@ DESKTOP_WINDOW_LIST = "_NET_CLIENT_LIST"
 # can only ever be compared by its prefix.
 COMM_MAX = 15
 
+# Steam preloads its overlay into everything it launches, and the library does
+# not survive what a desktop application does on the way up: Discord's zygote
+# segfaults inside it while the dynamic linker is still initialising it, and with
+# no zygote Electron never forks a renderer, so no window is ever created. The
+# tile looks like it did nothing at all -- Discord is running, with no window on
+# any display, and a second launch only hands off to that windowless copy and
+# exits. xprop dies in it too, on the way out of every call, which blinds the
+# window watch below.
+#
+# Turning the overlay off on the shortcut does not help: AllowOverlay=0 sets
+# SteamNoOverlayUI=1 and Steam goes on preloading the library regardless. So it
+# comes out of the environment here, where it also reaches the xprop calls.
+# Games are why the overlay exists; this only ever runs desktop applications,
+# which have nothing to gain from it.
+OVERLAY_LIB = "gameoverlayrenderer.so"
+
+# LD_PRELOAD separates on colons and whitespace alike.
+PRELOAD_SEP_RE = re.compile(r"[:\s]+")
+
+# What Steam puts in front of the program in %command%. Neither is ever the
+# application, and both take the rest of their arguments after a "--".
+STEAM_LAUNCH_HELPERS = {"steam-launch-wrapper", "reaper"}
+
 NUMBER_RE = re.compile(r"0x[0-9a-fA-F]+|\d+")
+
+
+def strip_overlay(environ):
+    """Take Steam's overlay out of LD_PRELOAD, and say what was taken out.
+
+    Anything else in there is left alone and in order: it is not ours, and a
+    preload someone chose deliberately is not ours to drop.
+    """
+    raw = environ.get("LD_PRELOAD")
+    if not raw:
+        return []
+    parts = [p for p in PRELOAD_SEP_RE.split(raw) if p]
+    dropped = [p for p in parts if OVERLAY_LIB in p]
+    if not dropped:
+        return []
+    keep = [p for p in parts if OVERLAY_LIB not in p]
+    if keep:
+        environ["LD_PRELOAD"] = ":".join(keep)
+    else:
+        environ.pop("LD_PRELOAD", None)
+    return dropped
 
 
 def log(msg):
@@ -230,6 +274,33 @@ def descendants(pid, proc="/proc"):
         out.add(current)
         pending.extend(children.get(current, []))
     return out
+
+
+def real_program(command):
+    """Skip Steam's launch chain to the application itself.
+
+    A tile's launch options are not handed the program on its own. Steam wraps it,
+    so %command% arrives as something like
+
+        .../steam-launch-wrapper -- .../reaper SteamLaunch AppId=N -- /usr/bin/discord
+
+    and taken at face value the application is steam-launch-wrapper. Every
+    judgement made from its name is then about the wrong process: the
+    single-instance sweep hunts for second copies of a launcher nobody runs twice,
+    the window watch looks for windows of a class that has none, and the cleanup
+    on the way out finds nothing to clean up -- so Steam's Stop button takes the
+    wrapper away and leaves the application running with no window, holding the
+    lock that stops the next launch from working.
+
+    The chain is skipped rather than the last separator taken, because the
+    application has its own arguments and is welcome to a "--" among them.
+    """
+    rest = list(command)
+    while rest and os.path.basename(rest[0]).lower() in STEAM_LAUNCH_HELPERS:
+        if "--" not in rest:
+            break
+        rest = rest[rest.index("--") + 1:]
+    return rest or list(command)
 
 
 def instance_names(program):
@@ -416,7 +487,17 @@ def main():
               file=sys.stderr)
         return 2
 
-    program = command[0]
+    # Before anything else spawns: our own environment is what the application
+    # and every xprop call inherit.
+    dropped = strip_overlay(os.environ)
+    if dropped:
+        log(f"dropped Steam's overlay from LD_PRELOAD ({', '.join(dropped)}); "
+            f"it crashes desktop applications on startup")
+
+    # Still launched through the whole chain -- Steam's bookkeeping depends on its
+    # own wrapper and reaper running -- but everything we recognise the
+    # application by comes from the program at the end of it.
+    program = real_program(command)[0]
     name = os.path.basename(program)
     names = instance_names(program)
     classes = set(names) | {c.lower() for c in args.wm_class}
@@ -433,11 +514,21 @@ def main():
                     f"shutdown next time")
 
     env = dict(os.environ)
-    # Electron chooses its display server from the environment. Console mode
-    # already unsets WAYLAND_DISPLAY, so that gamescope's X11 is the only thing
-    # left to pick, but saying so outright costs nothing and covers a session
-    # that leaked one back in.
-    env.setdefault("ELECTRON_OZONE_PLATFORM_HINT", "x11")
+    # Electron picks its display server from the environment, and console mode
+    # unsetting WAYLAND_DISPLAY is not the safeguard it reads as: a Wayland client
+    # with no WAYLAND_DISPLAY does not give up and settle for X11, it connects to
+    # wayland-0 in XDG_RUNTIME_DIR, which is the desktop's own compositor. That is
+    # how Discord ended up a window on the desktop, on whichever screen the
+    # desktop chose, while console mode showed Big Picture with nothing else in
+    # it: from the couch the tile had done nothing at all, and the copy holding
+    # the single-instance lock was one no launch could bring into the session.
+    #
+    # XDG_SESSION_TYPE is what Chromium reads to choose a platform when its hint
+    # is auto, and the session inherited here says wayland. Both of these have to
+    # say X11 before the window lands on gamescope's display, and X11 is the
+    # truth inside a session whose only display server is gamescope's Xwayland.
+    env["XDG_SESSION_TYPE"] = "x11"
+    env["ELECTRON_OZONE_PLATFORM_HINT"] = "x11"
     # Never the program's own directory: for anything in /usr/bin that is a
     # read-only working directory, and an application that writes beside itself
     # -- a crash dump, a log -- fails in a way that has nothing to do with us.

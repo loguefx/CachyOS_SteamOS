@@ -183,6 +183,32 @@ gamescope reports as focusable, and once Discord has shown one and then has
 none left, it quits it. Steam sees the exit, the tile goes back to "Play", and
 Big Picture has the screen again.
 
+It also corrects two things in the environment Steam hands a tile. Both stop a
+desktop application dead, and both look the same from the couch: you press the
+tile and nothing appears.
+
+Steam preloads its in-game overlay into everything it launches, and the library
+does not survive Electron starting up. Discord's zygote segfaults inside it while
+the dynamic linker is still initialising it, and with no zygote there is never a
+renderer, so no window is ever created — Discord is left running with no window
+on any display, holding its lock, and the next launch only hands off to that copy
+and exits. Turning the overlay off on the shortcut is not enough: `AllowOverlay
+= 0` disables the overlay's UI and Steam goes on preloading the library anyway.
+So it comes out of `LD_PRELOAD` here. Anything else you have put there is left
+alone, and the same applies to the `xprop` calls behind the window watch above,
+which died in it on the way out of every call.
+
+And it pins the application to gamescope's X11 display. Console mode unsets
+`WAYLAND_DISPLAY`, which reads like a safeguard but is not one: a Wayland client
+with no `WAYLAND_DISPLAY` does not settle for X11, it connects to `wayland-0` in
+`XDG_RUNTIME_DIR`, which is your desktop's compositor. That is how Discord came
+up as a window on the desktop, on whichever screen the desktop chose, while
+console mode showed Big Picture with nothing else in it. `XDG_SESSION_TYPE` is
+what Chromium reads to choose a platform, and the session it inherits says
+wayland, so the wrapper sets it to `x11` alongside Electron's own platform hint.
+The window then lands in the session, where gamescope lists it as focusable and
+the task switcher can reach it.
+
 This applies to any tile you add this way, not just Discord. Pass `--no-wrap`
 to launch a program directly, and `--keep-running` in the launch options for
 something that is meant to live in a tray.

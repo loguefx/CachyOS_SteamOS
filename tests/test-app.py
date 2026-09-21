@@ -301,6 +301,85 @@ check("only the first separator splits",
       ([], ["/usr/bin/discord", "--", "%u"]))
 
 print()
+print("finding the application inside Steam's launch chain:")
+
+# Captured from a real tile launch: this is what %command% expanded to.
+STEAM_CHAIN = [
+    "/home/u/.local/share/Steam/ubuntu12_32/steam-launch-wrapper", "--",
+    "/home/u/.local/share/Steam/ubuntu12_64/reaper", "SteamLaunch",
+    "AppId=3214031495", "--", "/usr/bin/discord",
+]
+
+check("the application is found past the wrapper and the reaper",
+      app.real_program(STEAM_CHAIN), ["/usr/bin/discord"])
+# The name everything else is decided from. Getting this wrong is what left
+# Discord running with no window after Steam's Stop button.
+check("so it is named after the application, not the wrapper",
+      os.path.basename(app.real_program(STEAM_CHAIN)[0]), "discord")
+check("and its instance names are the application's",
+      app.instance_names(app.real_program(STEAM_CHAIN)[0]), {"discord"})
+
+check("the application's own arguments come with it",
+      app.real_program(STEAM_CHAIN + ["--", "%u"]),
+      ["/usr/bin/discord", "--", "%u"])
+check("a bare program is left alone",
+      app.real_program(["/usr/bin/discord"]), ["/usr/bin/discord"])
+check("as is one that merely has arguments",
+      app.real_program(["/usr/bin/discord", "--start-minimized"]),
+      ["/usr/bin/discord", "--start-minimized"])
+check("the reaper on its own is skipped too",
+      app.real_program(["/path/reaper", "SteamLaunch", "AppId=7", "--", "/usr/bin/app"]),
+      ["/usr/bin/app"])
+# Never an empty command: a chain with nothing after it is a launch we cannot
+# interpret, and guessing would be worse than running what we were given.
+check("a chain with nothing after it falls back to the chain",
+      app.real_program(["/path/steam-launch-wrapper"]),
+      ["/path/steam-launch-wrapper"])
+
+print()
+print("taking Steam's overlay out of the way:")
+
+# The exact value Steam sets for a non-Steam shortcut, 32-bit and 64-bit, with
+# the empty leading field it really has.
+STEAM_PRELOAD = (":/home/u/.local/share/Steam/ubuntu12_32/gameoverlayrenderer.so"
+                 ":/home/u/.local/share/Steam/ubuntu12_64/gameoverlayrenderer.so")
+
+
+def stripped(value):
+    """The LD_PRELOAD left behind, with None for 'gone entirely'."""
+    env = {} if value is None else {"LD_PRELOAD": value}
+    dropped = app.strip_overlay(env)
+    return env.get("LD_PRELOAD"), dropped
+
+
+left, dropped = stripped(STEAM_PRELOAD)
+check("Steam's overlay is dropped", len(dropped), 2)
+# Nothing left worth setting, and an empty LD_PRELOAD is not the same as none:
+# the dynamic linker treats the empty entry as the current directory.
+check("and LD_PRELOAD goes with it rather than being left empty", left, None)
+
+left, dropped = stripped(
+    "/usr/lib/libsomething.so:"
+    "/home/u/.local/share/Steam/ubuntu12_64/gameoverlayrenderer.so")
+check("a preload the user chose is kept", left, "/usr/lib/libsomething.so")
+check("and only the overlay is dropped", dropped,
+      ["/home/u/.local/share/Steam/ubuntu12_64/gameoverlayrenderer.so"])
+
+# LD_PRELOAD is whitespace-separated as well as colon-separated, and Steam is not
+# the only thing that writes it.
+left, dropped = stripped("/usr/lib/a.so /path/gameoverlayrenderer.so /usr/lib/b.so")
+check("spaces separate entries too", left, "/usr/lib/a.so:/usr/lib/b.so")
+check("and the overlay is still found", len(dropped), 1)
+
+check("nothing to do without LD_PRELOAD", stripped(None), (None, []))
+# Left exactly as found: there is no overlay in it to take out, and a variable we
+# had no reason to touch is not ours to remove.
+check("nor with an empty one", stripped(""), ("", []))
+left, dropped = stripped("/usr/lib/only-mine.so")
+check("a preload with no overlay in it is untouched", left, "/usr/lib/only-mine.so")
+check("and reports nothing dropped", dropped, [])
+
+print()
 if FAILURES:
     print(f"{len(FAILURES)} failure(s): " + ", ".join(FAILURES))
     sys.exit(1)
