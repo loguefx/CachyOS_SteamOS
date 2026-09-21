@@ -53,6 +53,14 @@ else
     missing+=(sdl2)
 fi
 
+# Pillow only draws the library tiles, so its absence costs artwork rather
+# than a working install and it never joins the missing list.
+if python3 -c 'import PIL' 2>/dev/null; then
+    printf '  %-12s yes\n' "pillow"
+else
+    printf '  %-12s no (optional: pacman -S python-pillow, for library art)\n' "pillow"
+fi
+
 if (( ${#missing[@]} )); then
     say
     warn "missing: ${missing[*]}"
@@ -70,7 +78,7 @@ say "== installing =="
 mkdir -p "$BIN_DIR"
 for tool in cachy-console cachy-console-display cachy-console-watch \
             cachy-console-audio cachy-console-exit cachy-console-shortcut \
-            cachy-console-settings cachy-console-session; do
+            cachy-console-art cachy-console-settings cachy-console-session; do
     install -m755 "$SRC/bin/$tool" "$BIN_DIR/$tool"
     printf '  %s -> %s\n' "$tool" "$BIN_DIR"
 done

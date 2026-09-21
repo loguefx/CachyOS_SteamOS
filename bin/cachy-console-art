@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""Give a non-Steam shortcut the library artwork Steam expects.
+
+A shortcut added to the library has no capsule, no hero and no logo, so Big
+Picture falls back to a grey tile with the name printed across it. That is
+legible at a desk and close to useless from a sofa, where the tile is the only
+thing distinguishing Discord from the exit entry next to it.
+
+Steam serves custom art for an app out of userdata/<user>/config/grid. The
+client exposes that directory to its own UI as the "customimages" route and
+asks for one file per art type:
+
+    <appid>p.png       vertical capsule, the library grid tile   600x900
+    <appid>.png        horizontal capsule, rows and search       920x430
+    <appid>_hero.png   banner behind the app's page             1920x620
+    <appid>_logo.png   transparent overlay drawn on the hero
+
+The appid is the unsigned 32-bit crc32 of the quoted Exe plus the AppName with
+the high bit set -- the same number shortcuts.vdf stores in its `appid` field.
+Steam's own logs print the signed form of it (-1080935801 for Discord's
+3214031495) when its asset downloader gives up on a shortcut, and that stray
+negative is where the folklore about grid files needing a signed id comes
+from. The client keys everything else off the unsigned value, including the
+librarycache entry it writes per app, so that is what the filenames use.
+
+Steam asks for .jpg before .png for every one of these. We write .png because
+the logo needs an alpha channel and one format for all four is easier to
+reason about than a mixture.
+
+Usage:
+    cachy-console-art --name Discord --exe /usr/bin/discord
+    cachy-console-art --name Discord --exe /usr/bin/discord --revert
+"""
+
+import argparse
+import glob
+import os
+import re
+import subprocess
+import sys
+import zlib
+
+try:
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont
+except ImportError:   # optional: without it we simply add no artwork
+    Image = None
+
+STEAM_ROOT = os.path.expanduser("~/.steam/steam")
+
+# Suffix and pixel size per art type, as the client asks for them.
+ART_TYPES = {
+    "capsule": ("p", (600, 900)),
+    "wide": ("", (920, 430)),
+    "hero": ("_hero", (1920, 620)),
+    "logo": ("_logo", (640, 480)),
+}
+
+FONTS = (
+    "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+)
+
+# Used when an icon is so washed out that its own colours make a muddy tile.
+FALLBACK_COLOR = (58, 63, 74)
+
+
+def grid_appid(exe, name):
+    """The number Steam names this shortcut's art files after.
+
+    Deliberately a copy of cachy-console-shortcut's shortcut_appid rather than
+    an import of it: the art helper is called *by* that tool, so importing it
+    back would be a cycle. The test suite asserts the two stay equal, which is
+    the only property that matters -- art filed under a different id than the
+    library entry is art Steam never looks at.
+    """
+    return zlib.crc32((exe + name).encode("utf-8")) | 0x80000000
+
+
+def grid_filename(appid, kind):
+    suffix, _ = ART_TYPES[kind]
+    return f"{appid}{suffix}.png"
+
+
+def grid_dirs():
+    """One grid directory per logged-in Steam account on this machine."""
+    base = os.path.join(STEAM_ROOT, "userdata")
+    if not os.path.isdir(base):
+        return []
+    found = []
+    for entry in sorted(os.listdir(base)):
+        if not entry.isdigit() or entry == "0":
+            continue          # "0" is the anonymous/logged-out profile
+        cfg = os.path.join(base, entry, "config")
+        if os.path.isdir(cfg):
+            found.append(os.path.join(cfg, "grid"))
+    return found
+
+
+def icon_dirs():
+    """Icon theme roots, including whatever Flatpak has exported."""
+    roots = [os.path.expanduser("~/.local/share")]
+    roots += os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":")
+    roots += ["/var/lib/flatpak/exports/share",
+              os.path.expanduser("~/.local/share/flatpak/exports/share")]
+    seen, out = set(), []
+    for root in roots:
+        path = os.path.join(root, "icons")
+        if root and path not in seen and os.path.isdir(path):
+            seen.add(path)
+            out.append(path)
+    return out
+
+
+def _icon_size(path):
+    """Sort key pulling 256 out of .../hicolor/256x256/apps/discord.png.
+
+    Scalable directories hold SVGs, which beat every bitmap because they
+    rasterise to whatever the capsule needs without going soft.
+    """
+    if "/scalable/" in path:
+        return 1 << 20
+    match = re.search(r"/(\d+)x\1/", path)
+    return int(match.group(1)) if match else 0
+
+
+def find_icon(exe, name=None):
+    """The largest installed icon belonging to this program, or None.
+
+    Matched on the executable's basename, which is what packages name their
+    icons after; the AppName is tried too so that a shortcut pointing at a
+    wrapper script can still be given the right artwork.
+    """
+    stems = []
+    for candidate in (os.path.basename(exe.strip('"').rstrip("/")), name):
+        if candidate:
+            stem = candidate.strip().lower().replace(" ", "-")
+            if stem and stem not in stems:
+                stems.append(stem)
+
+    for stem in stems:
+        found = []
+        for root in icon_dirs():
+            for ext in ("png", "svg"):
+                found += glob.glob(f"{root}/*/*/apps/{stem}.{ext}")
+        for direct in ("/usr/share/pixmaps", f"/opt/{stem}"):
+            for ext in ("png", "svg"):
+                found += glob.glob(f"{direct}/{stem}.{ext}")
+        if found:
+            return sorted(found, key=_icon_size)[-1]
+    return None
+
+
+def load_icon(path, size=1024):
+    """Read an icon as RGBA, rasterising SVG through ImageMagick if needed."""
+    if path.lower().endswith(".svg"):
+        png = subprocess.run(
+            ["magick", "-background", "none", f"{path}",
+             "-resize", f"{size}x{size}", "png:-"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True).stdout
+        import io
+        return Image.open(io.BytesIO(png)).convert("RGBA")
+    return Image.open(path).convert("RGBA")
+
+
+def dominant_color(icon):
+    """The icon's own brand colour, for a background that belongs with it.
+
+    Weighted towards saturated pixels: Discord's icon is mostly blurple with a
+    white mark through the middle, and averaging those together would give a
+    washed-out lilac instead of the #5865F2 the app is recognised by.
+    """
+    small = icon.resize((64, 64), Image.LANCZOS)
+    best, best_score = None, 0.0
+    for count, pixel in small.getcolors(64 * 64) or []:
+        r, g, b, a = pixel
+        if a < 200:
+            continue
+        high, low = max(r, g, b), min(r, g, b)
+        saturation = (high - low) / high if high else 0.0
+        # Very dark pixels read as saturated but make a dead tile, so the
+        # score also asks for some brightness.
+        score = count * saturation * (high / 255) ** 0.5
+        if score > best_score:
+            best, best_score = (r, g, b), score
+    return best or FALLBACK_COLOR
+
+
+def _shade(rgb, factor):
+    """Lighten (factor > 1) or darken (factor < 1) while staying in gamut."""
+    if factor >= 1:
+        t = 1 - 1 / factor
+        return tuple(round(c + (255 - c) * t) for c in rgb)
+    return tuple(round(c * factor) for c in rgb)
+
+
+def _background(size, color):
+    """A vertical gradient with a soft glow where the icon will sit.
+
+    Flat colour looks like a placeholder; a full illustration we cannot make
+    from an icon. A gradient reads as deliberate at sofa distance and costs
+    nothing.
+    """
+    strip = Image.new("RGB", (1, 256))
+    top, bottom = _shade(color, 1.25), _shade(color, 0.55)
+    for y in range(256):
+        t = y / 255
+        strip.putpixel((0, y), tuple(round(a + (b - a) * t)
+                                     for a, b in zip(top, bottom)))
+    back = strip.resize(size, Image.BICUBIC).convert("RGBA")
+
+    w, h = size
+    glow = Image.new("L", size, 0)
+    radius = min(w, h) * 0.55
+    ImageDraw.Draw(glow).ellipse(
+        (w / 2 - radius, h * 0.42 - radius, w / 2 + radius, h * 0.42 + radius),
+        fill=70)
+    glow = glow.filter(ImageFilter.GaussianBlur(min(w, h) * 0.12))
+    back.paste(Image.new("RGBA", size, _shade(color, 1.6) + (255,)), (0, 0), glow)
+    return back
+
+
+def _font(size):
+    for path in FONTS:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size)
+    return None
+
+
+def _fit_font(text, max_width, start):
+    """Largest font size at or below `start` that keeps `text` on one line."""
+    for size in range(start, 11, -2):
+        font = _font(size)
+        if font is None:
+            return None
+        if ImageDraw.Draw(Image.new("RGBA", (1, 1))).textlength(text, font=font) <= max_width:
+            return font
+    return _font(12)
+
+
+def _draw_label(image, text, center, max_width, start_size):
+    """Centred white caption with a soft shadow, so it survives any backdrop."""
+    font = _fit_font(text, max_width, start_size)
+    if font is None:
+        return
+    shadow = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    offset = max(2, start_size // 18)
+    ImageDraw.Draw(shadow).text((center[0] + offset, center[1] + offset), text,
+                                font=font, fill=(0, 0, 0, 150), anchor="mm")
+    image.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(offset)))
+    ImageDraw.Draw(image).text(center, text, font=font, fill=(255, 255, 255, 255),
+                               anchor="mm")
+
+
+def _scaled(icon, box):
+    return icon.resize((box, box), Image.LANCZOS)
+
+
+def render(kind, icon, name, color):
+    """Compose one piece of artwork: icon on a branded backdrop, name beneath."""
+    _, (w, h) = ART_TYPES[kind]
+
+    if kind == "logo":
+        # Drawn over the hero, so it must be transparent and carry the name
+        # itself; the hero behind it is only a wash of colour.
+        out = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        box = 260
+        out.alpha_composite(_scaled(icon, box), ((w - box) // 2, 40))
+        _draw_label(out, name, (w // 2, 40 + box + 70), w - 60, 72)
+        return out
+
+    out = _background((w, h), color)
+
+    if kind == "hero":
+        # The logo lands on top of this, so the hero stays a backdrop: a faint
+        # watermark pushed off to one side, small enough to stay inside the
+        # banner rather than being cropped into an anonymous blob.
+        box = 420
+        mark = _scaled(icon, box)
+        faded = Image.new("RGBA", mark.size, (0, 0, 0, 0))
+        faded.paste(mark, (0, 0), mark.getchannel("A").point(lambda a: a // 6))
+        out.alpha_composite(faded, (w - box - 140, (h - box) // 2))
+        return out
+
+    if kind == "capsule":
+        box = 320
+        out.alpha_composite(_scaled(icon, box), ((w - box) // 2, 230))
+        _draw_label(out, name, (w // 2, 680), w - 70, 66)
+        return out
+
+    box = 190                 # "wide": icon and name side by side
+    out.alpha_composite(_scaled(icon, box), (70, (h - box) // 2))
+    _draw_label(out, name, (70 + box + (w - box - 130) // 2, h // 2),
+                w - box - 160, 64)
+    return out
+
+
+def paths_for(appid, directory=None):
+    """Every file this tool owns for one app, keyed by art type."""
+    dirs = [directory] if directory else grid_dirs()
+    return [{kind: os.path.join(d, grid_filename(appid, kind))
+             for kind in ART_TYPES} for d in dirs]
+
+
+def install(exe, name, icon=None, dry_run=False, quiet=False):
+    """Write all four art files for this shortcut into every Steam account.
+
+    Returns the icon that was used, which the caller wants for the shortcut's
+    own `icon` field, or None when there was nothing to work from.
+    """
+    def say(text):
+        if not quiet:
+            print(text)
+
+    source = icon or find_icon(exe, name)
+    if not source:
+        say(f"  no icon found for {name!r}; leaving the tile plain")
+        return None
+    if Image is None:
+        say("  python-pillow is not installed; leaving the tile plain")
+        return source
+
+    art = load_icon(source)
+    color = dominant_color(art)
+    appid = grid_appid(f'"{exe}"', name)
+    say(f"  artwork from {source} "
+        f"(#{color[0]:02X}{color[1]:02X}{color[2]:02X}, appid {appid})")
+
+    for group in paths_for(appid):
+        directory = os.path.dirname(next(iter(group.values())))
+        if dry_run:
+            say(f"  would write {len(group)} files to {directory}")
+            continue
+        os.makedirs(directory, exist_ok=True)
+        for kind, path in group.items():
+            render(kind, art, name, color).save(path)
+        say(f"  wrote {len(group)} files to {directory}")
+    return source
+
+
+def remove(exe, name, dry_run=False, quiet=False):
+    """Take the artwork back out again, for --revert and uninstall."""
+    appid = grid_appid(f'"{exe}"', name)
+    gone = 0
+    for group in paths_for(appid):
+        for path in group.values():
+            if not os.path.exists(path):
+                continue
+            gone += 1
+            if not dry_run:
+                os.remove(path)
+    if not quiet and gone:
+        print(f"  {'would remove' if dry_run else 'removed'} {gone} artwork file(s)")
+    return gone
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--name", required=True, help="library entry name")
+    ap.add_argument("--exe", required=True, help="program the entry runs")
+    ap.add_argument("--icon", help="image to build the artwork from")
+    ap.add_argument("--revert", action="store_true", help="delete the artwork")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="show what would change, write nothing")
+    args = ap.parse_args()
+
+    if not grid_dirs():
+        print(f"no Steam user config found under {STEAM_ROOT}/userdata",
+              file=sys.stderr)
+        return 1
+    if args.revert:
+        remove(args.exe, args.name, args.dry_run)
+        return 0
+    if args.icon and not os.path.exists(args.icon):
+        print(f"no such image: {args.icon}", file=sys.stderr)
+        return 1
+    return 0 if install(args.exe, args.name, args.icon, args.dry_run) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

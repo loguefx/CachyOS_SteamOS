@@ -20,6 +20,12 @@ spec = importlib.util.spec_from_loader("ies", loader)
 ies = importlib.util.module_from_spec(spec)
 loader.exec_module(ies)
 
+ART = os.path.join(HERE, "..", "bin", "cachy-console-art")
+art_loader = importlib.machinery.SourceFileLoader("cca", ART)
+art = importlib.util.module_from_spec(
+    importlib.util.spec_from_loader("cca", art_loader))
+art_loader.exec_module(art)
+
 FAILURES = []
 
 
@@ -125,6 +131,74 @@ for label, blob in (("an unknown type byte", b"\x99bogus\x00"),
         check(f"{label} is rejected", "parsed", "VDFError")
     except ies.VDFError:
         check(f"{label} is rejected", "VDFError", "VDFError")
+
+print()
+print("library artwork:")
+# Steam names a shortcut's art files after the same unsigned appid it keeps in
+# shortcuts.vdf, but prints the signed form of that number in its own logs
+# when its asset downloader skips the app. Art filed under the signed form is
+# art Steam never looks at, so the two helpers agreeing is the whole game.
+ART_ID = art.grid_appid(f'"{DISCORD}"', "Discord")
+check("the art helper derives the id the shortcut stores",
+      ART_ID, ies.build_entry(DISCORD, "Discord")["appid"])
+check("and it is the unsigned form, not the negative Steam logs",
+      ART_ID >> 31, 1)
+check("the vertical capsule is <id>p.png",
+      art.grid_filename(ART_ID, "capsule"), f"{ART_ID}p.png")
+check("the horizontal capsule is <id>.png",
+      art.grid_filename(ART_ID, "wide"), f"{ART_ID}.png")
+check("the hero is <id>_hero.png",
+      art.grid_filename(ART_ID, "hero"), f"{ART_ID}_hero.png")
+check("the logo is <id>_logo.png",
+      art.grid_filename(ART_ID, "logo"), f"{ART_ID}_logo.png")
+check("we render the sizes Steam expects",
+      {kind: size for kind, (_, size) in art.ART_TYPES.items()},
+      {"capsule": (600, 900), "wide": (920, 430),
+       "hero": (1920, 620), "logo": (640, 480)})
+
+grid = os.path.join(tempfile.mkdtemp(), "grid")
+group = art.paths_for(ART_ID, grid)
+check("all four files go to one grid directory", len(group), 1)
+check("and no two of them collide", len(set(group[0].values())), 4)
+
+check("a new entry carries no icon unless one is found",
+      ies.build_entry(DISCORD, "Discord")["icon"], "")
+check("and records the one it was given",
+      ies.build_entry(DISCORD, "Discord", "/x/discord.png")["icon"],
+      "/x/discord.png")
+
+print()
+print("finding an icon to build the artwork from:")
+# Biggest wins: a 64px icon stretched over a 600x900 capsule is a blurry mess.
+# A made-up program name keeps this off whatever the host has installed.
+FAKE = "/usr/bin/zz-not-a-real-program"
+root = os.path.join(tempfile.mkdtemp(), "icons")
+for size in ("64x64", "256x256", "128x128"):
+    os.makedirs(os.path.join(root, "hicolor", size, "apps"))
+    open(os.path.join(root, "hicolor", size, "apps",
+                      "zz-not-a-real-program.png"), "wb").close()
+art.icon_dirs = lambda: [root]
+check("the biggest installed icon wins", art.find_icon(FAKE),
+      os.path.join(root, "hicolor/256x256/apps/zz-not-a-real-program.png"))
+
+os.makedirs(os.path.join(root, "hicolor", "scalable", "apps"))
+open(os.path.join(root, "hicolor/scalable/apps/zz-not-a-real-program.svg"),
+     "wb").close()
+check("but a scalable icon beats every bitmap", art.find_icon(FAKE),
+      os.path.join(root, "hicolor/scalable/apps/zz-not-a-real-program.svg"))
+check("the entry name is tried too, for wrapper scripts",
+      art.find_icon("/usr/bin/wrapper", "ZZ Not A Real Program"),
+      os.path.join(root, "hicolor/scalable/apps/zz-not-a-real-program.svg"))
+check("a program with no icon anywhere gets no artwork",
+      art.find_icon("/usr/bin/zz-nothing-here"), None)
+
+if art.Image is not None:
+    swatch = art.Image.new("RGBA", (64, 64), (255, 255, 255, 255))
+    art.ImageDraw.Draw(swatch).rectangle((0, 0, 63, 40), fill=(88, 101, 242, 255))
+    # The white half of Discord's icon outnumbers nothing, but averaging it in
+    # would give a washed-out lilac instead of the colour it is known by.
+    check("the backdrop takes the icon's brand colour, not its average",
+          art.dominant_color(swatch), (88, 101, 242))
 
 print()
 if FAILURES:

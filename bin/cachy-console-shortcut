@@ -23,9 +23,12 @@ owned by your desktop, so it has to be started inside the session:
 Usage:
     cachy-console shortcut [--dry-run] [--revert] [--force]
                            [--name NAME] [--exe PATH]
+                           [--icon PATH] [--no-art]
 """
 
 import argparse
+import importlib.machinery
+import importlib.util
 import os
 import shutil
 import struct
@@ -33,6 +36,19 @@ import subprocess
 import sys
 import time
 import zlib
+
+# Library artwork lives in its own helper because it is the only part of this
+# tool that wants an imaging library, and a machine without Pillow must still
+# be able to add the exit tile.
+try:
+    _ART = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "cachy-console-art")
+    _loader = importlib.machinery.SourceFileLoader("cca", _ART)
+    artwork = importlib.util.module_from_spec(
+        importlib.util.spec_from_loader("cca", _loader))
+    _loader.exec_module(artwork)
+except (OSError, ImportError):
+    artwork = None
 
 MAP_START, STRING, INT32, MAP_END = 0x00, 0x01, 0x02, 0x08
 
@@ -223,14 +239,16 @@ def next_index(shortcuts):
     return str(max(used) + 1 if used else 0)
 
 
-def build_entry(exe, name):
+def build_entry(exe, name, icon=""):
     quoted = f'"{exe}"'       # Steam stores Exe and StartDir quoted
     return {
         "appid": shortcut_appid(quoted, name),
         "AppName": name,
         "Exe": quoted,
         "StartDir": f'"{os.path.dirname(exe)}/"',
-        "icon": "",
+        # Separate from the grid artwork: this is the small icon Steam shows
+        # in list views and in the running-game banner.
+        "icon": icon,
         "ShortcutPath": "",
         "LaunchOptions": "",
         "IsHidden": 0,
@@ -258,6 +276,10 @@ def main():
     ap.add_argument("--name", default=DEFAULT_NAME, help="library entry name")
     ap.add_argument("--exe", default=default_exe(),
                     help="program the entry runs")
+    ap.add_argument("--icon", help="image to build the library artwork from "
+                                   "(default: the program's installed icon)")
+    ap.add_argument("--no-art", action="store_true",
+                    help="add the entry but leave its tile blank")
     args = ap.parse_args()
 
     if not args.dry_run and steam_running() and not args.force:
@@ -275,6 +297,18 @@ def main():
         print(f"no Steam user config found under {STEAM_ROOT}/userdata",
               file=sys.stderr)
         return 1
+
+    # Steam gives a shortcut a blank grey tile, which from a sofa tells you
+    # nothing. The artwork is filed under the same appid as the entry, so it
+    # is generated here rather than being left as a manual step.
+    icon = args.icon or ""
+    if artwork is not None and not args.no_art:
+        print("artwork:")
+        if args.revert:
+            artwork.remove(args.exe, args.name, args.dry_run)
+        else:
+            icon = artwork.install(args.exe, args.name, args.icon,
+                                   args.dry_run) or icon
 
     for path in paths:
         account = os.path.basename(os.path.dirname(os.path.dirname(path)))
@@ -298,11 +332,11 @@ def main():
             obj["shortcuts"] = {str(n): v for n, v in enumerate(shortcuts.values())}
             print(f"  removing {args.name!r}")
         else:
-            entry = build_entry(args.exe, args.name)
+            entry = build_entry(args.exe, args.name, icon)
             if existing is not None:
                 old_name = shortcuts[existing].get("AppName") or args.name
                 if old_name in LEGACY_NAMES and old_name != args.name:
-                    entry = build_entry(args.exe, old_name)
+                    entry = build_entry(args.exe, old_name, icon)
                 shortcuts[existing] = entry
                 print(f"  updating existing entry {existing} -> {entry['AppName']!r} ({args.exe})")
             else:

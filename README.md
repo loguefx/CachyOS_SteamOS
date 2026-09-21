@@ -146,6 +146,24 @@ one, then launch it from your library inside console mode:
 cachy-console shortcut --name Discord --exe /usr/bin/discord   # Steam closed
 ```
 
+That command also gives the tile its picture. A shortcut Steam has no artwork
+for is drawn as a grey placeholder with the name printed across it, which from
+a sofa is barely distinguishable from the entry beside it. `cachy-console-art`
+finds the program's installed icon under `/usr/share/icons`, takes the
+background colour from the icon itself — Discord's own blurple, in its case —
+and renders the four files Steam asks for: the 600x900 capsule that fills the
+library grid, the 920x430 header used in rows and search, the 1920x620 hero
+behind the app's page, and a transparent logo drawn over it. They go into
+`userdata/<id>/config/grid`, named after the same appid as the library entry.
+Nothing is downloaded, and any shortcut whose program ships an icon gets the
+same treatment. This is the one part that wants `python-pillow`; without it
+the entry is still added, just without the artwork.
+
+Steam reads that directory when it starts, so the tile appears on its next
+launch rather than immediately. Pass `--icon PATH` to build the artwork from
+a different image, `--no-art` to leave the tile plain, and `--revert` to take
+both the entry and its artwork away again.
+
 Big Picture's task switcher then flips between Discord and your game with the
 controller. It plays through whatever `AUDIO_DEVICE` console mode is using,
 because it inherits `PULSE_SINK` from the session, and it records from
