@@ -18,6 +18,11 @@ While focus sits on something that is not a game, such as the Big Picture
 library, the current mutes are held rather than cleared, so opening the Steam
 menu does not suddenly let a background game blare through.
 
+Anything named in AUDIO_NEVER_MUTE is left audible even though Steam started it.
+Voice chat needs that: Discord launched from the library is a Steam shortcut
+like any other, and muting it whenever you look at your game is the opposite of
+what it is for.
+
 Usage:
     cachy-console-audio [--verbose] [--dry-run] [--once] [--status]
 """
@@ -45,19 +50,52 @@ CONFIG_PATH = os.path.join(
     "cachy-console", "config")
 
 
-def audio_focus_enabled():
-    """Whether the user wants this at all; on by default before setup runs."""
+def read_config():
+    """The config file as a dict, parsed the way the other tools parse it."""
+    values = {}
     try:
         with open(CONFIG_PATH) as fh:
             for line in fh:
                 line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
                 key, _, value = line.partition("=")
-                if key.strip() == "AUDIO_FOCUS":
-                    return value.strip().strip('"').strip("'").lower() not in (
-                        "off", "no", "0", "false")
+                values[key.strip()] = value.strip().strip('"').strip("'")
     except OSError:
         pass
-    return True
+    return values
+
+
+def audio_focus_enabled():
+    """Whether the user wants this at all; on by default before setup runs."""
+    value = read_config().get("AUDIO_FOCUS")
+    if value is None:
+        return True
+    return value.lower() not in ("off", "no", "0", "false")
+
+
+def never_mute():
+    """Names and appids the user wants left audible, from AUDIO_NEVER_MUTE.
+
+    Voice chat is the case this exists for. Discord has to be started inside
+    gamescope to be visible there, which in practice means launching it from
+    the library -- and that makes it a Steam shortcut with a SteamGameId, so
+    without an exemption it counts as a game and goes silent the moment you
+    focus the one you are playing.
+
+    Read once at startup, so changing it needs:
+        systemctl --user restart cachy-console-audio
+    """
+    names, appids = set(), set()
+    for item in read_config().get("AUDIO_NEVER_MUTE", "").replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if item.isdigit():
+            appids.add(int(item))
+        else:
+            names.add(item.lower())
+    return names, appids
 
 
 def log(msg):
@@ -147,6 +185,26 @@ def parent_of(pid):
     return None
 
 
+def process_names(pid):
+    """The command name and executable of a pid.
+
+    Matching on these as well as the stream label matters because PipeWire's
+    application.name is whatever the app chose to report, and an Electron app's
+    audio process does not reliably call itself by the app's own name.
+    """
+    names = set()
+    try:
+        with open(f"/proc/{pid}/comm") as fh:
+            names.add(fh.read().strip().lower())
+    except OSError:
+        pass
+    try:
+        names.add(os.path.basename(os.readlink(f"/proc/{pid}/exe")).lower())
+    except OSError:
+        pass
+    return {n for n in names if n}
+
+
 def steam_appid(pid, limit=24):
     """The Steam appid owning this process, or None if Steam did not start it.
 
@@ -208,6 +266,16 @@ def set_mute(index, muted, dry_run):
     if dry_run:
         return True
     return run(["pactl", "set-sink-input-mute", str(index), "1" if muted else "0"]) is not None
+
+
+def exempt_stream(stream, appid, names, appids):
+    """Whether AUDIO_NEVER_MUTE covers this stream, so it stays audible."""
+    if appid in appids:
+        return True
+    if not names:
+        return False
+    candidates = {(stream.name or "").lower()} | process_names(stream.pid)
+    return any(p in c for p in names for c in candidates if c)
 
 
 # ---- focus --------------------------------------------------------------
@@ -283,20 +351,42 @@ class AudioFocus:
         self.dry_run = dry_run
         self.muted_appids = set()      # games we are holding muted
         self.appid_cache = {}          # pid -> appid, so we re-read /proc rarely
+        self.exempt_cache = {}         # pid -> never-mute, for the same reason
+        self.never_names, self.never_appids = never_mute()
         self.last_focus = None
         self.last_report = None
+        if self.never_names or self.never_appids:
+            log(f"never muting: {self.never_listing()}")
+
+    def never_listing(self):
+        return ", ".join(sorted(self.never_names)
+                         + [str(a) for a in sorted(self.never_appids)])
 
     def appid_for(self, pid):
         if pid not in self.appid_cache:
             self.appid_cache[pid] = steam_appid(pid)
         return self.appid_cache[pid]
 
+    def exempt(self, stream, appid):
+        if stream.pid not in self.exempt_cache:
+            self.exempt_cache[stream.pid] = exempt_stream(
+                stream, appid, self.never_names, self.never_appids)
+        return self.exempt_cache[stream.pid]
+
     def games(self, streams):
-        """Map of appid -> streams, for games only."""
+        """Map of appid -> streams, for games only.
+
+        An exempt stream is dropped here rather than merely skipped when muting,
+        so that voice chat plus one game counts as one game and nothing is muted
+        at all.
+        """
         out = {}
         for stream in streams:
             appid = self.appid_for(stream.pid)
             if appid is None or appid in NON_GAME_APPIDS:
+                continue
+            if self.exempt(stream, appid):
+                vlog(self.verbose, f"{stream.name!r} is never muted; ignoring")
                 continue
             out.setdefault(appid, []).append(stream)
         return out
@@ -329,8 +419,9 @@ class AudioFocus:
 
     def prune(self, streams):
         live = {s.pid for s in streams}
-        for pid in [p for p in self.appid_cache if p not in live]:
-            del self.appid_cache[pid]
+        for cache in (self.appid_cache, self.exempt_cache):
+            for pid in [p for p in cache if p not in live]:
+                del cache[pid]
 
     def poll(self):
         """One pass. Returns True if a session is active, for pacing."""
@@ -444,8 +535,11 @@ def main():
 
 
 def status():
+    names, appids = never_mute()
     streams = sink_inputs()
     print(f"playback streams: {len(streams)}")
+    listing = ", ".join(sorted(names) + [str(a) for a in sorted(appids)])
+    print(f"never muted: {listing or '(nothing; see AUDIO_NEVER_MUTE)'}")
     for stream in streams:
         appid = steam_appid(stream.pid)
         kind = "not a game"
@@ -453,6 +547,8 @@ def status():
             kind = f"steam itself (appid {appid})"
         elif appid is not None:
             kind = f"game appid {appid}"
+            if exempt_stream(stream, appid, names, appids):
+                kind += ", never muted"
         print(f"  [{stream.index}] {stream.name!r} pid={stream.pid} "
               f"muted={stream.muted} -> {kind}")
 

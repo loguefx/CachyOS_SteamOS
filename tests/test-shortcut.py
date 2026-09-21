@@ -87,6 +87,26 @@ check("reverting leaves only their game",
 check("and renumbers keys consecutively", list(renumbered), ["0"])
 
 print()
+print("a second shortcut living alongside the exit tile:")
+# Discord has to be launched inside gamescope, so it gets its own tile. The
+# legacy fallbacks must not let that run adopt and rename the exit entry.
+DISCORD = "/usr/bin/discord"
+library = {"0": ies.build_entry(EXE, NAME)}
+check("adding Discord does not adopt the exit tile",
+      ies.find_entry(library, DISCORD, "Discord"), None)
+check("the exit run still finds its own tile", ies.find_entry(library, EXE, NAME), "0")
+
+library["1"] = ies.build_entry(DISCORD, "Discord")
+check("Discord is found for a later update", ies.find_entry(library, DISCORD, "Discord"), "1")
+check("and the exit tile stays separate", ies.find_entry(library, EXE, NAME), "0")
+check("the two get different appids",
+      library["0"]["appid"] != library["1"]["appid"], True)
+
+old = {"0": ies.build_entry("/home/me/.local/bin/projector-exit", "Exit Game Mode")}
+check("a Discord run leaves an old projector-exit tile alone",
+      ies.find_entry(old, DISCORD, "Discord"), None)
+
+print()
 print("first run, with no library yet:")
 check("a missing file reads as an empty library",
       ies.load(os.path.join(tempfile.mkdtemp(), "absent.vdf")), {"shortcuts": {}})

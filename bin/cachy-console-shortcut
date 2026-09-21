@@ -14,8 +14,15 @@ so the desktop comes back and cachy-console-watch restarts the desktop client.
 Steam rewrites shortcuts.vdf from memory when it shuts down, so it must not be
 running while we edit the file, or our entry is silently discarded.
 
+The same machinery adds any other program you want to reach from the couch,
+which is how Discord gets into console mode -- gamescope cannot adopt a window
+owned by your desktop, so it has to be started inside the session:
+
+    cachy-console shortcut --name Discord --exe /usr/bin/discord
+
 Usage:
-    cachy-console shortcut [--dry-run] [--revert] [--force] [--name NAME]
+    cachy-console shortcut [--dry-run] [--revert] [--force]
+                           [--name NAME] [--exe PATH]
 """
 
 import argparse
@@ -181,7 +188,20 @@ LEGACY_NAMES = ("Exit Game Mode", "Exit Console Mode", DEFAULT_NAME)
 LEGACY_EXE_MARKERS = ("projector-exit", "cachy-console-exit")
 
 
+def manages_exit_entry(exe, name):
+    """Whether this run is about the exit tile rather than some other program.
+
+    The legacy fallbacks adopt and rename whatever they match, which is what we
+    want for an old "Exit Game Mode" tile. Applying them to `--name Discord`
+    would instead replace the exit tile with Discord, so they are limited to
+    runs that are actually managing the exit entry.
+    """
+    return (any(marker in exe for marker in LEGACY_EXE_MARKERS)
+            or name in LEGACY_NAMES)
+
+
 def find_entry(shortcuts, exe, name):
+    legacy = manages_exit_entry(exe, name)
     for index, entry in shortcuts.items():
         if not isinstance(entry, dict):
             continue
@@ -189,6 +209,8 @@ def find_entry(shortcuts, exe, name):
         stored = str(entry.get("Exe", ""))
         if app == name or exe in stored:
             return index
+        if not legacy:
+            continue
         if app in LEGACY_NAMES:
             return index
         if any(marker in stored for marker in LEGACY_EXE_MARKERS):

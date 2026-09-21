@@ -277,6 +277,60 @@ check("USB route points at the headset",
 
 
 print()
+print("the microphone:")
+
+# PipeWire publishes a .monitor source for every sink. Offering those as
+# microphones would be a list of loopbacks, most of them named after outputs.
+SOURCES = [
+    {"name": "alsa_output.usb-RODE_RODECaster_Duo.analog-stereo.monitor",
+     "properties": {"device.class": "monitor", "node.nick": "RODECaster Duo"}},
+    {"name": "alsa_input.usb-RODE_RODECaster_Duo.analog-stereo",
+     "properties": {"device.class": "sound", "node.nick": "RODECaster Duo"}},
+    {"name": "alsa_output.pci-0000_0c_00.1.hdmi-stereo.monitor",
+     "properties": {"device.class": "monitor", "node.nick": "Odyssey G93SC"}},
+    {"name": "alsa_input.usb-HyperX_Cloud_III_S.mono-fallback",
+     "properties": {"device.class": "sound",
+                    "node.nick": "HyperX Cloud III S Wireless"}},
+]
+cd._sources_raw = lambda: [dict(s) for s in SOURCES]
+
+check("monitor sources are not offered as microphones",
+      [s["name"] for s in cd._sources()],
+      ["alsa_input.usb-RODE_RODECaster_Duo.analog-stereo",
+       "alsa_input.usb-HyperX_Cloud_III_S.mono-fallback"])
+check("the choices are labelled by nick",
+      [c["id"] for c in cd.audio_input_choices()],
+      ["RODECaster Duo", "HyperX Cloud III S Wireless"])
+
+cd.read_config = lambda: {}
+check("no saved microphone leaves input alone", cd.match_audio_input(), None)
+check("and nothing is saved to report", cd.saved_audio_input_device(), None)
+
+cd.read_config = lambda: {"AUDIO_INPUT_DEVICE": "HyperX Cloud III S Wireless"}
+check("a saved headset resolves to its capture source, not its monitor",
+      cd.match_audio_input(), "alsa_input.usb-HyperX_Cloud_III_S.mono-fallback")
+
+cd.read_config = lambda: {"AUDIO_INPUT_DEVICE": "RODECaster Duo"}
+check("the RODE resolves to its input even though a monitor shares the name",
+      cd.match_audio_input(), "alsa_input.usb-RODE_RODECaster_Duo.analog-stereo")
+
+cd.read_config = lambda: {"AUDIO_INPUT_DEVICE": "Some Unplugged Mic"}
+check("an absent microphone falls back to the session default rather than "
+      "picking another one", cd.match_audio_input(), None)
+
+# Output and input are independent: saving a headset mic must not drag console
+# mode's speakers off the projector.
+cd.read_config = lambda: {"AUDIO_DEVICE": "Optoma UHD",
+                          "AUDIO_INPUT_DEVICE": "HyperX Cloud III S Wireless",
+                          "DISPLAY": "HDMI-1",
+                          "DISPLAY_MODEL": "Optoma Corporation"}
+hit = cd.match_audio()
+check("the saved output is still the projector",
+      hit.get("eld") if hit else None, "Optoma UHD")
+check("while input is the headset",
+      cd.match_audio_input(), "alsa_input.usb-HyperX_Cloud_III_S.mono-fallback")
+
+print()
 if FAILURES:
     print(f"{len(FAILURES)} failure(s): " + ", ".join(FAILURES))
     sys.exit(1)

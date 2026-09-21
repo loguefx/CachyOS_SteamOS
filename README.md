@@ -25,7 +25,9 @@ normal desktop changes.
 - **The Steam button opens it**, the same double-press that already opens Big
   Picture
 - **One game's audio at a time** — with two games running, you only hear the one
-  you switched to
+  you switched to, while voice chat stays audible through all of it
+- **Discord on the couch**, launched from your library and using the same
+  speakers and microphone console mode does
 - **A working way out**, which Big Picture itself does not give you
 - **No trackpad permission prompts** from the Steam controller
 
@@ -129,6 +131,30 @@ shortcuts file from memory when it exits and would otherwise discard the entry.
 An older "Exit Game Mode" tile that still pointed at `projector-exit` is updated
 to `cachy-console-exit` by that same command.
 
+### Voice chat
+
+**The Discord already open on your desktop cannot be moved into console mode.**
+A window belongs to the compositor its client connected to, and gamescope is a
+separate nested one — the same reason Big Picture has to be relaunched rather
+than moved. Discord also keeps a single-instance lock, so starting it inside
+gamescope while the desktop copy runs just raises that copy and exits.
+
+So it is one Discord at a time, which follows you in and out. Quit the desktop
+one, then launch it from your library inside console mode:
+
+```bash
+cachy-console shortcut --name Discord --exe /usr/bin/discord   # Steam closed
+```
+
+Big Picture's task switcher then flips between Discord and your game with the
+controller. It plays through whatever `AUDIO_DEVICE` console mode is using,
+because it inherits `PULSE_SINK` from the session, and it records from
+`AUDIO_INPUT_DEVICE` if you picked one.
+
+Note the entry in `AUDIO_NEVER_MUTE`. A library shortcut is a Steam app like any
+other, so without that exemption per-game audio focus counts Discord as a game
+and mutes it the moment you look at the one you are playing.
+
 ## Configuration
 
 `~/.config/cachy-console/config`, written by `cachy-console settings` and safe to
@@ -145,6 +171,8 @@ edit by hand:
 | `STEAM_BUTTON` | `on` | Let the Steam button open console mode |
 | `AUDIO_FOCUS` | `on` | Mute games you are not looking at |
 | `AUDIO_DEVICE` | *(follows display)* | HDMI monitor name (`Optoma UHD`) or device (`RODECaster Duo`). Kept until you change it in **Cachy Console** settings |
+| `AUDIO_NEVER_MUTE` | `Discord` | Left audible even though Steam started it. Comma-separated names or appids. Read by the audio service, so restart it after editing |
+| `AUDIO_INPUT_DEVICE` | *(session default)* | Microphone for console mode, e.g. `HyperX Cloud III S Wireless`. Empty leaves input alone |
 | `EXTRA_GAMESCOPE_ARGS` | empty | Passed straight through, e.g. `--mangoapp` |
 
 ## How it works
@@ -186,7 +214,17 @@ mute one stream. A stream is treated as a game's only when its process, or one
 of its ancestors, was started by Steam with `SteamGameId` set, so browsers,
 music and Steam's own interface sounds are never touched. Nothing is muted
 unless two or more games are actually producing audio, and every mute is undone
-when the games close or the service stops.
+when the games close or the service stops. `AUDIO_NEVER_MUTE` exempts anything
+that is technically a Steam app but is not a game — voice chat, which is worse
+than useless if it goes quiet whenever you look at what you are playing. Names
+there are matched against the stream's own label and against the process behind
+it, because an Electron app's audio process is not reliably named after the app.
+
+**The microphone.** `AUDIO_INPUT_DEVICE` is exported as `PULSE_SOURCE` to what
+console mode starts, and nothing else: the desktop's default input is never
+changed, so the mic at your desk keeps working for everything else. Only real
+capture devices are offered, never the `.monitor` loopback PipeWire publishes
+for every output. Leaving it empty leaves input alone entirely.
 
 **The trackpad prompt.** Steam drives the controller trackpad through XTEST. On
 Wayland, XWayland turns that into an xdg-desktop-portal request — the "allow

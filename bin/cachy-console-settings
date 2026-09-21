@@ -62,6 +62,15 @@ def save_audio(device):
     ccd.update_config({"AUDIO_DEVICE": device})
 
 
+def save_audio_input(device):
+    ccd.update_config({"AUDIO_INPUT_DEVICE": device})
+
+
+def snapshot_input():
+    """Microphones, plus the saved one ("" means the session default)."""
+    return ccd.audio_input_choices(), ccd.saved_audio_input_device() or ""
+
+
 def snapshot_audio():
     """HDMI monitors and other sinks, plus the saved (or suggested) output."""
     rows = ccd.audio_choices()
@@ -94,14 +103,19 @@ def console_running():
         return False
 
 
-def apply_message(connector, audio="", audio_applied=False):
+def apply_message(connector, audio="", audio_applied=False, mic=""):
     extra = f" Audio: {audio}." if audio else ""
+    if mic:
+        extra += f" Mic: {mic}."
     if console_running():
         live = " Audio is switched now." if audio_applied else ""
-        return (f"Saved {connector}.{extra}{live} Console mode is still on the "
-                "old display. Exit with cachy-console exit (or Exit Console "
-                "Mode in the library), then press the Steam button twice to "
-                f"open it on {connector}.")
+        # The mic is an environment variable handed to what console mode starts,
+        # so a running session keeps the one it was given.
+        later = " The microphone applies to the next session." if mic else ""
+        return (f"Saved {connector}.{extra}{live}{later} Console mode is still "
+                "on the old display. Exit with cachy-console exit (or Exit "
+                "Console Mode in the library), then press the Steam button "
+                f"twice to open it on {connector}.")
     return (f"Saved {connector}.{extra} Press the Steam button twice to open "
             "console mode on this display.")
 
@@ -119,6 +133,14 @@ AUDIO_HINT = (
     "moves TV/monitor HDMI audio onto that screen for the session."
 )
 
+INPUT_HINT = (
+    "Voice chat from the couch uses this microphone. It is handed only to what "
+    "console mode launches, so your desktop's own default input is left alone. "
+    "A change takes effect the next time console mode starts."
+)
+
+DEFAULT_INPUT_LABEL = "Session default (leave input alone)"
+
 
 def run_gtk():
     import gi
@@ -129,14 +151,23 @@ def run_gtk():
     class Window(Gtk.ApplicationWindow):
         def __init__(self, app):
             super().__init__(application=app, title=APP_NAME)
-            self.set_default_size(520, 640)
+            self.set_default_size(560, 720)
             self.set_border_width(16)
             self.choice = None
             self.choice_model = ""
             self.choice_audio = ""
+            self.choice_input = ""
+
+            # Three groups of radios do not fit every screen, and Save has to
+            # stay reachable, so only the choices scroll.
+            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            self.add(outer)
+            scroller = Gtk.ScrolledWindow()
+            scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            outer.pack_start(scroller, True, True, 0)
 
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-            self.add(box)
+            scroller.add(box)
 
             title = Gtk.Label()
             title.set_markup(f"<b>{APP_NAME}</b> — which display should console mode use?")
@@ -166,11 +197,25 @@ def run_gtk():
             self.audio_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
             box.pack_start(self.audio_box, True, True, 0)
 
+            input_title = Gtk.Label()
+            input_title.set_markup("<b>Microphone</b>")
+            input_title.set_xalign(0)
+            box.pack_start(input_title, False, False, 0)
+
+            input_hint = Gtk.Label(label=INPUT_HINT)
+            input_hint.set_line_wrap(True)
+            input_hint.set_xalign(0)
+            input_hint.set_max_width_chars(56)
+            box.pack_start(input_hint, False, False, 0)
+
+            self.input_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            box.pack_start(self.input_box, True, True, 0)
+
             self.status = Gtk.Label()
             self.status.set_line_wrap(True)
             self.status.set_xalign(0)
             self.status.set_max_width_chars(56)
-            box.pack_start(self.status, False, False, 0)
+            outer.pack_start(self.status, False, False, 0)
 
             buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             refresh = Gtk.Button(label="Refresh")
@@ -180,7 +225,7 @@ def run_gtk():
             save.connect("clicked", self.on_save)
             buttons.pack_end(save, False, False, 0)
             buttons.pack_end(refresh, False, False, 0)
-            box.pack_end(buttons, False, False, 0)
+            outer.pack_end(buttons, False, False, 0)
             self.reload()
 
         def reload(self):
@@ -188,9 +233,13 @@ def run_gtk():
                 self.list_box.remove(child)
             for child in list(self.audio_box.get_children()):
                 self.audio_box.remove(child)
+            for child in list(self.input_box.get_children()):
+                self.input_box.remove(child)
             rows, saved = snapshot()
             audio_rows, saved_audio = snapshot_audio()
+            input_rows, saved_input = snapshot_input()
             self.choice_audio = saved_audio
+            self.choice_input = saved_input
             if not rows:
                 self.list_box.pack_start(
                     Gtk.Label(label="No displays detected."), True, True, 0)
@@ -227,10 +276,29 @@ def run_gtk():
                         self.choice_audio = row["id"]
                     radio.connect("toggled", self.on_audio_toggle, row)
                     self.audio_box.pack_start(radio, False, False, 0)
+
+            # Always offered, so there is a way back to not touching input.
+            group = Gtk.RadioButton.new_with_label_from_widget(
+                None, DEFAULT_INPUT_LABEL)
+            group.audio_input = ""
+            group.set_active(not saved_input)
+            group.connect("toggled", self.on_input_toggle, {"id": ""})
+            self.input_box.pack_start(group, False, False, 0)
+            for row in input_rows:
+                label = f"{row['label']}  ({row['detail']})"
+                radio = Gtk.RadioButton.new_with_label_from_widget(group, label)
+                radio.audio_input = row["id"]
+                if saved_input and row["id"].lower() == saved_input.lower():
+                    radio.set_active(True)
+                    self.choice_input = row["id"]
+                radio.connect("toggled", self.on_input_toggle, row)
+                self.input_box.pack_start(radio, False, False, 0)
+
             if saved:
                 extra = " Console mode is running on the previous display." if console_running() else ""
                 audio = f" Audio: {saved_audio}." if saved_audio else ""
-                self.status.set_text(f"Saved: {saved}.{audio}{extra}")
+                mic = f" Mic: {saved_input}." if saved_input else ""
+                self.status.set_text(f"Saved: {saved}.{audio}{mic}{extra}")
             else:
                 self.status.set_text("Nothing saved yet. Pick a display and click Save.")
             self.show_all()
@@ -243,6 +311,10 @@ def run_gtk():
         def on_audio_toggle(self, radio, row):
             if radio.get_active():
                 self.choice_audio = row["id"]
+
+        def on_input_toggle(self, radio, row):
+            if radio.get_active():
+                self.choice_input = row["id"]
 
         def on_save(self, _button):
             if not self.choice:
@@ -258,13 +330,20 @@ def run_gtk():
                 if isinstance(child, Gtk.RadioButton) and child.get_active():
                     audio = getattr(child, "audio_id", audio)
                     self.choice_audio = audio
+            mic = self.choice_input
+            for child in self.input_box.get_children():
+                if isinstance(child, Gtk.RadioButton) and child.get_active():
+                    mic = getattr(child, "audio_input", mic)
+                    self.choice_input = mic
             save_connector(self.choice, model)
             if audio:
                 save_audio(audio)
+            # Written even when empty: that is how the session default is chosen.
+            save_audio_input(mic)
             applied = False
             if audio and console_running():
                 applied = apply_audio_now()
-            self.status.set_text(apply_message(self.choice, audio, applied))
+            self.status.set_text(apply_message(self.choice, audio, applied, mic))
             self.reload()
 
     class App(Gtk.Application):
@@ -293,9 +372,10 @@ def run_tk():
 
     root = tk.Tk()
     root.title(APP_NAME)
-    root.minsize(500, 560)
+    root.minsize(520, 680)
     var = tk.StringVar()
     audio_var = tk.StringVar()
+    input_var = tk.StringVar()
     status = tk.StringVar()
     frame = ttk.Frame(root, padding=16)
     frame.pack(fill="both", expand=True)
@@ -311,14 +391,23 @@ def run_tk():
         anchor="w", pady=(4, 8))
     audio_radios = ttk.Frame(frame)
     audio_radios.pack(fill="both", expand=True)
+    ttk.Label(frame, text="Microphone", font=("", 12, "bold")).pack(
+        anchor="w", pady=(8, 0))
+    ttk.Label(frame, text=INPUT_HINT, wraplength=460, justify="left").pack(
+        anchor="w", pady=(4, 8))
+    input_radios = ttk.Frame(frame)
+    input_radios.pack(fill="both", expand=True)
 
     def reload():
         for child in radios.winfo_children():
             child.destroy()
         for child in audio_radios.winfo_children():
             child.destroy()
+        for child in input_radios.winfo_children():
+            child.destroy()
         rows, saved = snapshot()
         audio_rows, saved_audio = snapshot_audio()
+        input_rows, saved_input = snapshot_input()
         if saved:
             var.set(saved)
             for row in rows:
@@ -327,11 +416,13 @@ def run_tk():
                     break
             extra = " Console mode is running on the previous display." if console_running() else ""
             audio = f" Audio: {saved_audio}." if saved_audio else ""
-            status.set(f"Saved: {saved}.{audio}{extra}")
+            mic = f" Mic: {saved_input}." if saved_input else ""
+            status.set(f"Saved: {saved}.{audio}{mic}{extra}")
         else:
             var.set("")
             status.set("Nothing saved yet. Pick a display and click Save.")
         audio_var.set(saved_audio or "")
+        input_var.set(saved_input or "")
         if not rows:
             ttk.Label(radios, text="No displays detected.").pack(anchor="w")
         else:
@@ -346,6 +437,13 @@ def run_tk():
                 text = f"{row['label']}  ({row['detail']})"
                 ttk.Radiobutton(audio_radios, text=text, value=row["id"],
                                 variable=audio_var).pack(anchor="w", pady=2)
+        # Always offered, so there is a way back to not touching input.
+        ttk.Radiobutton(input_radios, text=DEFAULT_INPUT_LABEL, value="",
+                        variable=input_var).pack(anchor="w", pady=2)
+        for row in input_rows:
+            text = f"{row['label']}  ({row['detail']})"
+            ttk.Radiobutton(input_radios, text=text, value=row["id"],
+                            variable=input_var).pack(anchor="w", pady=2)
 
     def on_save():
         connector = var.get().strip()
@@ -358,11 +456,14 @@ def run_tk():
                 model = row["model"]
                 break
         audio = audio_var.get().strip()
+        mic = input_var.get().strip()
         save_connector(connector, model)
         if audio:
             save_audio(audio)
+        # Written even when empty: that is how the session default is chosen.
+        save_audio_input(mic)
         applied = bool(audio and console_running() and apply_audio_now())
-        status.set(apply_message(connector, audio, applied))
+        status.set(apply_message(connector, audio, applied, mic))
         reload()
 
     ttk.Label(frame, textvariable=status, wraplength=460, justify="left").pack(

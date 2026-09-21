@@ -43,7 +43,8 @@ def check(label, got, want):
 class World:
     """A fake machine: some streams, some games, a focused app."""
 
-    def __init__(self, streams=(), owners=None, focus=None, session=True):
+    def __init__(self, streams=(), owners=None, focus=None, session=True,
+                 never=()):
         self.streams = list(streams)
         self.owners = dict(owners or {})     # pid -> appid (None = not a game)
         self.focus = focus
@@ -57,6 +58,13 @@ class World:
         pa.focused_appid = lambda display: self.focus
         pa.set_mute = self._set_mute
         pa.log = self.logs.append
+        # AUDIO_NEVER_MUTE and /proc are both stated here rather than read from
+        # the machine, which would make these tests depend on the config and the
+        # process table of whoever runs them.
+        names = {str(n).lower() for n in never if not str(n).isdigit()}
+        appids = {int(n) for n in never if str(n).isdigit()}
+        pa.never_mute = lambda: (names, appids)
+        pa.process_names = lambda pid: set()
 
     def _set_mute(self, index, muted, dry_run):
         self.mute_calls.append((index, muted))
@@ -186,6 +194,62 @@ check("a new stream from a muted game is muted too", world.muted(), [2, 3])
 world.add(4, 100, "GameA second device")
 focus.poll()
 check("but a new stream from the focused game plays", world.streams[-1].muted, False)
+
+print()
+print("never muting voice chat:")
+
+# Discord has to be started inside gamescope to be visible there, which means
+# launching it from the library -- so Steam gives it a SteamGameId and it looks
+# like a game. This is the case AUDIO_NEVER_MUTE exists for.
+DISCORD = 3278583129
+
+world = World(streams=[stream(1, 100, "GameA"), stream(2, 700, "Discord")],
+              owners={100: GAME_A, 700: DISCORD}, focus=GAME_A)
+focus = pa.AudioFocus()
+focus.poll()
+check("without an exemption Discord is muted, which is the trap",
+      world.muted(), [2])
+
+world = World(streams=[stream(1, 100, "GameA"), stream(2, 700, "Discord")],
+              owners={100: GAME_A, 700: DISCORD}, focus=GAME_A, never=("Discord",))
+focus = pa.AudioFocus()
+focus.poll()
+check("naming it leaves it audible while a game is focused", world.muted(), [])
+check("and it is not counted as a game at all", focus.muted_appids, set())
+
+world = World(streams=[stream(1, 100, "GameA"), stream(2, 700, "discord")],
+              owners={100: GAME_A, 700: DISCORD}, focus=GAME_A, never=("DISCORD",))
+focus = pa.AudioFocus()
+focus.poll()
+check("the name match ignores case", world.muted(), [])
+
+world = World(streams=[stream(1, 100, "GameA"), stream(2, 700, "Discord")],
+              owners={100: GAME_A, 700: DISCORD}, focus=GAME_A, never=(DISCORD,))
+focus = pa.AudioFocus()
+focus.poll()
+check("an appid can be exempted instead of a name", world.muted(), [])
+
+world = World(
+    streams=[stream(1, 100, "GameA"), stream(2, 200, "GameB"), stream(3, 700, "Discord")],
+    owners={100: GAME_A, 200: GAME_B, 700: DISCORD}, focus=GAME_A, never=("Discord",))
+focus = pa.AudioFocus()
+focus.poll()
+check("two real games are still managed around it", world.muted(), [2])
+world.focus = GAME_B
+focus.poll()
+check("switching between them still works", world.muted(), [1])
+check("and Discord was never touched", [c for c in world.mute_calls if c[0] == 3], [])
+
+# The stream label is whatever the app reported; an Electron audio process is
+# not reliably named after the app, so the process is checked as well.
+pa.process_names = lambda pid: {"discord"}
+check("a stream labelled 'playStream' is still recognised by its process",
+      pa.exempt_stream(stream(1, 700, "playStream"), DISCORD, {"discord"}, set()), True)
+pa.process_names = lambda pid: {"firefox"}
+check("an unrelated process is not exempt",
+      pa.exempt_stream(stream(1, 900, "playStream"), DISCORD, {"discord"}, set()), False)
+check("no exemptions configured means no /proc lookups at all",
+      pa.exempt_stream(stream(1, 900, "Discord"), DISCORD, set(), set()), False)
 
 print()
 print("robustness:")

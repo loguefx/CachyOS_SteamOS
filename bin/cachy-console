@@ -42,6 +42,7 @@ CFG_HDR=off
 CFG_VRR=on
 CFG_TRACKPAD_FIX=on
 CFG_AUDIO_DEVICE=""
+CFG_AUDIO_INPUT_DEVICE=""
 CFG_EXTRA_GAMESCOPE_ARGS=""
 
 DRY_RUN=0
@@ -94,9 +95,9 @@ load_config() {
         value="${value%\"}"; value="${value#\"}"
         value="${value%\'}"; value="${value#\'}"
         case "$key" in
-            DISPLAY|DISPLAY_MODEL|RESOLUTION|REFRESH|HDR|VRR|TRACKPAD_FIX|EXTRA_GAMESCOPE_ARGS|AUDIO_DEVICE)
+            DISPLAY|DISPLAY_MODEL|RESOLUTION|REFRESH|HDR|VRR|TRACKPAD_FIX|EXTRA_GAMESCOPE_ARGS|AUDIO_DEVICE|AUDIO_INPUT_DEVICE)
                 printf -v "CFG_$key" '%s' "$value" ;;
-            STEAM_BUTTON|AUDIO_FOCUS) ;;   # read by the services, not by us
+            STEAM_BUTTON|AUDIO_FOCUS|AUDIO_NEVER_MUTE) ;;   # read by the services, not by us
             "") ;;
             *) warn "ignoring unknown setting in $CONFIG_FILE: $key" ;;
         esac
@@ -255,6 +256,9 @@ It will not choose a screen for you."
         say "  ${argv[*]}"
         say "  HDMI audio:"
         "$HELPER_DISPLAY" audio-route --dry-run 2>/dev/null | sed 's/^/    /' || true
+        local dry_source
+        dry_source="$("$HELPER_DISPLAY" audio-input-resolve 2>/dev/null || true)"
+        say "  microphone: ${dry_source:-(session default)}"
         return 0
     fi
 
@@ -273,6 +277,17 @@ It will not choose a screen for you."
     # Steam and games inherit this, so they play on the TV even if the
     # session default is still a headset.
     [[ -n "$sink" ]] && export PULSE_SINK="$sink"
+
+    # Same idea for the microphone, which voice chat in console mode needs: the
+    # desktop default is likely the mic at your desk, not the one by the TV.
+    # Only set when saved, and only for what we launch, so the desktop's own
+    # default source is never changed.
+    local source
+    source="$("$HELPER_DISPLAY" audio-input-resolve 2>/dev/null || true)"
+    if [[ -n "$source" ]]; then
+        export PULSE_SOURCE="$source"
+        say "Microphone: $source"
+    fi
 
     # Mesa's device-select layer can sit in front of gamescope's WSI hook and
     # produce a "non-Gamescope swapchain" dialog. Anti-lag is opt-in but if it
@@ -346,10 +361,23 @@ STEAM_BUTTON=on
 # looking at. Read by cachy-console-audio.service.
 AUDIO_FOCUS=on
 
+# Never mute these, even though Steam started them. Comma separated names or
+# appids. Voice chat belongs here: Discord launched from the library is a Steam
+# shortcut like any other, so without this it counts as a game and goes quiet
+# whenever you look at the one you are playing.
+# Read by cachy-console-audio.service; restart it after changing this.
+AUDIO_NEVER_MUTE=Discord
+
 # Audio output inside console mode. An HDMI monitor name (Optoma UHD) or
 # a device name (RODECaster Duo). Empty follows the saved display.
 # Change it with: cachy-console settings
 AUDIO_DEVICE=$CFG_AUDIO_DEVICE
+
+# Microphone inside console mode, for voice chat from the couch. A device name
+# (HyperX Cloud III S Wireless). Empty leaves input alone, so whatever your
+# desktop uses is what console mode uses.
+# Change it with: cachy-console settings
+AUDIO_INPUT_DEVICE=$CFG_AUDIO_INPUT_DEVICE
 
 # Extra arguments passed straight to gamescope, for anything not covered above.
 # For example: EXTRA_GAMESCOPE_ARGS=--mangoapp
@@ -512,6 +540,10 @@ status() {
     say
     say "== HDMI audio =="
     "$HELPER_DISPLAY" audio-list || true
+
+    say
+    say "== microphone =="
+    "$HELPER_DISPLAY" audio-input-list || true
 
     say
     say "== what would run =="

@@ -615,6 +615,84 @@ def _sinks():
     return _pactl_json("sinks")
 
 
+def _sources():
+    """Real capture devices only.
+
+    PipeWire publishes a .monitor source for every sink, which is a loopback of
+    output rather than a microphone, and offering those as input choices would
+    be actively confusing.
+    """
+    out = []
+    for source in _sources_raw():
+        props = source.get("properties") or {}
+        name = source.get("name") or ""
+        if (props.get("device.class") or "").lower() == "monitor":
+            continue
+        if name.endswith(".monitor") or source.get("monitor_of_sink"):
+            continue
+        out.append(source)
+    return out
+
+
+def _sources_raw():
+    return _pactl_json("sources")
+
+
+def _source_labels(source):
+    props = source.get("properties") or {}
+    return [x for x in (
+        source.get("name"),
+        props.get("node.nick"),
+        props.get("node.description"),
+        props.get("device.description"),
+        props.get("device.product.name"),
+    ) if x]
+
+
+def saved_audio_input_device():
+    """The microphone the user saved, or None to leave input alone."""
+    raw = (read_config().get("AUDIO_INPUT_DEVICE") or "").strip()
+    return raw or None
+
+
+def audio_input_choices():
+    """Microphones the user can save for console mode."""
+    choices = []
+    seen = set()
+    for source in _sources():
+        name = source.get("name") or ""
+        props = source.get("properties") or {}
+        label = (props.get("node.nick") or props.get("node.description")
+                 or props.get("device.description") or name)
+        if not label or label.lower() in seen:
+            continue
+        seen.add(label.lower())
+        choices.append({
+            "id": label,
+            "label": label,
+            "kind": "source",
+            "detail": "microphone",
+            "source": name,
+        })
+    return choices
+
+
+def match_audio_input():
+    """The PipeWire source console mode should use, or None to leave it alone.
+
+    Nothing saved means input is untouched: unlike HDMI output, a microphone
+    does not need a profile switch to become usable, so there is no reason to
+    guess at one on the user's behalf.
+    """
+    wanted = saved_audio_input_device()
+    if not wanted:
+        return None
+    for source in _sources():
+        if _name_matches(wanted, *_source_labels(source)):
+            return source.get("name")
+    return None
+
+
 def _load_audio_state():
     try:
         with open(AUDIO_STATE) as fh:
@@ -824,6 +902,38 @@ def cmd_audio_set(args):
     return 0
 
 
+def cmd_audio_input_list(args):
+    saved = saved_audio_input_device() or ""
+    resolved = match_audio_input()
+    print(f"  saved microphone: {saved or '(session default)'}")
+    print("  microphones:")
+    choices = audio_input_choices()
+    for choice in choices:
+        mark = "*" if resolved and choice.get("source") == resolved else " "
+        print(f"  {mark} {choice['label']:28} {choice['detail']}")
+    if not choices:
+        print("    (none found)")
+    if saved and not resolved:
+        print(f"  saved microphone {saved} is not available; console mode will "
+              f"use the session default.")
+    return 0
+
+
+def cmd_audio_input_set(args):
+    name = (args.device or "").strip()
+    update_config({"AUDIO_INPUT_DEVICE": name})
+    print(f"saved microphone: {name or '(session default)'}")
+    return 0
+
+
+def cmd_audio_input_resolve(args):
+    """The source name for PULSE_SOURCE, or nothing to leave input alone."""
+    name = match_audio_input()
+    if name:
+        print(name)
+    return 0
+
+
 def _remember_restore_state(target):
     previous_sink = _default_sink()
     previous_profile = target.get("card_profile")
@@ -959,6 +1069,20 @@ def main():
                        help="save the audio output console mode will use")
     p.add_argument("device")
     p.set_defaults(func=cmd_audio_set)
+
+    sub.add_parser("audio-input-list",
+                   help="microphones and which one is saved") \
+        .set_defaults(func=cmd_audio_input_list)
+
+    p = sub.add_parser("audio-input-set",
+                       help="save the microphone console mode will use")
+    p.add_argument("device", nargs="?", default="",
+                   help="omit to go back to the session default")
+    p.set_defaults(func=cmd_audio_input_set)
+
+    sub.add_parser("audio-input-resolve",
+                   help="print the PipeWire source for PULSE_SOURCE") \
+        .set_defaults(func=cmd_audio_input_resolve)
 
     p = sub.add_parser("audio-route",
                        help="switch audio to the saved output")
