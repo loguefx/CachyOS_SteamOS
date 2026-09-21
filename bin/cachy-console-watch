@@ -161,8 +161,6 @@ class Xprop:
 # `pgrep -x gamescope` reports nothing while a session is clearly running.
 GAMESCOPE_COMMS = frozenset(("gamescope", "gamescope-wl"))
 
-EXTEST_SONAME = "libextest.so"
-
 
 def proc_state(pid):
     """Single-letter state from /proc/PID/status, or None if it is gone."""
@@ -311,33 +309,30 @@ class Session:
         return self.display
 
     def relaunch_desktop_steam(self):
-        """Bring back the desktop client, so the Steam button works again."""
+        """Bring back the desktop client, so the Steam button works again.
+
+        Handed to `cachy-console restart-steam` rather than done here. The
+        wrapper knows what console mode exported into Steam's environment and so
+        what has to be stripped back out, it honours RESTART_STEAM, and it does
+        the same thing from its own exit path when it outlives the session. Both
+        of us call it because neither is always the survivor: the wrapper's
+        process group goes down with gamescope's reaper when the exit tile is
+        clicked from inside the session, and this service is not running at all
+        when STEAM_BUTTON is off. A lock in there settles who actually starts it.
+        """
         if not self.relaunch_steam:
             return
         if self.dry_run:
             log("[dry-run] would relaunch the desktop Steam client")
             return
-        steam = shutil.which("steam")
-        if steam is None:
-            log("steam is not on PATH; cannot bring the desktop client back")
-            return
-
-        env = dict(os.environ)
-        # Keep the trackpad working without the desktop's "allow remote
-        # interaction" prompt, the same way console mode does.
-        preload = env.get("LD_PRELOAD", "")
-        if EXTEST_SONAME not in preload:
-            env["LD_PRELOAD"] = f"{EXTEST_SONAME} {preload}".strip()
-
         try:
-            # -silent returns it to the tray instead of popping a window over
-            # whatever the user went back to doing.
             subprocess.Popen(
-                [steam, "-silent"], env=env, stdin=subprocess.DEVNULL,
+                [self.console, "restart-steam"],
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True)
         except OSError as exc:
-            log(f"could not start steam: {exc}")
+            log(f"could not run {self.console}: {exc}")
 
 
 def _sibling_or_path(name):

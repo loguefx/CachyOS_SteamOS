@@ -274,6 +274,45 @@ check("a live process reports a non-zombie state",
       pw.proc_state(os.getpid()) not in (None, "Z"), True)
 
 print()
+print("handing the desktop client back to the wrapper:")
+
+
+class FakePopen:
+    """Records a launch instead of performing one."""
+
+    calls = []
+
+    def __init__(self, argv, **kwargs):
+        FakePopen.calls.append((argv, kwargs))
+
+
+def relaunch(**kwargs):
+    FakePopen.calls.clear()
+    real, pw.subprocess.Popen = pw.subprocess.Popen, FakePopen
+    try:
+        pw.Session("/opt/bin/cachy-console", "/opt/bin/cachy-console-display",
+                   "HDMI-1", **kwargs).relaunch_desktop_steam()
+    finally:
+        pw.subprocess.Popen = real
+    return list(FakePopen.calls)
+
+
+# The watcher used to start Steam itself, with an extest preload nobody asked
+# for and no idea what console mode had exported into Steam's environment. That
+# knowledge lives in the wrapper, which also has to do this from its own exit
+# path, so there is one implementation and the watcher calls it.
+launched = relaunch()
+check("the client is put back by the wrapper, not started here",
+      [argv for argv, _ in launched],
+      [["/opt/bin/cachy-console", "restart-steam"]])
+check("and detached, so restarting this service cannot take it down again",
+      launched[0][1].get("start_new_session"), True)
+check("a dry run only says what it would do",
+      relaunch(dry_run=True), [])
+check("--no-steam-relaunch leaves Steam alone",
+      relaunch(relaunch_steam=False), [])
+
+print()
 if FAILURES:
     print(f"{FAILURES} failure(s)")
     sys.exit(1)

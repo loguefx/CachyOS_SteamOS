@@ -126,6 +126,10 @@ The library entry is the one you want on a couch: it appears among your games,
 so you can launch it with the controller and end up back at your desktop.
 Favourite it, or pin it to your home shelf, and it becomes a one-click exit.
 
+Either way you get your ordinary Steam back with it, minimised to the tray, so
+the next double press on the Steam button opens console mode again without your
+having to go and start Steam first. Turn that off with `RESTART_STEAM=off`.
+
 Run `cachy-console shortcut` while **Steam is closed** — Steam rewrites its
 shortcuts file from memory when it exits and would otherwise discard the entry.
 An older "Exit Game Mode" tile that still pointed at `projector-exit` is updated
@@ -195,6 +199,7 @@ edit by hand:
 | `HDR` | `off` | Only worth enabling if display and games support it |
 | `TRACKPAD_FIX` | `off` | Preload libextest for the trackpad. Only for a gamescope that cannot emulate input; on a modern one it sends the cursor to the desktop instead |
 | `STEAM_BUTTON` | `on` | Let the Steam button open console mode |
+| `RESTART_STEAM` | `on` | Start the desktop Steam client again when console mode ends, minimised to the tray, so the Steam button has a client to open Big Picture in next time |
 | `AUDIO_FOCUS` | `on` | Mute games you are not looking at |
 | `AUDIO_DEVICE` | *(follows display)* | HDMI monitor name (`Optoma UHD`) or device (`RODECaster Duo`). Kept until you change it in **Cachy Console** settings |
 | `AUDIO_NEVER_MUTE` | `Discord` | Left audible even though Steam started it. Comma-separated names or appids. Read by the audio service, so restart it after editing |
@@ -226,7 +231,27 @@ fill those in from the sockets your session already created, on both desktops.
 intercept. gamescope also cannot adopt a window owned by another compositor, so
 an open Big Picture cannot be moved into it. `cachy-console-watch` therefore
 watches for the Big Picture window appearing and relaunches Steam inside
-gamescope, then restores the desktop client when the session ends.
+gamescope.
+
+**Getting a Steam button back.** The same fact runs the other way when you
+leave: the button needs a client to talk to, and leaving console mode kills
+gamescope, which takes the Steam inside it down too. `RESTART_STEAM` starts the
+ordinary desktop client again, `-silent` so it returns to the tray rather than
+throwing a window over whatever you went back to, and with none of what console
+mode arranged for the television — `PULSE_SINK`, `PULSE_SOURCE`, gamescope's
+nested-session workarounds — following it back to the desk. The desktop's HDMI
+audio profile is restored first, so the client does not enumerate its devices
+while the GPU still points at the TV.
+
+Both `cachy-console` and `cachy-console-watch` do this, because which of them
+outlives a session depends on how it ended: clicking the exit tile from inside
+Big Picture has gamescope's reaper take the wrapper's process group down with
+it, and the watcher is not running at all with `STEAM_BUTTON=off`. A lock
+decides which one actually starts the client, and the client is started in its
+own transient scope so that restarting the watcher service cannot take it with
+it. Steam's second instance hands its arguments to the client that already holds
+the IPC socket and exits, so the relaunch waits for gamescope's Steam to finish
+dying before starting one, and tries again if what it started never appeared.
 
 **HDMI audio.** GPU HDMI/DP audio exposes one stereo device at a time, and
 PipeWire names it after the graphics card (`Navi 31 HDMI/DP Audio`) even when
@@ -321,6 +346,18 @@ journalctl --user -u cachy-console-watch -f
 
 The watcher stands down when your chosen display is switched off, so Big Picture
 stays on the desktop rather than opening somewhere you cannot see.
+
+**Steam did not come back after leaving console mode.** The button has nothing
+to open without it, so check `RESTART_STEAM` is not `off`, then:
+
+```bash
+cachy-console status                        # says whether the client comes back
+journalctl --user -u cachy-console-watch    # "bringing the desktop Steam client back"
+```
+
+It comes back minimised to the tray, so an empty taskbar is not a failure — look
+for the tray icon, or `pgrep -x steam`. If it really is missing, starting Steam
+by hand is enough: from then on the Steam button works as usual.
 
 **A Gamescope WSI Layer Error dialog appears and the controller cannot click
 OK.** The game opened a Vulkan window on the desktop instead of inside

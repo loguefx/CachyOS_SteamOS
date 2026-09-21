@@ -14,6 +14,7 @@
 #   cachy-console displays     list displays, their modes and gamescope indices
 #   cachy-console controllers  list gamepads and the ones console mode hides
 #   cachy-console shortcut     add "Exit Console Mode" to your Steam library
+#   cachy-console restart-steam  bring the desktop Steam client back
 #   cachy-console help
 #
 # Options:
@@ -42,6 +43,7 @@ CFG_REFRESH=auto
 CFG_HDR=off
 CFG_VRR=on
 CFG_TRACKPAD_FIX=off
+CFG_RESTART_STEAM=on
 CFG_AUDIO_DEVICE=""
 CFG_AUDIO_INPUT_DEVICE=""
 CFG_IGNORE_CONTROLLERS=""
@@ -97,7 +99,7 @@ load_config() {
         value="${value%\"}"; value="${value#\"}"
         value="${value%\'}"; value="${value#\'}"
         case "$key" in
-            DISPLAY|DISPLAY_MODEL|RESOLUTION|REFRESH|HDR|VRR|TRACKPAD_FIX|EXTRA_GAMESCOPE_ARGS|AUDIO_DEVICE|AUDIO_INPUT_DEVICE|IGNORE_CONTROLLERS)
+            DISPLAY|DISPLAY_MODEL|RESOLUTION|REFRESH|HDR|VRR|TRACKPAD_FIX|RESTART_STEAM|EXTRA_GAMESCOPE_ARGS|AUDIO_DEVICE|AUDIO_INPUT_DEVICE|IGNORE_CONTROLLERS)
                 printf -v "CFG_$key" '%s' "$value" ;;
             STEAM_BUTTON|AUDIO_FOCUS|AUDIO_NEVER_MUTE|AUDIO_PIN_VOICE) ;;   # read by the services, not by us
             "") ;;
@@ -163,6 +165,125 @@ Quit the game first, or set CACHY_CONSOLE_FORCE=1 to override."
     warn "Steam ignored the shutdown request; killing it."
     pkill -9 -x steam || true
     sleep 2
+}
+
+# One relaunch at a time, and never one racing a session that is starting.
+steam_lock_path() { printf '%s\n' "${XDG_RUNTIME_DIR:-/tmp}/$NAME-steam.lock"; }
+
+# Started detached, and in its own transient scope where the user manager can
+# make one: the client has to outlive whoever asked for it. This script is about
+# to exit, and cachy-console-watch is a systemd service whose control group
+# would otherwise own the desktop Steam client -- and collect its log into the
+# watcher's journal, where it buries the watcher's own output.
+launch_desktop_steam() {
+    local plain="${1:-0}"
+
+    # Nothing console mode arranged for the TV may follow Steam back to the
+    # desk. PULSE_SINK and PULSE_SOURCE would leave the desktop client playing
+    # through the television and listening to the microphone by the couch, and
+    # the rest are workarounds for running nested inside gamescope.
+    local -a clean=(env
+        -u PULSE_SINK -u PULSE_SOURCE
+        -u SDL_VIDEODRIVER -u SDL_GAMECONTROLLER_IGNORE_DEVICES
+        -u NODEVICE_SELECT -u DISABLE_LAYER_MESA_ANTI_LAG
+        -u GDK_BACKEND -u QT_QPA_PLATFORM)
+
+    # Only when the user asked for the preload at all. The desktop is the one
+    # place extest is the right answer, but it is still their call, and a
+    # preload nobody asked for is a preload nobody can explain.
+    extest_wanted && clean+=("LD_PRELOAD=${EXTEST_LIB}${LD_PRELOAD:+:$LD_PRELOAD}")
+
+    # -silent: back to the tray rather than a window thrown over whatever the
+    # user returned to. A double press on the Steam button opens Big Picture
+    # from the tray just the same, which is the whole reason for bringing it
+    # back.
+    local -a cmd=("${clean[@]}" steam -silent)
+
+    if (( ! plain )) && have systemd-run; then
+        setsid systemd-run --user --quiet --collect --scope -- "${cmd[@]}" \
+            >/dev/null 2>&1 < /dev/null &
+    else
+        setsid "${cmd[@]}" >/dev/null 2>&1 < /dev/null &
+    fi
+    disown 2>/dev/null || true
+}
+
+# Put the ordinary desktop Steam client back after a console session.
+#
+# Console mode stops the desktop client so Steam can be restarted inside
+# gamescope, and leaving takes that Steam down with the compositor, so without
+# this the machine is left with no Steam running at all -- and then the Steam
+# button has nothing to work on, because a double press does not launch Steam,
+# it flips an *already running* client into Big Picture.
+#
+# Both this script's EXIT trap and cachy-console-watch call it, because which of
+# them is still alive depends on how console mode ended: the reaper takes our
+# process group down with it when the exit tile is clicked from inside the
+# session, and the watcher is not running at all when STEAM_BUTTON is off. The
+# lock is what keeps two survivors from starting two clients.
+restart_desktop_steam() {
+    is_on "$CFG_RESTART_STEAM" || return 0
+    have steam || return 0
+
+    # Held for the whole relaunch, and released when this process exits. Without
+    # flock there is nothing to arbitrate with, so go ahead unlocked rather than
+    # leave the user with no Steam at all.
+    if have flock; then
+        exec 9>"$(steam_lock_path)" || return 0
+        flock -n 9 || return 0
+    fi
+
+    local timeout="${CACHY_CONSOLE_STEAM_TIMEOUT:-15}" polls i attempt
+    polls=$(( timeout * 2 ))
+
+    # Wait for gamescope's Steam to finish going down first. A second client
+    # started while the first still owns the IPC socket never becomes a client:
+    # it hands its arguments to the one that is already registered and exits, so
+    # starting too early leaves no desktop Steam at all.
+    for (( i = 0; i < polls; i++ )); do
+        steam_running || break
+        sleep 0.5
+    done
+    # Still there, so a client is already running and there is nothing to
+    # restore -- console mode was left without ever stopping this one.
+    steam_running && return 0
+
+    local exit_helper
+    exit_helper="$(find_helper "$NAME-exit")"
+
+    for (( attempt = 1; attempt <= 2; attempt++ )); do
+        # Never fight the next session. Starting console mode stops the desktop
+        # client on purpose, so a client started now would be shut down again a
+        # moment later, and `stop_steam` would refuse if a game had reached it.
+        "$exit_helper" --running && return 0
+
+        say "Bringing the desktop Steam client back…"
+        # The second attempt drops the transient scope: if systemd-run could not
+        # reach the user manager, nothing started, and plain setsid still works.
+        launch_desktop_steam "$(( attempt - 1 ))"
+
+        for (( i = 0; i < polls; i++ )); do
+            steam_running && return 0
+            "$exit_helper" --running && return 0
+            sleep 0.5
+        done
+    done
+
+    warn "the desktop Steam client did not come back; start Steam yourself."
+}
+
+# Going straight back into console mode is the case the relaunch cannot see by
+# itself: it watches for a *running* gamescope, and stop_steam happens before
+# there is one. Waiting for the lock means the client it is starting is already
+# up by the time we look, so stop_steam shuts it down like any other, instead of
+# finding nothing and leaving it to appear a moment later beside the Steam
+# gamescope is about to start.
+await_steam_relaunch() {
+    local lock
+    lock="$(steam_lock_path)"
+    [[ -e "$lock" ]] || return 0
+    have flock || return 0
+    ( flock -w 30 9 || true ) 9>"$lock" 2>/dev/null || true
 }
 
 # Steam drives the controller trackpad through XTEST, and extest reimplements
@@ -300,12 +421,22 @@ It will not choose a screen for you."
 
     say "Console mode on $CONNECTOR at ${WIDTH}x${HEIGHT}@${REFRESH}Hz."
     warn_extest
+    await_steam_relaunch
     stop_steam
 
     # One GPU HDMI profile is visible at a time. Steam's audio list is that
     # profile plus USB devices, so without this the projector never appears.
-    restore_hdmi_audio() { "$HELPER_DISPLAY" audio-restore || true; }
-    trap restore_hdmi_audio EXIT
+    #
+    # Installed here, straight after stop_steam, so that whatever happens next
+    # -- a session that ran for hours or a gamescope that never came up -- the
+    # two things console mode took away are given back: the desktop's HDMI audio
+    # profile, and the Steam client. Audio first, so the desktop client does not
+    # enumerate its devices while the GPU profile still points at the television.
+    back_to_desktop() {
+        "$HELPER_DISPLAY" audio-restore || true
+        restart_desktop_steam || true
+    }
+    trap back_to_desktop EXIT
     local route_log sink
     route_log="$("$HELPER_DISPLAY" audio-route 2>&1)" || warn "could not switch HDMI audio to $CONNECTOR"
     say "$route_log"
@@ -411,6 +542,12 @@ HDR=$CFG_HDR
 # its cursor, and extest would replay the calls on the desktop instead -- no
 # cursor in console mode at all. Only for a gamescope too old to emulate input.
 TRACKPAD_FIX=$CFG_TRACKPAD_FIX
+
+# Start the ordinary desktop Steam client again when console mode ends. Leaving
+# takes gamescope's Steam down with it, and the Steam button cannot open Big
+# Picture with no client running, so this is what makes a second press work.
+# It comes back minimised to the tray, on the desktop's own audio devices.
+RESTART_STEAM=$CFG_RESTART_STEAM
 
 # Open console mode when you press the Steam button twice on a controller.
 # Read by cachy-console-watch.service.
@@ -615,6 +752,13 @@ status() {
     else
         say "  not running."
     fi
+    if is_on "$CFG_RESTART_STEAM"; then
+        say "  the desktop client comes back when console mode ends, so the"
+        say "  Steam button can open Big Picture again (RESTART_STEAM=on)."
+    else
+        say "  RESTART_STEAM is off, so leaving console mode leaves no Steam"
+        say "  running and the Steam button will have nothing to open."
+    fi
     if game_running; then
         warn "a game is running (AppID: $(running_appids)); starting console mode"
         warn "now would refuse, because restarting Steam would close it."
@@ -664,7 +808,7 @@ ARGS=()
 while (( $# )); do
     case "$1" in
         -h|--help|help)     usage ;;
-        start|setup|settings|status|check|displays|controllers|exit|stop|shortcut)
+        start|setup|settings|status|check|displays|controllers|exit|stop|shortcut|restart-steam)
                             COMMAND="$1" ;;
         --display)          DISPLAY_OVERRIDE="${2-}"; shift ;;
         --display=*)        DISPLAY_OVERRIDE="${1#*=}" ;;
@@ -687,4 +831,7 @@ case "$COMMAND" in
     controllers) "$HELPER_DISPLAY" controllers ;;
     exit|stop)  exec "$(find_helper "$NAME-exit")" ;;
     shortcut)   exec "$(find_helper "$NAME-shortcut")" "${ARGS[@]+"${ARGS[@]}"}" ;;
+    # How cachy-console-watch puts the client back when it, and not this
+    # script, is the one left alive after a session.
+    restart-steam) restart_desktop_steam ;;
 esac
