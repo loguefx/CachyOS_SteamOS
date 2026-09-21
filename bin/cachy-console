@@ -12,6 +12,7 @@
 #   cachy-console exit         leave console mode, back to the desktop
 #   cachy-console status       check the setup and show what would run
 #   cachy-console displays     list displays, their modes and gamescope indices
+#   cachy-console controllers  list gamepads and the ones console mode hides
 #   cachy-console shortcut     add "Exit Console Mode" to your Steam library
 #   cachy-console help
 #
@@ -43,6 +44,7 @@ CFG_VRR=on
 CFG_TRACKPAD_FIX=on
 CFG_AUDIO_DEVICE=""
 CFG_AUDIO_INPUT_DEVICE=""
+CFG_IGNORE_CONTROLLERS=""
 CFG_EXTRA_GAMESCOPE_ARGS=""
 
 DRY_RUN=0
@@ -95,7 +97,7 @@ load_config() {
         value="${value%\"}"; value="${value#\"}"
         value="${value%\'}"; value="${value#\'}"
         case "$key" in
-            DISPLAY|DISPLAY_MODEL|RESOLUTION|REFRESH|HDR|VRR|TRACKPAD_FIX|EXTRA_GAMESCOPE_ARGS|AUDIO_DEVICE|AUDIO_INPUT_DEVICE)
+            DISPLAY|DISPLAY_MODEL|RESOLUTION|REFRESH|HDR|VRR|TRACKPAD_FIX|EXTRA_GAMESCOPE_ARGS|AUDIO_DEVICE|AUDIO_INPUT_DEVICE|IGNORE_CONTROLLERS)
                 printf -v "CFG_$key" '%s' "$value" ;;
             STEAM_BUTTON|AUDIO_FOCUS|AUDIO_NEVER_MUTE) ;;   # read by the services, not by us
             "") ;;
@@ -259,6 +261,7 @@ It will not choose a screen for you."
         local dry_source
         dry_source="$("$HELPER_DISPLAY" audio-input-resolve 2>/dev/null || true)"
         say "  microphone: ${dry_source:-(session default)}"
+        say "  hidden controllers: ${CFG_IGNORE_CONTROLLERS:-(none)}"
         return 0
     fi
 
@@ -287,6 +290,26 @@ It will not choose a screen for you."
     if [[ -n "$source" ]]; then
         export PULSE_SOURCE="$source"
         say "Microphone: $source"
+    fi
+
+    # Hide devices that are only nominally gamepads. Anything holding a lower
+    # js number than the controller is player one as far as a game is
+    # concerned, even if it never sends an event, which leaves the controller
+    # driving a second player that cannot reach the menus. Keyboards with an
+    # analog mode do this: the endpoint is part of their USB descriptor, so it
+    # is there from boot, while Steam Input's virtual pad can only appear once
+    # Steam is up. Scoped to console mode, so the device is still a gamepad on
+    # the desktop.
+    if [[ -n "$CFG_IGNORE_CONTROLLERS" ]]; then
+        # Appended: Steam sets this too, to hide the physical controller it is
+        # presenting through Steam Input, and replacing its value would undo
+        # that.
+        if [[ -n "${SDL_GAMECONTROLLER_IGNORE_DEVICES:-}" ]]; then
+            export SDL_GAMECONTROLLER_IGNORE_DEVICES="${SDL_GAMECONTROLLER_IGNORE_DEVICES},${CFG_IGNORE_CONTROLLERS}"
+        else
+            export SDL_GAMECONTROLLER_IGNORE_DEVICES="$CFG_IGNORE_CONTROLLERS"
+        fi
+        say "Hiding controllers: $CFG_IGNORE_CONTROLLERS"
     fi
 
     # Mesa's device-select layer can sit in front of gamescope's WSI hook and
@@ -378,6 +401,13 @@ AUDIO_DEVICE=$CFG_AUDIO_DEVICE
 # desktop uses is what console mode uses.
 # Change it with: cachy-console settings
 AUDIO_INPUT_DEVICE=$CFG_AUDIO_INPUT_DEVICE
+
+# Devices console mode should not treat as gamepads, as "0xVENDOR/0xPRODUCT",
+# comma separated. For a keyboard with an analog gamepad mode, which takes the
+# first controller slot at boot and so becomes player one ahead of the
+# controller. Empty hides nothing. They stay gamepads on the desktop.
+# List them with: cachy-console controllers
+IGNORE_CONTROLLERS=$CFG_IGNORE_CONTROLLERS
 
 # Extra arguments passed straight to gamescope, for anything not covered above.
 # For example: EXTRA_GAMESCOPE_ARGS=--mangoapp
@@ -546,6 +576,10 @@ status() {
     "$HELPER_DISPLAY" audio-input-list || true
 
     say
+    say "== controllers =="
+    "$HELPER_DISPLAY" controllers || true
+
+    say
     say "== what would run =="
     if ! have gamescope; then
         say "  gamescope is missing, so nothing can run yet."
@@ -576,7 +610,7 @@ ARGS=()
 while (( $# )); do
     case "$1" in
         -h|--help|help)     usage ;;
-        start|setup|settings|status|check|displays|exit|stop|shortcut)
+        start|setup|settings|status|check|displays|controllers|exit|stop|shortcut)
                             COMMAND="$1" ;;
         --display)          DISPLAY_OVERRIDE="${2-}"; shift ;;
         --display=*)        DISPLAY_OVERRIDE="${1#*=}" ;;
@@ -596,6 +630,7 @@ case "$COMMAND" in
     settings)   exec "$(find_helper "$NAME-settings")" ;;
     status|check) status ;;
     displays)   "$HELPER_DISPLAY" list ;;
+    controllers) "$HELPER_DISPLAY" controllers ;;
     exit|stop)  exec "$(find_helper "$NAME-exit")" ;;
     shortcut)   exec "$(find_helper "$NAME-shortcut")" "${ARGS[@]+"${ARGS[@]}"}" ;;
 esac

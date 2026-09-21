@@ -173,6 +173,7 @@ edit by hand:
 | `AUDIO_DEVICE` | *(follows display)* | HDMI monitor name (`Optoma UHD`) or device (`RODECaster Duo`). Kept until you change it in **Cachy Console** settings |
 | `AUDIO_NEVER_MUTE` | `Discord` | Left audible even though Steam started it. Comma-separated names or appids. Read by the audio service, so restart it after editing |
 | `AUDIO_INPUT_DEVICE` | *(session default)* | Microphone for console mode, e.g. `HyperX Cloud III S Wireless`. Empty leaves input alone |
+| `IGNORE_CONTROLLERS` | empty | Devices console mode should not treat as gamepads, as `0x31e3/0x1400`, comma separated. List them with `cachy-console controllers` |
 | `EXTRA_GAMESCOPE_ARGS` | empty | Passed straight through, e.g. `--mangoapp` |
 
 ## How it works
@@ -226,6 +227,24 @@ changed, so the mic at your desk keeps working for everything else. Only real
 capture devices are offered, never the `.monitor` loopback PipeWire publishes
 for every output. Leaving it empty leaves input alone entirely.
 
+**Which controller is player one.** A game assigns players in the order the
+kernel numbered the gamepads, so whatever holds `js0` is player one whether or
+not it ever sends an event. That is a problem when something is only nominally a
+gamepad. Keyboards with an analog mode — Wooting's, for one — publish a gamepad
+endpoint as part of their USB descriptor, so it is there from boot, while Steam
+Input's virtual pad cannot appear until Steam is up and therefore always lands
+behind it. The symptom is a controller that moves nothing in the menus because
+it is player two, and a player one that is a keyboard pretending to be a pad.
+`IGNORE_CONTROLLERS` hides such a device by USB id, via SDL's own ignore list,
+which is what both Steam and Proton's controller layer read. It is appended to
+rather than replacing what Steam puts there, since Steam uses the same list to
+hide the physical controller it presents through Steam Input. This applies to
+console mode only, so the device is still a gamepad on the desktop:
+
+```bash
+cachy-console controllers   # names, USB ids, and which slot each one holds
+```
+
 **The trackpad prompt.** Steam drives the controller trackpad through XTEST. On
 Wayland, XWayland turns that into an xdg-desktop-portal request — the "allow
 remote interaction" dialog — and the permission dies with the Steam process, so
@@ -274,6 +293,17 @@ cachy-console-audio --status    # streams, their games, and the focused app
 ```
 
 Stopping the service unmutes everything it muted.
+
+**The controller is player two and cannot move the menus.** Something else is
+holding the first controller slot — usually a keyboard with an analog gamepad
+mode, which is a gamepad to the kernel from boot:
+
+```bash
+cachy-console controllers   # the one on js0 is player one
+```
+
+Put that device's USB id in `IGNORE_CONTROLLERS`, then exit and Steam-button
+twice. It stays a gamepad on the desktop.
 
 ## Not supported
 

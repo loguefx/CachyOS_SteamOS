@@ -34,10 +34,15 @@ Subcommands:
   audio-set NAME        save the audio output console mode will use
   audio-route           switch to the saved audio output (Steam's list)
   audio-restore         put the previous HDMI profile back after console mode
+  audio-input-list      microphones and which one is saved
+  audio-input-set NAME  save the microphone console mode will use
+  audio-input-resolve   the PipeWire source name, for PULSE_SOURCE
+  controllers           gamepads, their USB ids, and which console mode hides
 """
 
 import argparse
 import ctypes
+import glob
 import json
 import os
 import re
@@ -934,6 +939,85 @@ def cmd_audio_input_resolve(args):
     return 0
 
 
+# ---- controllers --------------------------------------------------------
+
+def gamepads():
+    """Every gamepad the kernel is presenting, in the order it numbered them.
+
+    Read from sysfs rather than through SDL, so that merely listing controllers
+    does not start a joystick subsystem or open the devices out from under
+    whatever is using them. The js number is the whole point of the list: a
+    game assigns players in this order, so a device sitting on js0 is player
+    one whether or not it ever sends an event.
+    """
+    found = []
+    for node in glob.glob("/sys/class/input/js*"):
+        digits = re.sub(r"\D", "", os.path.basename(node))
+        device = os.path.dirname(os.path.realpath(node))
+
+        def attr(name):
+            try:
+                with open(os.path.join(device, name)) as fh:
+                    return fh.read().strip()
+            except OSError:
+                return ""
+
+        found.append({
+            "js": os.path.basename(node),
+            "index": int(digits) if digits else 0,
+            "name": attr("name") or "(unnamed)",
+            "vendor": attr("id/vendor").lower(),
+            "product": attr("id/product").lower(),
+            "virtual": "/devices/virtual/" in os.path.realpath(node),
+        })
+    found.sort(key=lambda pad: pad["index"])
+    return found
+
+
+def saved_ignored_controllers():
+    """The raw IGNORE_CONTROLLERS setting, in SDL's own id format."""
+    return (read_config().get("IGNORE_CONTROLLERS") or "").strip()
+
+
+def ignored_pairs(raw):
+    """Parse "0x31e3/0x1400, 0x28de/0x1205" into {(vendor, product)}.
+
+    Padded to four hex digits because sysfs reports ids that way while people
+    write them either way, so "0x3e3/0x400" still matches.
+    """
+    pairs = set()
+    for item in (raw or "").replace(";", ",").split(","):
+        vendor, sep, product = item.strip().lower().partition("/")
+        if not sep:
+            continue
+        vendor = vendor.strip().removeprefix("0x").zfill(4)
+        product = product.strip().removeprefix("0x").zfill(4)
+        if vendor and product:
+            pairs.add((vendor, product))
+    return pairs
+
+
+def cmd_controllers(args):
+    raw = saved_ignored_controllers()
+    ignored = ignored_pairs(raw)
+    print(f"  hidden from console mode: {raw or '(nothing)'}")
+    print("  gamepads:")
+    pads = gamepads()
+    for pad in pads:
+        if pad["vendor"] and pad["product"]:
+            ident = f"0x{pad['vendor']}/0x{pad['product']}"
+        else:
+            ident = "(no usb id)"
+        mark = "-" if (pad["vendor"], pad["product"]) in ignored else " "
+        kind = "  virtual" if pad["virtual"] else ""
+        print(f"  {mark} {pad['js']:4} {ident:16} {pad['name']}{kind}")
+    if not pads:
+        print("    (none connected)")
+    print("  '-' marks one IGNORE_CONTROLLERS hides. A virtual pad is what")
+    print("  Steam Input presents for a controller it has taken over.")
+    return 0
+
+
 def _remember_restore_state(target):
     previous_sink = _default_sink()
     previous_profile = target.get("card_profile")
@@ -1083,6 +1167,10 @@ def main():
     sub.add_parser("audio-input-resolve",
                    help="print the PipeWire source for PULSE_SOURCE") \
         .set_defaults(func=cmd_audio_input_resolve)
+
+    sub.add_parser("controllers",
+                   help="gamepads and which ones console mode hides") \
+        .set_defaults(func=cmd_controllers)
 
     p = sub.add_parser("audio-route",
                        help="switch audio to the saved output")
