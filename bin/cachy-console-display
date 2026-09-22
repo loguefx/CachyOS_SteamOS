@@ -597,6 +597,41 @@ def match_saved_audio(wanted):
     return None
 
 
+def sink_for(target):
+    """The Pulse sink a resolved audio target plays through, if there is one yet.
+
+    A saved AUDIO_DEVICE usually resolves to an HDMI port rather than a sink, and
+    that is the shape the routing wants: sending sound to a TV means setting the
+    card's profile, not picking a sink. Anything that has to name a destination
+    for one stream needs the sink instead -- pinning voice chat does -- and the
+    sink only exists once that profile is active, so this answers None rather than
+    guessing when it is not.
+    """
+    if not target:
+        return None
+    if target.get("sink"):
+        return target["sink"]
+    # A card's sinks are named after the card and the profile that created them:
+    # profile output:hdmi-stereo-extra3 on alsa_card.pci-0000_0c_00.1 gives the
+    # sink alsa_output.pci-0000_0c_00.1.hdmi-stereo-extra3. Matching on both is
+    # exact, where a name alone is only ever a guess.
+    card = (target.get("card") or "").split(".", 1)[-1]
+    profile = (target.get("profile") or "").split(":", 1)[-1]
+    if card and profile:
+        for sink in _sinks():
+            name = sink.get("name") or ""
+            if card in name and name.endswith(profile):
+                return name
+    # For a card that does not name its sinks that way, the ELD is what the user
+    # chose in the settings window and what the sink is likely to be nicked.
+    eld = target.get("eld") or ""
+    if eld:
+        for sink in _sinks():
+            if _name_matches(eld, *_sink_labels(sink)):
+                return sink.get("name")
+    return None
+
+
 def match_audio():
     """The audio output console mode should use.
 
@@ -940,9 +975,9 @@ def cmd_audio_resolve(args):
     a session is running, and switching underneath a running session would be a
     side effect nobody asked for.
     """
-    target = match_audio()
-    if target and target.get("sink"):
-        print(target["sink"])
+    name = sink_for(match_audio())
+    if name:
+        print(name)
     return 0
 
 

@@ -331,6 +331,51 @@ check("while input is the headset",
       cd.match_audio_input(), "alsa_input.usb-HyperX_Cloud_III_S.mono-fallback")
 
 print()
+print("naming the sink a target plays through:")
+
+# A TV resolves to an HDMI port, which is what routing wants -- it sets a card
+# profile -- but pinning a single stream has to name a sink. Without this the
+# resolve printed nothing and voice chat was never pinned to the console's output.
+HDMI_SINKS = [
+    {"name": "alsa_output.usb-RODE_RODECaster_Duo.analog-stereo",
+     "properties": {"node.nick": "RODECaster Duo"}},
+    {"name": "alsa_output.pci-0000_0c_00.1.hdmi-stereo-extra3",
+     "properties": {"node.nick": "Optoma UHD",
+                    "node.description": "Navi 31 HDMI/DP Audio"}},
+]
+cd._sinks = lambda: [dict(s) for s in HDMI_SINKS]
+
+optoma = {"kind": "hdmi", "card": HDMI_CARD, "port": "hdmi-output-3",
+          "eld": "Optoma UHD", "profile": "output:hdmi-stereo-extra3"}
+check("an HDMI port finds its card's sink for that profile",
+      cd.sink_for(optoma),
+      "alsa_output.pci-0000_0c_00.1.hdmi-stereo-extra3")
+
+# Another display on the same card, whose sink the current profile has not
+# created. Pinning voice chat to the Optoma's sink because it is the only one
+# there would put the sound on the wrong screen, so nothing is the right answer.
+check("a display whose sink does not exist resolves to nothing",
+      cd.sink_for({"kind": "hdmi", "card": HDMI_CARD, "port": "hdmi-output-1",
+                   "eld": "ZOWIE XL LCD",
+                   "profile": "output:hdmi-stereo-extra1"}), None)
+
+check("a target that already names a sink is taken at its word",
+      cd.sink_for({"kind": "sink", "sink": "alsa_output.some.thing"}),
+      "alsa_output.some.thing")
+check("nothing resolved means no sink", cd.sink_for(None), None)
+
+# A card that does not name its sinks after its profiles: the ELD is what the
+# user picked in the settings window, so it is the remaining way in.
+cd._sinks = lambda: [{"name": "alsa_output.weird-name",
+                      "properties": {"node.nick": "Optoma UHD"}}]
+check("otherwise the ELD is matched against the sinks",
+      cd.sink_for(optoma), "alsa_output.weird-name")
+
+cd._sinks = lambda: [dict(s) for s in HDMI_SINKS]
+check("and an ELD that matches nothing stays unresolved",
+      cd.sink_for({"kind": "hdmi", "eld": "No Such Display"}), None)
+
+print()
 if FAILURES:
     print(f"{len(FAILURES)} failure(s): " + ", ".join(FAILURES))
     sys.exit(1)
