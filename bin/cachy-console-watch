@@ -429,9 +429,6 @@ def main():
                     help="polls before acting, so ~1s (default 2)")
     ap.add_argument("--start-timeout", type=float, default=90.0,
                     help="seconds to wait for gamescope to appear (default 90)")
-    ap.add_argument("--settle", type=float, default=25.0,
-                    help="seconds to ignore windows after a session ends, "
-                         "while the desktop client restarts (default 25)")
     ap.add_argument("--max-starts", type=int, default=3,
                     help="sessions allowed per --start-window before giving up "
                          "(default 3)")
@@ -563,9 +560,16 @@ def run_loop(xprop, session, bpm_re, args, stopping, sleep,
                 engage_streak = 0
                 last_standdown = None
                 awaiting_bpm_clear = True
-                # Steam takes a while to come up, and if it restores itself
-                # into Big Picture we must not read that as a fresh request.
-                sleep(args.settle)
+                # Watched rather than slept through. The guard itself is right --
+                # a client that restores itself into Big Picture must not read as a
+                # fresh request -- but it used to be paired with sleeping for the
+                # whole settle period, and the state it cares about is a window
+                # appearing and disappearing inside exactly that window. Leaving
+                # console mode takes Big Picture with it, so the very next poll
+                # clears the guard and a press half a minute later is honoured;
+                # blind, the press was still on screen when the sleep ended and was
+                # read as the last session's, which stood the watcher down until
+                # someone thought to close Big Picture by hand.
                 continue
 
         elif state == STARTING:
@@ -588,9 +592,9 @@ def run_loop(xprop, session, bpm_re, args, stopping, sleep,
                 if awaiting_bpm_clear:
                     if "bigpicture" in kinds:
                         stand_down("awaiting-clear",
-                                   "waiting for Big Picture to close after the "
-                                   "last session; press the Steam button twice "
-                                   "when you want console mode again.")
+                                   "Big Picture is still open from the last "
+                                   "session; close it and press the Steam button "
+                                   "twice to start console mode again.")
                         sleep(args.interval)
                         continue
                     awaiting_bpm_clear = False

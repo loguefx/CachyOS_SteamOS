@@ -119,7 +119,7 @@ def run(script, connected=True, engage_polls=2, start_ok=True, up_after=1,
     session.display = display
     args = types.SimpleNamespace(
         interval=0, engage_polls=engage_polls,
-        start_timeout=10, settle=0, max_starts=max_starts,
+        start_timeout=10, max_starts=max_starts,
         start_window=start_window)
     stopping = {"now": False}
     limit = polls if polls is not None else len(script)

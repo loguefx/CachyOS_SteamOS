@@ -44,6 +44,9 @@ def check(label, got, want):
 STEAM = """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$STATE/steam-argv"
 env > "$STATE/steam-env"
+# The relaunch lock is held on fd 9. A client that inherits it holds it for as
+# long as it runs, so it has to arrive closed.
+[[ -e /proc/self/fd/9 ]] && printf '%s\\n' "$(readlink /proc/self/fd/9)" >> "$STATE/steam-fd9"
 [[ -f "$STATE/swallow" ]] || : > "$STATE/running"
 """
 
@@ -173,6 +176,11 @@ class Run:
         return self._lines("systemd-run-argv")
 
     @property
+    def inherited_lock(self):
+        """What the client was handed on fd 9, which should be nothing."""
+        return self._lines("steam-fd9")
+
+    @property
     def display_calls(self):
         return self._lines("display-argv")
 
@@ -240,6 +248,14 @@ check("a console session already running again gets no desktop client",
 # be the only survivor, so both always try. The lock is what stops two clients.
 check("a relaunch already in flight is left to finish alone",
       run(hold_lock=True).steam_launches, [])
+
+# And the lock does not leave with the client it started. Held on fd 9, it is
+# inherited by anything spawned, so the Steam client carried it for its whole
+# life -- and the next start, which waits on that lock before touching Steam,
+# waited out its full timeout every single time: half a minute of Big Picture
+# sitting on whichever screen it opened on, with nothing logged to say why.
+check("the client it starts does not inherit the relaunch lock",
+      ended.inherited_lock, [])
 
 print()
 print("the environment the client comes back with:")

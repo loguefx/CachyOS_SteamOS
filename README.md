@@ -164,7 +164,18 @@ which clears that screen in about a second, and only then asked to quit.
 The wait after that is Steam starting up again inside gamescope, and there is no
 way around it: gamescope cannot adopt a window from another compositor, so Steam
 has to be relaunched as its child. Expect a few seconds to the display switching
-over and a few more before Big Picture has drawn.
+over and a few more before Big Picture has drawn — measured here, the wrong
+screen clears about 1.7s after Big Picture opens, and console mode has drawn by
+about 12s.
+
+That was thirty seconds longer until the relaunch lock stopped leaking. The lock
+exists so that two things racing to put the desktop client back cannot start two
+clients, and it is held on a file descriptor — which a child inherits, so the
+Steam client it started carried it for as long as Steam ran. The next start waits
+on that lock before touching Steam, and so waited out its whole timeout every
+time, in silence, with Big Picture sitting on whichever screen it had opened on
+for the duration. It now says when it waits, and the client no longer takes the
+lock with it.
 
 **The Discord already open on your desktop cannot be moved into console mode.**
 A window belongs to the compositor its client connected to, and gamescope is a
@@ -472,7 +483,14 @@ audio immediately; a new session also uses it.
 **The refresh rate looks wrong.** `cachy-console-display probe` shows both SDL
 views separately. If they disagree, set `REFRESH` explicitly.
 
-**Nothing happens on the Steam button.**
+**Nothing happens on the Steam button.** If Big Picture is already open on the
+desktop, close it first. The button does not launch anything — it flips the
+running client into Big Picture — so with that window already up the press
+changes nothing for the watcher to react to, and after a session has ended the
+watcher deliberately ignores a Big Picture it has not seen close, so that a
+client restoring itself into one cannot start console mode in a loop.
+`journalctl --user -u cachy-console-watch` says so when this is what is
+happening.
 
 ```bash
 systemctl --user status cachy-console-watch

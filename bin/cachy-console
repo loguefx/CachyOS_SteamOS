@@ -260,11 +260,18 @@ launch_desktop_steam() {
     # back.
     local -a cmd=("${clean[@]}" steam -silent)
 
+    # 9>&- matters more than it looks. The relaunch lock above is held on fd 9,
+    # and a child inherits it: the Steam client would carry that descriptor for
+    # its whole life, so the lock meant to cover a relaunch would instead be held
+    # for as long as Steam ran. Every later start then blocked the full 30s in
+    # await_steam_relaunch waiting for a client that was never going to let go --
+    # in silence, with Big Picture sitting on the wrong monitor throughout, which
+    # is exactly what that wait looked like from the sofa.
     if (( ! plain )) && have systemd-run; then
         setsid systemd-run --user --quiet --collect --scope -- "${cmd[@]}" \
-            >/dev/null 2>&1 < /dev/null &
+            >/dev/null 2>&1 < /dev/null 9>&- &
     else
-        setsid "${cmd[@]}" >/dev/null 2>&1 < /dev/null &
+        setsid "${cmd[@]}" >/dev/null 2>&1 < /dev/null 9>&- &
     fi
     disown 2>/dev/null || true
 }
@@ -344,7 +351,14 @@ await_steam_relaunch() {
     lock="$(steam_lock_path)"
     [[ -e "$lock" ]] || return 0
     have flock || return 0
-    ( flock -w 30 9 || true ) 9>"$lock" 2>/dev/null || true
+    # Say so when it actually waits. A silent wait here is indistinguishable from
+    # console mode being slow to start, which is how a lock held by mistake went
+    # unnoticed: thirty seconds of nothing, every single time, with no clue where
+    # it went.
+    if ! ( flock -n 9 ) 9>"$lock" 2>/dev/null; then
+        say "Waiting for a desktop Steam relaunch to finish…"
+    fi
+    ( flock -w "${CACHY_CONSOLE_RELAUNCH_WAIT:-20}" 9 || true ) 9>"$lock" 2>/dev/null || true
 }
 
 # Steam drives the controller trackpad through XTEST, and extest reimplements
@@ -495,6 +509,11 @@ It will not choose a screen for you."
 
     say "Console mode on $CONNECTOR at ${WIDTH}x${HEIGHT}@${REFRESH}Hz."
     warn_extest
+    # Before the wait below, not after it. This is the window sitting on the wrong
+    # monitor, and clearing it is independent of anything to do with Steam's
+    # lifetime -- so it should never be queued behind a lock. stop_steam asks
+    # again, which costs nothing once there is nothing open.
+    leave_big_picture
     await_steam_relaunch
     stop_steam
 
