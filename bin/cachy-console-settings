@@ -357,6 +357,14 @@ def run_gtk():
             if self.win is None:
                 self.win = Window(self)
                 self.win.connect("destroy", self._on_destroy)
+            else:
+                # Opening the application again lands here rather than in a second
+                # process, and the window it raises may have been sitting open
+                # since before the television was turned on or the headset
+                # plugged in. Its lists are from whenever it was built, and a
+                # choice saved from a stale list is a device that no longer means
+                # what it did -- so it is read again on the way to the front.
+                self.win.reload()
             self.win.present()
             self.win.show_all()
 
