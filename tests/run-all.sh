@@ -6,7 +6,7 @@ set -uo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 
 failed=0
-for suite in test-display.py test-watch.py test-steam-restart.py test-exit.py test-audio.py test-hdmi-audio.py test-shortcut.py test-app.py test-controllers.py; do
+for suite in test-display.py test-watch.py test-steam-restart.py test-exit.py test-audio.py test-hdmi-audio.py test-shortcut.py test-app.py test-controllers.py test-gamescope-args.py; do
     printf '\n===== %s =====\n' "$suite"
     if ./"$suite" > /tmp/cachy-console-$suite.log 2>&1; then
         tail -1 /tmp/cachy-console-$suite.log

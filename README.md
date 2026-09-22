@@ -263,6 +263,33 @@ stream itself, which is the one thing an application cannot overrule, and
 re-checking every poll so a stream that wanders back is moved again. It only
 does this while a session is running, so Discord at your desk is left alone.
 
+Expect Discord's own **Voice & Video** screen to keep naming the devices it
+saved at your desk while this is happening. It is not reading them back from the
+stream, and the stream is what you hear and what is heard: checked on a call
+here, Discord showed a desk interface for both while its capture sat on the
+console's microphone and its playback on the television. Believe
+`cachy-console-audio --status` over that screen — it prints the device each
+stream is actually on.
+
+**Mouse, keyboard and calls all work in a tile; screen sharing does not.** The
+trackpad moves a cursor and clicks, and the Steam overlay's keyboard types into
+Discord, because Steam drives both through gamescope's own X server, which
+handles them for every client in the session. That is also why `GRAB_CURSOR`
+matters more than it looks: with the pointer held in relative mode there is no
+cursor to aim, and a tile you cannot click is indistinguishable from one that
+did not start.
+
+Sharing a screen is the one that cannot be made to work from inside the session,
+and the reason is not Discord. Its X11 capture reads the display's root window,
+and an Xwayland server does not keep one to read — this is true of the desktop's
+Xwayland as much as gamescope's. Individual windows fare no better for the case
+that matters: Steam and anything built on Vulkan hand the compositor a buffer
+rather than drawing into an X pixmap, so a capture of the window comes back
+black. The route that does work is the PipeWire portal, and the portal's source
+picker is a window on the *desktop* compositor, which is exactly the thing a
+session on the television cannot reach. So: share from the Discord at your desk,
+where picking the television as the source captures console mode along with it.
+
 ## Configuration
 
 `~/.config/cachy-console/config`, written by `cachy-console settings` and safe to
@@ -276,6 +303,7 @@ edit by hand:
 | `VRR` | `on` | FreeSync / G-Sync inside console mode |
 | `HDR` | `off` | Only worth enabling if display and games support it |
 | `TRACKPAD_FIX` | `off` | Preload libextest for the trackpad. Only for a gamescope that cannot emulate input; on a modern one it sends the cursor to the desktop instead |
+| `GRAB_CURSOR` | `off` | Hold gamescope in relative mouse mode. On means no cursor is ever drawn, so nothing in a desktop application can be clicked — only worth it for a mouse on a desk that slides onto another monitor mid-game |
 | `STEAM_BUTTON` | `on` | Let the Steam button open console mode |
 | `RESTART_STEAM` | `on` | Start the desktop Steam client again when console mode ends, minimised to the tray, so the Steam button has a client to open Big Picture in next time |
 | `AUDIO_FOCUS` | `on` | Mute games you are not looking at |
@@ -298,6 +326,18 @@ by manufacturer. The two views are matched up by screen position, taking names
 and indices from one and the mode from the other. Connector names are
 normalized so Plasma's `HDMI-A-1` and GNOME's `HDMI-1` stay the same saved
 display.
+
+An index is only meaningful for one arrangement of screens, though, and turning
+the television on changes the arrangement while you are reaching for the Steam
+button. Ask a moment too early and the index worked out here is read against a
+list that has since grown a screen, which puts console mode on the wrong
+monitor; the same wake brings the screen's HDMI audio port up a little after the
+screen, so the saved audio device matches nothing and sound stays wherever the
+desktop had it. Both are the same fault and both look like the saved settings
+were ignored. So the display is resolved twice and started only once two
+readings agree, and the audio route is retried for a few seconds rather than
+giving up on the first miss. Neither costs anything noticeable when the screens
+were already on.
 
 **Session environment.** The Steam-button watcher and per-game audio run as
 systemd user services. GNOME usually exports `DISPLAY` and `XAUTHORITY` into
@@ -484,8 +524,12 @@ cachy-console controllers   # the one on js0 is player one
 Put that device's USB id in `IGNORE_CONTROLLERS`, then exit and Steam-button
 twice. It stays a gamepad on the desktop.
 
-**No cursor at all from the trackpad.** Usually `TRACKPAD_FIX=on` on a gamescope
-that emulates input, which sends the trackpad to the desktop instead:
+**No cursor at all from the trackpad.** Check `GRAB_CURSOR` first. On, it holds
+gamescope in relative mouse mode, which is right for a game reading the mouse to
+aim and wrong for everything else: no cursor is drawn at all, so nothing in
+Discord or a dialog can be clicked however far the trackpad is pushed. It is off
+by default. The other cause is `TRACKPAD_FIX=on` on a gamescope that emulates
+input, which sends the trackpad to the desktop instead:
 
 ```bash
 cachy-console status   # the "trackpad" section says which case you are in

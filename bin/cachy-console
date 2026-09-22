@@ -43,6 +43,7 @@ CFG_REFRESH=auto
 CFG_HDR=off
 CFG_VRR=on
 CFG_TRACKPAD_FIX=off
+CFG_GRAB_CURSOR=off
 CFG_RESTART_STEAM=on
 CFG_AUDIO_DEVICE=""
 CFG_AUDIO_INPUT_DEVICE=""
@@ -99,7 +100,7 @@ load_config() {
         value="${value%\"}"; value="${value#\"}"
         value="${value%\'}"; value="${value#\'}"
         case "$key" in
-            DISPLAY|DISPLAY_MODEL|RESOLUTION|REFRESH|HDR|VRR|TRACKPAD_FIX|RESTART_STEAM|EXTRA_GAMESCOPE_ARGS|AUDIO_DEVICE|AUDIO_INPUT_DEVICE|IGNORE_CONTROLLERS)
+            DISPLAY|DISPLAY_MODEL|RESOLUTION|REFRESH|HDR|VRR|TRACKPAD_FIX|GRAB_CURSOR|RESTART_STEAM|EXTRA_GAMESCOPE_ARGS|AUDIO_DEVICE|AUDIO_INPUT_DEVICE|IGNORE_CONTROLLERS)
                 printf -v "CFG_$key" '%s' "$value" ;;
             STEAM_BUTTON|AUDIO_FOCUS|AUDIO_NEVER_MUTE|AUDIO_PIN_VOICE) ;;   # read by the services, not by us
             "") ;;
@@ -124,6 +125,25 @@ resolve_display() {
         RESOLVE_ERROR="${line#"$NAME"-display: }"
         return 1
     fi
+
+    # Wait for the answer to stop changing before trusting it. gamescope's SDL
+    # backend can only be pointed at a screen by *index*, and an index is only
+    # meaningful for one arrangement of displays: turn the television on and press
+    # the Steam button straight away, and the index worked out here is read a
+    # moment later against a list that has grown a screen, so console mode opens
+    # on the wrong one. A screen waking up also brings its HDMI audio port up
+    # separately, which is the other half of the same symptom.
+    #
+    # Two readings that agree mean the arrangement has settled. This costs a
+    # fraction of a second in the ordinary case, where the first two already do.
+    local settle previous="$line"
+    for settle in 1 2 3 4 5 6 7 8; do
+        sleep 0.4
+        line="$("$HELPER_DISPLAY" resolve "$wanted" 2>&1)" || break
+        [[ "$line" == "$previous" ]] && break
+        say "Waiting for the displays to settle…"
+        previous="$line"
+    done
     read -r DISPLAY_INDEX WIDTH HEIGHT REFRESH CONNECTOR <<<"$line"
     if [[ -z "${DISPLAY_INDEX:-}" ]]; then
         RESOLVE_ERROR="could not work out which display to use"
@@ -400,7 +420,20 @@ gamescope_argv() {
     # XWayland: SDL's Wayland driver cannot position windows, so the compositor
     # would choose the screen instead of us.
         out+=(--backend sdl --display-index "$DISPLAY_INDEX"
-              --prefer-output "$CONNECTOR" --force-grab-cursor)
+              --prefer-output "$CONNECTOR")
+    # Left off, because it is the reason a controller has no cursor. gamescope
+    # normally flips between two ways of handling a pointer: relative motion for
+    # something that has hidden its cursor -- a game reading the mouse to aim --
+    # and an ordinary cursor for anything showing one. --force-grab-cursor stops
+    # it flipping and keeps it in relative mode always, so a desktop application
+    # in the session shows no cursor no matter how much the trackpad is moved, and
+    # nothing in Discord can be clicked. Steam's own trackpad emulation is
+    # unaffected either way: it drives gamescope's X server directly, which needs
+    # no pointer grab.
+    #
+    # It is still worth having for a real mouse on a desk, which without the grab
+    # can slide off gamescope onto another monitor mid-game, so it stays available.
+    is_on "$CFG_GRAB_CURSOR" && out+=(--force-grab-cursor)
 
     if [[ -n "$CFG_EXTRA_GAMESCOPE_ARGS" ]]; then
         # Deliberately word-split: this is a list of arguments, not one string.
@@ -412,7 +445,7 @@ gamescope_argv() {
     # Steam and games must not inherit the *host* Wayland display. If they do,
     # a Vulkan game (Slay the Spire 2, etc.) creates a swapchain on GNOME/KWin
     # instead of inside gamescope. The WSI layer then shows a GTK dialog on the
-    # desktop — and --force-grab-cursor means a controller cannot click OK.
+    # desktop, where a controller cannot reach it to click OK.
     # Strip WAYLAND_DISPLAY and force toolkit dialogs onto gamescope's X11.
     out+=(-- env -u WAYLAND_DISPLAY
           GDK_BACKEND=x11
@@ -478,10 +511,22 @@ It will not choose a screen for you."
         restart_desktop_steam || true
     }
     trap back_to_desktop EXIT
-    local route_log sink
-    route_log="$("$HELPER_DISPLAY" audio-route 2>&1)" || warn "could not switch HDMI audio to $CONNECTOR"
+    local route_log sink attempt
+    # A screen that has just woken brings its HDMI audio port up a moment after
+    # the screen itself, and until it does the saved device cannot be matched: the
+    # route finds nothing, PULSE_SINK goes unset, and Steam plays through whatever
+    # the desktop happens to be using -- the complaint that console mode came up
+    # on the wrong audio device. Worth a few more tries before giving up on it.
+    for attempt in 1 2 3 4 5 6; do
+        route_log="$("$HELPER_DISPLAY" audio-route 2>&1)" \
+            || warn "could not switch HDMI audio to $CONNECTOR"
+        sink="$(printf '%s\n' "$route_log" | awk '/^SINK /{print $2; exit}')"
+        [[ -n "$sink" ]] && break
+        (( attempt == 1 )) && say "Waiting for the audio device to appear…"
+        sleep 0.5
+    done
     say "$route_log"
-    sink="$(printf '%s\n' "$route_log" | awk '/^SINK /{print $2; exit}')"
+    [[ -z "$sink" ]] && warn "no audio device matched ${CFG_AUDIO_DEVICE:-the saved choice}; Steam will use the desktop's own output."
     # Steam and games inherit this, so they play on the TV even if the
     # session default is still a headset.
     [[ -n "$sink" ]] && export PULSE_SINK="$sink"
@@ -583,6 +628,12 @@ HDR=$CFG_HDR
 # its cursor, and extest would replay the calls on the desktop instead -- no
 # cursor in console mode at all. Only for a gamescope too old to emulate input.
 TRACKPAD_FIX=$CFG_TRACKPAD_FIX
+
+# Keep the pointer inside gamescope by holding it in relative mouse mode. Off,
+# because on means no cursor is ever drawn: a desktop application in the session
+# -- Discord -- cannot be clicked, however much the trackpad moves. Turn it on
+# only for a mouse on a desk that keeps sliding onto another monitor mid-game.
+GRAB_CURSOR=$CFG_GRAB_CURSOR
 
 # Start the ordinary desktop Steam client again when console mode ends. Leaving
 # takes gamescope's Steam down with it, and the Steam button cannot open Big
@@ -739,6 +790,15 @@ status() {
 
     say
     say "== trackpad =="
+    # Before anything about extest, because this one silences the cursor whatever
+    # else is set correctly, and it is not obvious from the couch that a tile
+    # which cannot be clicked is a pointer problem rather than a dead tile.
+    if is_on "$CFG_GRAB_CURSOR"; then
+        warn "GRAB_CURSOR is on, so gamescope stays in relative mouse mode and draws"
+        warn "no cursor. The trackpad cannot click anything in Discord or a dialog."
+        warn "Set GRAB_CURSOR=off unless a mouse on your desk needs holding in."
+        warnings=$(( warnings + 1 ))
+    fi
     if gamescope_emulates_input; then
         say "  gamescope emulates input, so it moves the trackpad cursor itself."
     else
