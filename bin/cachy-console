@@ -145,6 +145,45 @@ running_appids() {
         | grep -o 'AppId=[0-9][0-9]*' | cut -d= -f2 | sort -u | paste -sd' ' -
 }
 
+# The same title the watcher matches on, for the same window.
+BPM_PATTERN="${CACHY_CONSOLE_BPM_PATTERN:-[Bb]ig ?[Pp]icture}"
+
+big_picture_open() {
+    have xprop || return 1
+    local wid name
+    for wid in $(xprop -root _NET_CLIENT_LIST 2>/dev/null | grep -o '0x[0-9a-f]*'); do
+        name="$(xprop -id "$wid" _NET_WM_NAME WM_NAME 2>/dev/null)"
+        [[ "$name" =~ $BPM_PATTERN ]] && return 0
+    done
+    return 1
+}
+
+# Get the desktop client out of Big Picture before asking it to quit.
+#
+# What you see is the reason. The Steam button does not launch anything: it flips
+# the *desktop* client into Big Picture, on whatever screen that window was
+# already on, and only then does the watcher have anything to react to. That
+# window then stays where it is until Steam is gone, so console mode looks like it
+# opened on the wrong monitor and moved to the right one some seconds later.
+# Leaving Big Picture first puts that screen back to the desktop in about a
+# second, instead of it showing the wrong thing for the whole shutdown.
+#
+# Quitting from the desktop client is a little quicker as well -- measured here,
+# 2.7s against 4.6s from Big Picture -- and once took 33s from Big Picture, which
+# is the case this is really aimed at.
+leave_big_picture() {
+    big_picture_open || return 0
+    say "Leaving Big Picture on the desktop…"
+    steam steam://close/bigpicture >/dev/null 2>&1 || return 0
+    local i
+    for i in $(seq 1 20); do
+        big_picture_open || return 0
+        sleep 0.25
+    done
+    # Not worth waiting on: the shutdown below removes the window regardless.
+    return 0
+}
+
 stop_steam() {
     steam_running || return 0
 
@@ -154,6 +193,8 @@ stop_steam() {
         die "a game is running (AppID: $(running_appids)) — refusing to restart Steam.
 Quit the game first, or set CACHY_CONSOLE_FORCE=1 to override."
     fi
+
+    leave_big_picture
 
     say "Closing the running Steam client…"
     steam -shutdown >/dev/null 2>&1 || pkill -x steam || true

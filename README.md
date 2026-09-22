@@ -151,6 +151,21 @@ to `cachy-console-exit` by that same command.
 
 ### Voice chat
 
+**Big Picture appears on the desktop for a moment before console mode opens, and
+that is the trigger rather than a fault.** The Steam button does not launch
+anything: it flips the *already running* desktop client into Big Picture, on
+whichever screen that window was on. That window appearing is the only signal
+there is, so console mode cannot be started before it exists. What used to happen
+next was the annoying part — the window sat on the wrong monitor for as long as
+Steam took to quit, which looked like console mode had opened on the wrong screen
+and moved over some seconds later. Steam is now asked to leave Big Picture first,
+which clears that screen in about a second, and only then asked to quit.
+
+The wait after that is Steam starting up again inside gamescope, and there is no
+way around it: gamescope cannot adopt a window from another compositor, so Steam
+has to be relaunched as its child. Expect a few seconds to the display switching
+over and a few more before Big Picture has drawn.
+
 **The Discord already open on your desktop cannot be moved into console mode.**
 A window belongs to the compositor its client connected to, and gamescope is a
 separate nested one — the same reason Big Picture has to be relaunched rather
