@@ -283,12 +283,30 @@ console's microphone and its playback on the television. Believe
 stream is actually on.
 
 **Mouse, keyboard and calls all work in a tile; screen sharing does not.** The
-trackpad moves a cursor and clicks, and the Steam overlay's keyboard types into
-Discord, because Steam drives both through gamescope's own X server, which
-handles them for every client in the session. That is also why `GRAB_CURSOR`
-matters more than it looks: with the pointer held in relative mode there is no
-cursor to aim, and a tile you cannot click is indistinguishable from one that
-did not start.
+keyboard is the easy half: Steam types through XTEST against gamescope's own X
+server, and that arrives whatever else is set — measured here, Ctrl+K opened
+Discord's quick switcher and Escape closed it again.
+
+The trackpad needs both `TRACKPAD_FIX` and `GRAB_CURSOR` on, which is why they
+are, and each is silent when it is wrong:
+
+- **`TRACKPAD_FIX=on`** because XTEST *motion*, unlike XTEST keys, moves nothing
+  any client can see. Walked across Discord's window, the pointer the X server
+  reports follows exactly and Discord does not react at all, frame for frame
+  identical. extest turns those calls into a real device on the seat instead, and
+  then it does: the same motion moves the pointer inside the session, rows
+  highlight under it and clicks land on what they are over.
+- **`GRAB_CURSOR=on`** because a gamescope nested on a desktop does not draw a
+  cursor of its own. It hands the image to whatever is hosting its window and
+  lets that draw one, which KWin does — at the *desktop's* pointer, and only
+  while that is over the session's window. On another screen there is no cursor
+  in the session at all. Asking for the grab is what makes gamescope draw its
+  own, and it keeps the pointer from sliding out onto the desk's monitor.
+
+One limit to know: under the grab, gamescope takes relative motion and ignores
+absolute warps, so a trackpad configured as an *absolute* pad (touch a corner,
+the cursor goes to that corner) will not move anything. The default relative
+behaviour is what works.
 
 Sharing a screen is the one that cannot be made to work from inside the session,
 and the reason is not Discord. Its X11 capture reads the display's root window,
@@ -313,8 +331,8 @@ edit by hand:
 | `REFRESH` | `auto` | Follow the display's current setting, or force e.g. `120` |
 | `VRR` | `on` | FreeSync / G-Sync inside console mode |
 | `HDR` | `off` | Only worth enabling if display and games support it |
-| `TRACKPAD_FIX` | `off` | Preload libextest for the trackpad. Only for a gamescope that cannot emulate input; on a modern one it sends the cursor to the desktop instead |
-| `GRAB_CURSOR` | `off` | Hold gamescope in relative mouse mode. On means no cursor is ever drawn, so nothing in a desktop application can be clicked — only worth it for a mouse on a desk that slides onto another monitor mid-game |
+| `TRACKPAD_FIX` | `on` | Preload libextest, so Steam's trackpad emulation becomes a real device instead of XTEST calls no client reacts to. Off means the Steam keyboard still types and the trackpad does nothing |
+| `GRAB_CURSOR` | `on` | Hold gamescope in relative mouse mode, which is what makes a nested gamescope draw its own cursor and keeps the pointer in the session. Off hands the cursor back to the desktop, which draws one only while the desktop's pointer is over the session's window |
 | `STEAM_BUTTON` | `on` | Let the Steam button open console mode |
 | `RESTART_STEAM` | `on` | Start the desktop Steam client again when console mode ends, minimised to the tray, so the Steam button has a client to open Big Picture in next time |
 | `AUDIO_FOCUS` | `on` | Mute games you are not looking at |
@@ -426,19 +444,21 @@ console mode only, so the device is still a gamepad on the desktop:
 cachy-console controllers   # names, USB ids, and which slot each one holds
 ```
 
-**The trackpad, and why `TRACKPAD_FIX` is off.** Steam moves the trackpad cursor
-by making XTEST calls against whatever X server it is on, and gamescope's own
-XWayland handles them: gamescope is linked against `libeis` and logs
-`Successfully initialized libei for input emulation`, so an XTEST call lands on
-gamescope's cursor and the trackpad just works. extest intercepts those calls
-before they get there and replays them against the *host* seat in host
-coordinates — it will happily report your desktop's monitors while doing it —
-which leaves gamescope's cursor untouched and nothing to click. So the fix for a
-desktop session is the thing that breaks a gamescope one, and it stays off unless
-your gamescope is too old to emulate input. `cachy-console status` reads the
-`libeis` link and says which case you are in.
+**The trackpad, and why `TRACKPAD_FIX` is on.** Steam moves the trackpad cursor by
+making XTEST calls against whatever X server it is on — its client carries
+`XTestFakeMotionEvent` and friends, and uses `/dev/uinput` only for the virtual
+gamepad. Against gamescope's XWayland those calls are not enough. The X pointer
+moves, and only the X pointer: gamescope draws its cursor at the position its own
+input pipeline tracks, which an XTEST call never touches, and no client in the
+session sees a thing. Checked against Discord, motion changed nothing at all
+while keys from the same source arrived normally.
 
-If you do turn it on, note where the preload is set: on the `env` that gamescope
+extest replaces those calls with writes to `/dev/uinput`, which makes them a real
+device on the seat, and from there they reach the session the way a mouse would.
+That is also why the grab matters: extest's relative motion is what a grabbed
+gamescope wants, while its absolute warps are ignored.
+
+Note where the preload is set: on the `env` that gamescope
 execs, never exported. gamescope carries `CAP_SYS_NICE` for realtime scheduling,
 and file capabilities put a process into glibc's secure-execution mode, where
 `LD_PRELOAD` is only honoured for set-user-ID libraries. glibc does not merely
@@ -542,25 +562,27 @@ cachy-console controllers   # the one on js0 is player one
 Put that device's USB id in `IGNORE_CONTROLLERS`, then exit and Steam-button
 twice. It stays a gamepad on the desktop.
 
-**No cursor at all from the trackpad.** Check `GRAB_CURSOR` first. On, it holds
-gamescope in relative mouse mode, which is right for a game reading the mouse to
-aim and wrong for everything else: no cursor is drawn at all, so nothing in
-Discord or a dialog can be clicked however far the trackpad is pushed. It is off
-by default. The other cause is `TRACKPAD_FIX=on` on a gamescope that emulates
-input, which sends the trackpad to the desktop instead:
+**No cursor at all from the trackpad.** Check the controller first, because a
+Steam Controller switches itself off after a few minutes and nothing on screen
+says so: Big Picture is still there, the Steam keyboard still types, and the
+trackpad is simply dead.
 
 ```bash
-cachy-console status   # the "trackpad" section says which case you are in
+cachy-console controllers   # says when a dongle has nothing connected to it
+cachy-console status        # the "trackpad" section checks the rest
 ```
 
-Set `TRACKPAD_FIX=off`, then exit and Steam-button twice. If it is already off,
-check for `cannot be preloaded` in the startup output — that means the opposite
-problem, a preload that was refused rather than one that hijacked the cursor.
+Press the controller's Steam button to wake it. If it is awake, the two settings
+above both have to be on — `TRACKPAD_FIX` for the motion to reach the session at
+all, `GRAB_CURSOR` for a cursor to be drawn in it — and `status` warns for either
+one being off. A third cause is a preload that was refused: `cannot be preloaded`
+in the startup output means `sudo ldconfig`, or that `/dev/uinput` is not writable,
+which Steam's own udev rules normally handle.
 
-| gamescope | `TRACKPAD_FIX=off` | `TRACKPAD_FIX=on` |
+| | `TRACKPAD_FIX=off` | `TRACKPAD_FIX=on` |
 | --- | --- | --- |
-| linked against `libeis` | cursor works | no cursor |
-| not linked | no cursor | cursor works |
+| `GRAB_CURSOR=off` | nothing moves | moves, cursor only while the desktop's pointer is over the window |
+| `GRAB_CURSOR=on` | nothing moves | works |
 
 ## Not supported
 

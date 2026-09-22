@@ -42,8 +42,8 @@ CFG_RESOLUTION=auto
 CFG_REFRESH=auto
 CFG_HDR=off
 CFG_VRR=on
-CFG_TRACKPAD_FIX=off
-CFG_GRAB_CURSOR=off
+CFG_TRACKPAD_FIX=on
+CFG_GRAB_CURSOR=on
 CFG_RESTART_STEAM=on
 CFG_AUDIO_DEVICE=""
 CFG_AUDIO_INPUT_DEVICE=""
@@ -249,11 +249,11 @@ launch_desktop_steam() {
         -u NODEVICE_SELECT -u DISABLE_LAYER_MESA_ANTI_LAG
         -u GDK_BACKEND -u QT_QPA_PLATFORM)
 
-    # Only when the user asked for the preload at all. The desktop is the one
-    # place extest is the right answer, but it is still their call, and a
-    # preload nobody asked for is a preload nobody can explain.
-    extest_wanted && clean+=("LD_PRELOAD=${EXTEST_LIB}${LD_PRELOAD:+:$LD_PRELOAD}")
-
+    # The extest preload is not one of them. TRACKPAD_FIX is on by default, and a
+    # default is not a request: adding it here would quietly change how the
+    # trackpad behaves in the client the user runs at their desk, every time
+    # console mode ended. It belongs to the session, so it stays in the session.
+    #
     # -silent: back to the tray rather than a window thrown over whatever the
     # user returned to. A double press on the Steam button opens Big Picture
     # from the tray just the same, which is the whole reason for bringing it
@@ -365,13 +365,14 @@ await_steam_relaunch() {
 # those calls against /dev/uinput so a desktop Wayland session does not turn the
 # first one into an xdg-desktop-portal "allow remote interaction" prompt.
 #
-# Off by default, because inside gamescope it is the wrong answer and actively
-# breaks the trackpad. gamescope emulates input itself -- it logs "Successfully
-# initialized libei for input emulation" -- so XTEST aimed at its XWayland lands
-# on its own cursor and the trackpad simply works. extest intercepts those calls
-# first and replays them against the *host* seat, in host coordinates, which
-# leaves gamescope's cursor untouched and nothing to click. Only turn this on for
-# a gamescope too old to emulate input, where the portal prompt appears instead.
+# On by default, because XTEST on its own moves nothing a client can see. Checked
+# here against Discord in a session: XTEST motion does move the pointer the X
+# server reports -- XQueryPointer follows it exactly -- and Discord does not
+# react to it at all, frame for frame identical while the pointer is walked
+# across the window. XTEST *keys* do arrive, which is the confusing part: the
+# Steam keyboard types fine while the trackpad appears dead. Sent through extest
+# the same motion becomes an "extest fake device" on the seat, and the pointer
+# inside the session moves with it.
 extest_available() {
     [[ -e /usr/lib32/libextest.so || -e /usr/lib/libextest.so ]]
 }
@@ -380,14 +381,11 @@ extest_wanted() {
     is_on "$CFG_TRACKPAD_FIX" && extest_available
 }
 
-# Whether gamescope can emulate input, which is what lets the trackpad move its
-# cursor without help. Read from the link against libeis rather than from a
-# version number, since distributions differ on when the feature arrived.
-gamescope_emulates_input() {
-    have gamescope || return 1
-    local libs
-    libs="$(ldd "$(command -v gamescope)" 2>/dev/null || true)"
-    [[ "$libs" == *libeis.so* ]]
+# extest writes its events to /dev/uinput, and a kernel with no rule granting it
+# leaves it root-only. There is no error to see when that happens -- the trackpad
+# is simply dead again -- so it is worth saying so up front.
+uinput_writable() {
+    [[ -w /dev/uinput ]]
 }
 
 warn_extest() {
@@ -397,10 +395,10 @@ warn_extest() {
         warn "install it with: paru -S libextest-git   (or yay -S libextest-git)"
         return 0
     fi
-    gamescope_emulates_input || return 0
-    warn "TRACKPAD_FIX is on, but this gamescope emulates input itself, so extest"
-    warn "will replay the trackpad on the desktop and console mode will have no"
-    warn "cursor at all. Set TRACKPAD_FIX=off unless you know you need it."
+    uinput_writable && return 0
+    warn "TRACKPAD_FIX is on but /dev/uinput is not writable, so extest cannot"
+    warn "replay the trackpad and there will be no cursor. Steam's own udev rules"
+    warn "grant it: reinstall steam, or add yourself to the group owning it."
 }
 
 # ---- gamescope ----------------------------------------------------------
@@ -435,18 +433,15 @@ gamescope_argv() {
     # would choose the screen instead of us.
         out+=(--backend sdl --display-index "$DISPLAY_INDEX"
               --prefer-output "$CONNECTOR")
-    # Left off, because it is the reason a controller has no cursor. gamescope
-    # normally flips between two ways of handling a pointer: relative motion for
-    # something that has hidden its cursor -- a game reading the mouse to aim --
-    # and an ordinary cursor for anything showing one. --force-grab-cursor stops
-    # it flipping and keeps it in relative mode always, so a desktop application
-    # in the session shows no cursor no matter how much the trackpad is moved, and
-    # nothing in Discord can be clicked. Steam's own trackpad emulation is
-    # unaffected either way: it drives gamescope's X server directly, which needs
-    # no pointer grab.
-    #
-    # It is still worth having for a real mouse on a desk, which without the grab
-    # can slide off gamescope onto another monitor mid-game, so it stays available.
+    # On, because it is what draws a cursor at all in a session nested on a
+    # desktop. gamescope decides in ShouldDrawCursor(), and the deciding line for
+    # us is "if ( g_bForceRelativeMouse ) return true": without it, a nested
+    # gamescope hands the cursor image to the compositor hosting it and lets *that*
+    # draw one. Which KWin does -- wherever the desktop's own pointer is, and only
+    # while it is over the session's window. On another screen, or grabbed by a
+    # window on top, there is no cursor in the session however far the trackpad is
+    # pushed. Relative mode also keeps the pointer from sliding out of the session
+    # onto the desk's monitor mid-game, which is what it is usually wanted for.
     is_on "$CFG_GRAB_CURSOR" && out+=(--force-grab-cursor)
 
     if [[ -n "$CFG_EXTRA_GAMESCOPE_ARGS" ]]; then
@@ -807,49 +802,46 @@ status() {
         problems=$(( problems + 1 ))
     fi
 
-    say
-    say "== trackpad =="
-    # Before anything about extest, because this one silences the cursor whatever
-    # else is set correctly, and it is not obvious from the couch that a tile
-    # which cannot be clicked is a pointer problem rather than a dead tile.
-    if is_on "$CFG_GRAB_CURSOR"; then
-        warn "GRAB_CURSOR is on, so gamescope stays in relative mouse mode and draws"
-        warn "no cursor. The trackpad cannot click anything in Discord or a dialog."
-        warn "Set GRAB_CURSOR=off unless a mouse on your desk needs holding in."
-        warnings=$(( warnings + 1 ))
-    fi
-    if gamescope_emulates_input; then
-        say "  gamescope emulates input, so it moves the trackpad cursor itself."
-    else
-        say "  this gamescope does not emulate input (no libeis), so the trackpad"
-        say "  needs TRACKPAD_FIX=on to move a cursor."
-    fi
-    if is_on "$CFG_TRACKPAD_FIX"; then
-        if ! extest_available; then
-            warn "TRACKPAD_FIX is on but libextest is not installed."
-            say "       paru -S libextest-git"
-            warnings=$(( warnings + 1 ))
-        elif gamescope_emulates_input; then
-            warn "TRACKPAD_FIX is on while gamescope emulates input. extest replays"
-            warn "the trackpad on the desktop instead, so console mode gets no"
-            warn "cursor. Set TRACKPAD_FIX=off."
+        say
+        say "== trackpad =="
+        # Both of these have to be on for a trackpad to move a visible cursor, and
+        # each fails silently on its own: off, the motion never reaches the session;
+        # on without the grab, gamescope leaves the drawing to the desktop and there
+        # is no cursor in the session to aim. From the couch either one looks like a
+        # dead tile rather than a pointer problem.
+        if is_on "$CFG_GRAB_CURSOR"; then
+            say "  GRAB_CURSOR is on, so gamescope draws its own cursor and keeps the"
+            say "  pointer inside the session."
+        else
+            warn "GRAB_CURSOR is off, so a nested gamescope leaves the cursor to the"
+            warn "desktop: it is drawn only while the desktop's pointer is over the"
+            warn "session's window, and never from the trackpad alone."
             warnings=$(( warnings + 1 ))
         fi
-        # A bare soname resolves through the linker cache. Captured rather than
-        # piped into grep -q, which SIGPIPEs ldconfig and trips pipefail.
-        local cache
-        cache="$(ldconfig -p 2>/dev/null || true)"
-        if extest_available && [[ "$EXTEST_LIB" != /* && "$cache" != *"$EXTEST_LIB"* ]]; then
-            warn "$EXTEST_LIB is not in the linker cache; run: sudo ldconfig"
+        if is_on "$CFG_TRACKPAD_FIX"; then
+            if ! extest_available; then
+                warn "TRACKPAD_FIX is on but libextest is not installed."
+                say "       paru -S libextest-git"
+                warnings=$(( warnings + 1 ))
+            fi
+            # A bare soname resolves through the linker cache. Captured rather than
+            # piped into grep -q, which SIGPIPEs ldconfig and trips pipefail.
+            local cache
+            cache="$(ldconfig -p 2>/dev/null || true)"
+            if extest_available && [[ "$EXTEST_LIB" != /* && "$cache" != *"$EXTEST_LIB"* ]]; then
+                warn "$EXTEST_LIB is not in the linker cache; run: sudo ldconfig"
+                warnings=$(( warnings + 1 ))
+            fi
+            if ! uinput_writable; then
+                warn "/dev/uinput is not writable, so extest cannot inject input."
+                warnings=$(( warnings + 1 ))
+            fi
+        else
+            warn "TRACKPAD_FIX is off, so Steam's trackpad emulation reaches the session"
+            warn "as XTEST, which moves the X pointer without any client noticing. The"
+            warn "Steam keyboard still types; the trackpad does nothing."
             warnings=$(( warnings + 1 ))
         fi
-        if [[ ! -w /dev/uinput ]]; then
-            warn "/dev/uinput is not writable, so extest cannot inject input."
-            warnings=$(( warnings + 1 ))
-        fi
-    else
-        say "  TRACKPAD_FIX is off."
-    fi
 
     say
     say "== services =="

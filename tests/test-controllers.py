@@ -139,6 +139,49 @@ check("and it cannot be matched by an id, so nothing hides it by accident",
 fake_sysfs([])
 check("no controllers at all is an empty list", cd.gamepads(), [])
 
+
+print()
+print("telling a sleeping controller from a missing one")
+
+# The dongle stays on the bus when the controller it belongs to switches itself
+# off, so its presence says nothing. What changes is Steam's virtual pad.
+DONGLE = ('I: Bus=0003 Vendor=28de Product=1304\n'
+          'N: Name="Valve Software Steam Controller Puck Mouse"\n'
+          'H: Handlers=event8 mouse1\n')
+OTHER = ('I: Bus=0003 Vendor=31e3 Product=1400\n'
+         'N: Name="Generic X-Box pad"\n'
+         'H: Handlers=event23 js0\n')
+
+
+def fake_devices(text, pads):
+    """Stand in for /proc/bus/input/devices and the gamepad list beside it."""
+    path = os.path.join(tempfile.mkdtemp(), "devices")
+    with open(path, "w") as fh:
+        fh.write(text)
+    real_open = cd.open if hasattr(cd, "open") else open
+
+    def patched(name, *args, **kwargs):
+        if name == "/proc/bus/input/devices":
+            return real_open(path, *args, **kwargs)
+        return real_open(name, *args, **kwargs)
+
+    cd.open = patched
+    cd.gamepads = lambda: pads
+
+
+fake_devices(DONGLE + "\n" + OTHER, [{"virtual": False}])
+check("a dongle with no virtual pad beside it means nothing is connected",
+      cd.steam_controller_asleep(), True)
+
+fake_devices(DONGLE + "\n" + OTHER,
+             [{"virtual": False}, {"virtual": True}])
+check("and once Steam presents a pad for it, it is awake",
+      cd.steam_controller_asleep(), False)
+
+fake_devices(OTHER, [{"virtual": False}])
+check("no dongle at all is not a sleeping controller, it is someone else's "
+      "setup", cd.steam_controller_asleep(), False)
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} failure(s): " + ", ".join(FAILURES))

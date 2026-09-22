@@ -7,10 +7,10 @@ clicked.
 
 The screen is chosen by *index*, because the SDL backend has no other way to
 name an output, and an index only means anything for one arrangement of
-monitors. The cursor is the other one: --force-grab-cursor holds gamescope in
-relative mouse mode, so a desktop application in the session never gets a
-pointer and a controller cannot click anything in it. It is off unless asked
-for, and these pin that down, along with the fact that asking still works.
+monitors. The cursor is the other one: --force-grab-cursor is what makes a nested
+gamescope draw a cursor of its own instead of leaving it to the desktop holding
+the window, so without it there is nothing in the session to aim with a trackpad.
+It is on unless turned off, and these pin that down both ways.
 
 Everything here runs `start --dry-run` against a fake display helper and a fake
 gamescope, so no session is started and no display or audio device is touched.
@@ -111,18 +111,43 @@ w.clean()
 print()
 print("the cursor a controller needs")
 w = World("DISPLAY=HDMI-A-1\n")
-check("the pointer is not grabbed by default, so a cursor can be drawn",
-      "--force-grab-cursor" in w.argv(), False)
+check("the pointer is grabbed by default, so gamescope draws the cursor itself",
+      "--force-grab-cursor" in w.argv(), True)
 w.clean()
 
 w = World("DISPLAY=HDMI-A-1\nGRAB_CURSOR=on\n")
-check("asking for the grab still gets it",
+check("asking for it explicitly is the same as not saying it",
       "--force-grab-cursor" in w.argv(), True)
 w.clean()
 
 w = World("DISPLAY=HDMI-A-1\nGRAB_CURSOR=off\n")
-check("and saying off explicitly is the same as not saying it",
+check("and turning it off leaves the cursor to the desktop",
       "--force-grab-cursor" in w.argv(), False)
+w.clean()
+
+print()
+print("the trackpad Steam drives through XTEST")
+
+
+def preloaded(argv):
+    """Whether Steam is started with an extest preload, and nothing else is."""
+    return [a for a in argv if a.startswith("LD_PRELOAD=")]
+
+
+# Only meaningful where extest exists: the wrapper will not preload a library
+# that is not installed, and refusing to is the correct behaviour there.
+if os.path.exists("/usr/lib/libextest.so") or os.path.exists("/usr/lib32/libextest.so"):
+    w = World("DISPLAY=HDMI-A-1\n")
+    check("extest is preloaded into Steam by default, since XTEST alone moves "
+          "nothing a client can see",
+          preloaded(w.argv()), ["LD_PRELOAD=libextest.so"])
+    w.clean()
+else:
+    print("  SKIP  extest is not installed here")
+
+w = World("DISPLAY=HDMI-A-1\nTRACKPAD_FIX=off\n")
+check("and nothing is preloaded when it is turned off",
+      preloaded(w.argv()), [])
 w.clean()
 
 print()

@@ -1024,6 +1024,29 @@ def gamepads():
     return found
 
 
+def steam_controller_asleep():
+    """A Valve wireless dongle present with no controller talking to it.
+
+    Worth singling out because a Steam Controller turns itself off after a few
+    minutes and takes the trackpad with it, and nothing about that is visible
+    from the couch: Big Picture is still on screen, the Steam keyboard still
+    types -- Steam drives that from the client -- and the trackpad is simply
+    dead, which looks exactly like the pointer being broken.
+
+    The tell is the dongle's own input devices. The kernel gives every slot a
+    mouse and a keyboard for the controller's built-in emulation, and Steam
+    replaces those with a virtual pad for any controller it has taken over. A
+    dongle with no virtual pad beside it has nothing connected to it.
+    """
+    try:
+        with open("/proc/bus/input/devices") as fh:
+            blocks = fh.read().split("\n\n")
+    except OSError:
+        return False
+    dongle = any("Steam Controller" in b and "Vendor=28de" in b for b in blocks)
+    return dongle and not any(pad["virtual"] for pad in gamepads())
+
+
 def saved_ignored_controllers():
     """The raw IGNORE_CONTROLLERS setting, in SDL's own id format."""
     return (read_config().get("IGNORE_CONTROLLERS") or "").strip()
@@ -1065,6 +1088,10 @@ def cmd_controllers(args):
         print("    (none connected)")
     print("  '-' marks one IGNORE_CONTROLLERS hides. A virtual pad is what")
     print("  Steam Input presents for a controller it has taken over.")
+    if steam_controller_asleep():
+        print("  A Steam Controller dongle is plugged in with nothing connected to")
+        print("  it, so the trackpad will not move a cursor anywhere. Press the")
+        print("  controller's Steam button to wake it -- it sleeps by itself.")
     return 0
 
 
