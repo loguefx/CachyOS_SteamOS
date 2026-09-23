@@ -520,6 +520,27 @@ Two other things that look identical from the couch: the display being turned of
 still there and gamescope neither notices nor minds; and Big Picture opening on
 the desktop rather than in console mode at all, which is the next entry.
 
+**The saved screen was off, and Big Picture stayed on the desktop.** This is
+deliberate — console mode will not quietly use a different screen — and it is
+also the single most convincing impostor of the bug above, because what you see
+is full-screen Steam on the wrong monitor. It is not a session: nothing was
+started, and the watcher keeps checking, so turning the screen on while Big
+Picture is still open starts console mode there with no second press.
+
+The watcher now says so on screen as well as in the journal, once per wait:
+*Console mode is waiting for HDMI-A-1*. If you never see notifications from it,
+check that your desktop can show them at all before blaming the watcher — on
+Plasma, `org.freedesktop.Notifications` is claimed by plasmashell's Notifications
+widget, and with that widget missing from the panel the name is never claimed,
+activation times out, and every notification from every application is silently
+dropped:
+
+```bash
+busctl --user list | grep Notifications   # "(activatable)" with no owner means nothing is listening
+```
+
+Add the Notifications widget back to the system tray and the messages appear.
+
 **It opened on the wrong screen and "Exit Console Mode" does nothing.** Those two
 together mean it is not console mode at all: it is Big Picture on the desktop,
 and there is no session for the tile to end. A double press on the Steam button

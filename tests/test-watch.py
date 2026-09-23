@@ -111,9 +111,15 @@ class FakeSession:
         self._alive = False
 
 
-def run(script, connected=True, engage_polls=2, start_ok=True, up_after=1,
-        lifetime=None, max_starts=3, start_window=300.0, polls=None,
-        display="HDMI-1"):
+def run(script, **kw):
+    """What the loop did, which is what almost every test here is about."""
+    return run_session(script, **kw).actions
+
+
+def run_session(script, connected=True, engage_polls=2, start_ok=True, up_after=1,
+                lifetime=None, max_starts=3, start_window=300.0, polls=None,
+                display="HDMI-1"):
+    """The session itself, for the few tests that also care what was said."""
     xprop = FakeXprop(script)
     session = FakeSession(connected, start_ok, up_after, lifetime)
     session.display = display
@@ -135,9 +141,12 @@ def run(script, connected=True, engage_polls=2, start_ok=True, up_after=1,
         if ticks["n"] >= limit:
             stopping["now"] = True
 
+    said = []
     pw.run_loop(xprop, session, re.compile("big.?picture", re.I), args,
-                stopping, sleep, now)
-    return session.actions
+                stopping, sleep, now,
+                announce=lambda summary, body: said.append((summary, body)))
+    session.announced = said
+    return session
 
 
 FAILURES = 0
@@ -311,6 +320,42 @@ check("a dry run only says what it would do",
       relaunch(dry_run=True), [])
 check("--no-steam-relaunch leaves Steam alone",
       relaunch(relaunch_steam=False), [])
+
+print()
+print("saying on screen what the journal already knew")
+# The reason for all of this: with the projector off, the button leaves Big
+# Picture on a desktop monitor, which is indistinguishable from console mode
+# having opened on the wrong screen. A stand-down nobody can see is how that
+# gets reported as a display bug three times over.
+off = run_session([BPM] * 4, connected=False, display="HDMI-A-1")
+check("a screen that is off is announced, not just logged",
+      [s for s, _ in off.announced], ["Console mode is waiting for HDMI-A-1"])
+check("and the notification names the screen and what to do about it",
+      [("HDMI-A-1" in b, "Turn it on" in b) for _, b in off.announced],
+      [(True, True)])
+check("nothing was started on another screen",
+      off.actions, [])
+
+quiet = run_session([BPM] * 3)
+check("a start that works says nothing on screen",
+      quiet.announced, [])
+
+# One per stand-down, not one per poll: stand_down already dedupes by reason,
+# and the notification follows it rather than the loop.
+insistent = run_session([BPM] * 12, connected=False)
+check("a long wait still only notifies once",
+      len(insistent.announced), 1)
+
+nothing_saved = run_session([BPM] * 3, display="")
+check("no saved screen is announced too, since nothing will ever start",
+      [s for s, _ in nothing_saved.announced],
+      ["Console mode has no screen saved"])
+
+broken = run_session([BPM] * 3, start_ok=False)
+check("a session that refuses to start says so on screen",
+      [s for s, _ in broken.announced], ["Console mode could not start"])
+check("and points at the log that has the reason",
+      ["/tmp/fake.log" in b for _, b in broken.announced], [True])
 
 print()
 if FAILURES:

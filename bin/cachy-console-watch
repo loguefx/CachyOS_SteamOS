@@ -73,6 +73,39 @@ def log(msg):
     print(f"[cachy-console-watch] {msg}", flush=True)
 
 
+_sent = []
+
+
+def notify(summary, body):
+    """Say it on screen as well as in the journal.
+
+    The cases this is for all look the same from the couch and none of them look
+    like their cause: the saved screen being off leaves Big Picture sitting on the
+    desktop, on whichever monitor the client felt like, which reads as console
+    mode having opened on the wrong one. The journal has said so all along, which
+    is no use to anyone holding a controller.
+
+    Sent and forgotten, never waited on. A desktop can have no notification
+    daemon at all -- measured here, the name is merely activatable and starting
+    it times out after 25s -- and the Steam button has to keep working through
+    that. Handles are kept only to reap them, so a wedged daemon cannot leave a
+    zombie behind either.
+    """
+    if not shutil.which("notify-send"):
+        return
+    _sent[:] = [p for p in _sent if p.poll() is None]
+    try:
+        _sent.append(subprocess.Popen(
+            ["notify-send", "--app-name=Console Mode", "--icon=input-gaming",
+             # Replaces its own previous notification rather than stacking one
+             # per poll. Understood by Plasma and GNOME; harmless elsewhere.
+             "--hint=string:x-canonical-private-synchronous:cachy-console",
+             summary, body],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+    except OSError:
+        pass
+
+
 def ensure_session_env():
     """Plasma often starts systemd --user without DISPLAY/WAYLAND_DISPLAY."""
     if not os.environ.get("DISPLAY"):
@@ -526,7 +559,7 @@ IDLE, STARTING, GAME = "idle", "starting", "game"
 
 
 def run_loop(xprop, session, bpm_re, args, stopping, sleep,
-             now=time.monotonic):
+             now=time.monotonic, announce=notify):
     """The state machine, kept separate so it can be driven by fakes in tests."""
     state = IDLE
     engage_streak = 0
@@ -543,10 +576,15 @@ def run_loop(xprop, session, bpm_re, args, stopping, sleep,
     # the next appearance as a real request.
     awaiting_bpm_clear = False
 
-    def stand_down(reason, message):
+    def stand_down(reason, message, headline=None):
         nonlocal last_standdown
         if reason != last_standdown:
             log(message)
+            # Once per stand-down, for the same reason the log line is: the state
+            # is invisible otherwise, and every one of these is something the
+            # person at the controller can act on.
+            if headline:
+                announce(headline, message)
             last_standdown = reason
 
     while not stopping["now"]:
@@ -594,7 +632,8 @@ def run_loop(xprop, session, bpm_re, args, stopping, sleep,
                         stand_down("awaiting-clear",
                                    "Big Picture is still open from the last "
                                    "session; close it and press the Steam button "
-                                   "twice to start console mode again.")
+                                   "twice to start console mode again.",
+                                   headline="Close Big Picture to start again")
                         sleep(args.interval)
                         continue
                     awaiting_bpm_clear = False
@@ -617,15 +656,24 @@ def run_loop(xprop, session, bpm_re, args, stopping, sleep,
                     if not getattr(session, "display", None):
                         stand_down("unconfigured",
                                    "no display saved; open Console Mode Settings. "
-                                   "Not using another screen.")
+                                   "Not using another screen.",
+                                   headline="Console mode has no screen saved")
                         sleep(args.interval * 5)
                         continue
 
                     # With the saved display switched off, do not pick another.
+                    # This keeps polling, so turning the screen on while Big
+                    # Picture is still up starts console mode with no second
+                    # press -- which is worth saying, because the alternative
+                    # reading of the same screen is that it went to the wrong one.
                     if not session.connected():
-                        stand_down("disconnected", f"saved display "
-                                   f"{session.display} is off; leaving Big Picture "
-                                   f"on the desktop instead of using another screen.")
+                        stand_down(
+                            "disconnected",
+                            f"{session.display} is off or unplugged, so Big "
+                            f"Picture is staying on the desktop rather than "
+                            f"opening on another screen. Turn it on and console "
+                            f"mode moves there on its own.",
+                            headline=f"Console mode is waiting for {session.display}")
                         sleep(args.interval * 5)
                         continue
 
@@ -635,7 +683,8 @@ def run_loop(xprop, session, bpm_re, args, stopping, sleep,
                                    f"{len(starts)} sessions started in the last "
                                    f"{args.start_window:.0f}s; refusing to loop. "
                                    f"Turn off Steam's 'start in Big Picture' "
-                                   f"setting, then restart this service.")
+                                   f"setting, then restart this service.",
+                                   headline="Console mode stopped restarting")
                         sleep(args.interval * 10)
                         continue
 
@@ -648,7 +697,9 @@ def run_loop(xprop, session, bpm_re, args, stopping, sleep,
                         deadline = now() + args.start_timeout
                     else:
                         stand_down("startfail",
-                                   "could not start the session; will retry.")
+                                   "could not start the session; will retry. See "
+                                   f"{session.log_path} for what it said.",
+                                   headline="Console mode could not start")
 
         sleep(args.interval)
 
