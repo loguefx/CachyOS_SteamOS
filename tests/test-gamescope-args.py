@@ -37,11 +37,39 @@ def check(label, got, want):
         FAILURES.append(label)
 
 
+# A display helper that can also behave like screens in motion. Two knobs, both
+# written by the test as files in $CACHY_TEST_STATE:
+#
+#   strict-fails  how many `resolve --strict` calls refuse before answering,
+#                 which is what a layout caught mid-change looks like
+#   answer2       the answer to give once audio-route has been called -- the
+#                 point past which a screen waking or sleeping renumbers the
+#                 list, with the index already worked out and nothing to notice
 HELPER = """#!/bin/bash
+state="${CACHY_TEST_STATE:-}"
+
+answer() {
+    if [[ -n "$state" && -f "$state/flipped" && -f "$state/answer2" ]]; then
+        cat "$state/answer2"
+    else
+        echo "2 1920 1080 240 HDMI-A-1"
+    fi
+}
+
 case "$1" in
   saved)         echo "HDMI-A-1" ;;
-  resolve)       echo "2 1920 1080 240 HDMI-A-1" ;;
-  audio-route)   echo "SINK alsa_output.fake" ;;
+  resolve)
+    if [[ "$2" == "--strict" && -n "$state" && -f "$state/strict-fails" ]]; then
+        left="$(< "$state/strict-fails")"
+        if (( left > 0 )); then
+            printf '%s\n' "$(( left - 1 ))" > "$state/strict-fails"
+            echo "displays are still arranging themselves (DP-2, HDMI-A-1)" >&2
+            exit 1
+        fi
+    fi
+    answer ;;
+  audio-route)   [[ -n "$state" ]] && : > "$state/flipped"
+                 echo "SINK alsa_output.fake" ;;
   audio-input-resolve) echo "alsa_input.fake" ;;
   audio-resolve) echo "alsa_output.fake" ;;
   has)           exit 0 ;;
@@ -60,15 +88,27 @@ echo "  --force-grab-cursor  always use relative mouse mode"
 class World:
     """A cachy-console with fake helpers beside it and a config of our own."""
 
-    def __init__(self, config=""):
+    def __init__(self, config="", strict_fails=0, answer2=None):
         self.dir = tempfile.mkdtemp(prefix="cachy-args-")
         self.bin = os.path.join(self.dir, "bin")
         os.makedirs(self.bin)
+        self.state = os.path.join(self.dir, "state")
+        self.run = os.path.join(self.dir, "run")
+        os.makedirs(self.state)
+        os.makedirs(self.run)
+        if strict_fails:
+            self.write(os.path.join(self.state, "strict-fails"), str(strict_fails))
+        if answer2:
+            self.write(os.path.join(self.state, "answer2"), answer2)
         shutil.copy(WRAPPER, os.path.join(self.bin, "cachy-console"))
+        # gamescope writes down what it was asked for and leaves again, which is
+        # enough for a start to run through to the end.
+        recorder = GAMESCOPE + f'printf "%s\\n" "$@" > {self.state}/gamescope-argv\n'
         for name, body in (("cachy-console-display", HELPER),
-                           ("gamescope", GAMESCOPE),
+                           ("gamescope", recorder),
                            ("steam", "#!/bin/bash\nexit 0\n"),
-                           ("pgrep", "#!/bin/bash\nexit 1\n")):
+                           ("pgrep", "#!/bin/bash\nexit 1\n"),
+                           ("cachy-console-exit", "#!/bin/bash\nexit 1\n")):
             path = os.path.join(self.bin, name)
             with open(path, "w") as fh:
                 fh.write(body)
@@ -80,18 +120,42 @@ class World:
             fh.write(config)
         self.config_home = os.path.join(self.dir, "config")
 
-    def argv(self):
-        """The gamescope command line `start --dry-run` would run."""
+    @staticmethod
+    def write(path, text):
+        with open(path, "w") as fh:
+            fh.write(text + "\n")
+
+    def env(self):
         env = dict(os.environ)
         env["XDG_CONFIG_HOME"] = self.config_home
+        env["XDG_RUNTIME_DIR"] = self.run
+        env["CACHY_TEST_STATE"] = self.state
         env["PATH"] = self.bin + os.pathsep + env.get("PATH", "")
+        return env
+
+    def argv(self):
+        """The gamescope command line `start --dry-run` would run."""
         res = subprocess.run([os.path.join(self.bin, "cachy-console"),
                               "start", "--dry-run"],
-                             capture_output=True, text=True, timeout=60, env=env)
+                             capture_output=True, text=True, timeout=60,
+                             env=self.env())
+        self.output = res.stdout + res.stderr
         for line in res.stdout.splitlines():
             if "gamescope" in line and "--backend" in line:
                 return line.strip().split()
         return []
+
+    def started(self):
+        """The command line a real `start` handed gamescope."""
+        res = subprocess.run([os.path.join(self.bin, "cachy-console"), "start"],
+                             capture_output=True, text=True, timeout=120,
+                             env=self.env())
+        self.output = res.stdout + res.stderr
+        recorded = os.path.join(self.state, "gamescope-argv")
+        if not os.path.exists(recorded):
+            return []
+        with open(recorded) as fh:
+            return [line.rstrip("\n") for line in fh]
 
     def clean(self):
         shutil.rmtree(self.dir, ignore_errors=True)
@@ -148,6 +212,57 @@ else:
 w = World("DISPLAY=HDMI-A-1\nTRACKPAD_FIX=off\n")
 check("and nothing is preloaded when it is turned off",
       preloaded(w.argv()), [])
+w.clean()
+
+print()
+print("screens that are still moving when the button is pressed")
+
+
+def index_of(argv):
+    return argv[argv.index("--display-index") + 1] if "--display-index" in argv else None
+
+
+# Turn the projector on, press the Steam button straight away, and the layout is
+# mid-change: resolve refuses until it holds still. The point is that waiting is
+# what happens, rather than an index resolved against a list about to change.
+w = World("DISPLAY=HDMI-A-1\n", strict_fails=3)
+argv = w.argv()
+check("an unsettled layout is waited out rather than resolved against",
+      index_of(argv), "2")
+check("and it says so, because the wait is otherwise unexplained",
+      "Waiting for the displays to settle" in w.output, True)
+w.clean()
+
+# Nothing refuses here, it just never holds still, which is also what genuinely
+# mirrored screens look like. Starting is better than refusing to; saying the
+# screen may be wrong is better than not.
+w = World("DISPLAY=HDMI-A-1\n", strict_fails=99)
+argv = w.argv()
+check("screens that never settle still start, on the ordinary answer",
+      index_of(argv), "2")
+check("with a warning that the screen may not be the right one",
+      "never settled" in w.output, True)
+w.clean()
+
+print()
+print("the index is read again as late as it can be")
+# Closing Steam is the slow part of starting, and a screen sleeping or waking in
+# those seconds renumbers the list. SDL resolves the index when it creates the
+# window: stale, it silently uses display 0 -- the monitor being played on.
+w = World("DISPLAY=HDMI-A-1\n", answer2="1 1920 1080 60 HDMI-A-1")
+argv = w.started()
+check("gamescope is given the index resolved last, not the one resolved first",
+      index_of(argv), "1")
+check("and the mode that came with it",
+      argv[argv.index("-r") + 1] if "-r" in argv else None, "60")
+check("with the change said out loud, since it explains a slower start",
+      "renumbered" in w.output, True)
+w.clean()
+
+w = World("DISPLAY=HDMI-A-1\n")
+argv = w.started()
+check("a layout that held still is not announced as having changed",
+      (index_of(argv), "renumbered" in w.output), ("2", False))
 w.clean()
 
 print()

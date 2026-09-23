@@ -356,17 +356,40 @@ and indices from one and the mode from the other. Connector names are
 normalized so Plasma's `HDMI-A-1` and GNOME's `HDMI-1` stay the same saved
 display.
 
-An index is only meaningful for one arrangement of screens, though, and turning
-the television on changes the arrangement while you are reaching for the Steam
-button. Ask a moment too early and the index worked out here is read against a
-list that has since grown a screen, which puts console mode on the wrong
-monitor; the same wake brings the screen's HDMI audio port up a little after the
-screen, so the saved audio device matches nothing and sound stays wherever the
-desktop had it. Both are the same fault and both look like the saved settings
-were ignored. So the display is resolved twice and started only once two
-readings agree, and the audio route is retried for a few seconds rather than
-giving up on the first miss. Neither costs anything noticeable when the screens
-were already on.
+The index is the only lever there is, and it is a sharp one. `--prefer-output`
+is read by gamescope's DRM backend alone; nested, the connector name is passed
+and ignored, and the index goes straight to SDL as the display to put the window
+on. SDL, handed an index that is not there, does not fail — it resolves it to
+display ID 0 and uses the primary screen, which is the monitor you game on. So
+every way of getting the index wrong has exactly one symptom: console mode opens
+on the wrong screen, with nothing anywhere saying so.
+
+An index is only meaningful for one arrangement of screens, and turning the
+television on changes the arrangement while you are reaching for the Steam
+button. Two things follow from that, and both used to happen:
+
+- **A layout read mid-change.** A screen that has just woken is placed at 0,0,
+  on top of whatever is really there, until the arrangement is applied. Matching
+  the two SDL views by position while that is true attributes one screen's mode
+  to another — how a projector came to be asked for 240Hz. Readings taken during
+  it also agree with each other perfectly while describing a layout about to
+  change, so agreement alone is not enough: a reading with two screens at one
+  position is refused, and console mode waits for the arrangement to hold.
+- **An index that goes stale before it is used.** SDL resolves it when it
+  creates the window, not when we choose it, and closing Steam happens in
+  between — seconds, sometimes tens of them, in which a screen can sleep or
+  wake and renumber the list. So the display is resolved again immediately
+  before gamescope starts, and the session says which index it used:
+  `Console mode on HDMI-A-1 (display 2) at 1920x1080@60Hz`. A screen named in
+  that line with the session on a different monitor is this fault; the number is
+  what tells them apart.
+
+The same wake brings the screen's HDMI audio port up a little after the screen,
+so the saved audio device matches nothing and sound stays wherever the desktop
+had it — the same fault wearing different clothes, and it looks just as much
+like the saved settings being ignored. The audio route is retried for a few
+seconds rather than given up on at the first miss. None of this costs anything
+noticeable when the screens were already on.
 
 **Session environment.** The Steam-button watcher and per-game audio run as
 systemd user services. GNOME usually exports `DISPLAY` and `XAUTHORITY` into
@@ -477,6 +500,25 @@ it returns on every restart. libextest implements those calls against
 **It opened on the wrong screen.** Search for **Cachy Console**, save the
 display you want, then if gamescope is already running exit and Steam-button
 twice so the next session uses it.
+
+If the saved display is already right, check what the session thought it was
+doing — the first line names both the screen and the index it used:
+
+```bash
+head -1 /run/user/$(id -u)/cachy-console-session.log
+```
+
+A screen there that is not where the session opened means the index was read
+against a different arrangement of monitors than the one SDL saw a moment later,
+and SDL puts a window with an index it cannot place on the primary screen without
+complaining. That is resolved as late as it can be now, and a layout still
+settling is waited out rather than trusted, so it should not recur — but the
+window is never quite zero, and that line is how to tell.
+
+Two other things that look identical from the couch: the display being turned off
+*during* a session, after which the desktop moves the window to a screen that is
+still there and gamescope neither notices nor minds; and Big Picture opening on
+the desktop rather than in console mode at all, which is the next entry.
 
 **It opened on the wrong screen and "Exit Console Mode" does nothing.** Those two
 together mean it is not console mode at all: it is Big Picture on the desktop,

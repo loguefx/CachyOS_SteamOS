@@ -155,7 +155,17 @@ def displays():
                 "SDL found no displays under either the x11 or wayland backend")
         return wayland
 
-    by_position = {(d["x"], d["y"]): d for d in enumerate_sdl("wayland")}
+    # Position is the only thing the two lists share, so a position claimed by
+    # more than one display identifies nothing and has to be dropped. This is not
+    # hypothetical: a screen that has just woken is placed at 0,0 until the
+    # arrangement is applied, and while it sits there it has the same position as
+    # whatever is really there. Merging on that key gave a projector the gaming
+    # monitor's 240Hz mode -- the number console mode then asked gamescope for.
+    claims = {}
+    for candidate in enumerate_sdl("wayland"):
+        key = (candidate["x"], candidate["y"])
+        claims[key] = None if key in claims else candidate
+    by_position = {key: found for key, found in claims.items() if found}
     for display in x11:
         display.setdefault("model", "")
         truth = by_position.get((display["x"], display["y"]))
@@ -169,6 +179,23 @@ def displays():
         if truth["w"] == display["w"] and truth["h"] == display["h"]:
             display["refresh"] = truth["refresh"]
     return x11
+
+
+def stacked_displays(entries):
+    """The displays sharing a position with another one.
+
+    An index only means a screen while the arrangement holds, and gamescope's
+    nested backend can be pointed at a screen no other way: --prefer-output is
+    read by the DRM backend alone, and SDL, handed an index that no longer
+    exists, quietly puts the window on the first display instead. So a layout
+    caught mid-change is not something to resolve an index against -- it is
+    something to wait out. Two screens at one position is what that looks like.
+    """
+    counts = {}
+    for entry in entries:
+        key = (entry["x"], entry["y"])
+        counts[key] = counts.get(key, 0) + 1
+    return [e for e in entries if counts[(e["x"], e["y"])] > 1]
 
 
 def connector_of(display):
@@ -330,6 +357,16 @@ def cmd_list(args):
 def cmd_resolve(args):
     display = pick(args.name, allow_index=bool(args.name and str(args.name).isdigit()))
     config = read_config()
+
+    # --strict is for the moment before a session starts, where being told to wait
+    # is more useful than being given an index that means nothing.
+    if getattr(args, "strict", False):
+        stacked = stacked_displays(displays())
+        if stacked:
+            names = ", ".join(connector_of(entry) for entry in stacked)
+            raise DisplayError(
+                f"displays are still arranging themselves ({names} report the "
+                "same position)")
 
     width = display["w"]
     height = display["h"]
@@ -1206,6 +1243,8 @@ def main():
     p = sub.add_parser("resolve", help="the display to run console mode on")
     p.add_argument("name", nargs="?")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--strict", action="store_true",
+                   help="fail while the arrangement of screens is still changing")
     p.set_defaults(func=cmd_resolve)
 
     p = sub.add_parser("has", help="exit 0 if the display is connected")

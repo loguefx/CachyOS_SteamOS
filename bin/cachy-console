@@ -134,16 +134,37 @@ resolve_display() {
     # on the wrong one. A screen waking up also brings its HDMI audio port up
     # separately, which is the other half of the same symptom.
     #
-    # Two readings that agree mean the arrangement has settled. This costs a
-    # fraction of a second in the ordinary case, where the first two already do.
-    local settle previous="$line"
-    for settle in 1 2 3 4 5 6 7 8; do
+    # Two readings that agree mean the arrangement has settled -- but only if each
+    # was of an arrangement worth reading. A screen still waking up sits at 0,0 on
+    # top of whatever is there, and two readings taken during that agree with each
+    # other perfectly while describing a layout that is about to change. --strict
+    # refuses those, so waiting them out is the same loop as waiting for the answer
+    # to stop moving.
+    local settle reading previous="$line" said=0 settled=0
+    for settle in 1 2 3 4 5 6 7 8 9 10 11 12; do
         sleep 0.4
-        line="$("$HELPER_DISPLAY" resolve "$wanted" 2>&1)" || break
-        [[ "$line" == "$previous" ]] && break
-        say "Waiting for the displays to settle…"
-        previous="$line"
+        if ! reading="$("$HELPER_DISPLAY" resolve --strict "$wanted" 2>/dev/null)"; then
+            if (( ! said )); then say "Waiting for the displays to settle…"; said=1; fi
+            continue
+        fi
+        if [[ "$reading" == "$previous" ]]; then
+            line="$reading"
+            settled=1
+            break
+        fi
+        if (( ! said )); then say "Waiting for the displays to settle…"; said=1; fi
+        previous="$reading"
     done
+    # Screens genuinely mirrored onto one another stay stacked for good, and that is
+    # a setup rather than a transition. Take the ordinary reading instead of
+    # refusing to start, and say why the index may not mean what it should.
+    if (( ! settled )); then
+        line="$("$HELPER_DISPLAY" resolve "$wanted" 2>&1)" || {
+            RESOLVE_ERROR="${line#"$NAME"-display: }"
+            return 1
+        }
+        warn "the screens never settled; console mode may open on the wrong one"
+    fi
     read -r DISPLAY_INDEX WIDTH HEIGHT REFRESH CONNECTOR <<<"$line"
     if [[ -z "${DISPLAY_INDEX:-}" ]]; then
         RESOLVE_ERROR="could not work out which display to use"
@@ -502,7 +523,11 @@ It will not choose a screen for you."
         return 0
     fi
 
-    say "Console mode on $CONNECTOR at ${WIDTH}x${HEIGHT}@${REFRESH}Hz."
+    # The index is in here because it is the only part gamescope acts on, and the
+    # only part that can be wrong without anything looking wrong: a session that
+    # came up on the gaming monitor with this line naming the projector is the
+    # whole bug, and the number is what tells the two apart afterwards.
+    say "Console mode on $CONNECTOR (display $DISPLAY_INDEX) at ${WIDTH}x${HEIGHT}@${REFRESH}Hz."
     warn_extest
     # Before the wait below, not after it. This is the window sitting on the wrong
     # monitor, and clearing it is independent of anything to do with Steam's
@@ -584,6 +609,22 @@ It will not choose a screen for you."
     export DISABLE_LAYER_MESA_ANTI_LAG=1
 
     export SDL_VIDEODRIVER=x11
+
+    # Ask which screen it is one last time, as late as possible. The first answer
+    # was worked out before Steam was told to quit, and quitting Steam is the slow
+    # part of starting -- seconds during which a screen can sleep, wake, or be
+    # rearranged, and every one of those renumbers the list. SDL reads the index
+    # when it creates the window, not when we chose it, and a stale index is not an
+    # error anywhere: gamescope passes it to SDL_WINDOWPOS_UNDEFINED_DISPLAY and
+    # checks nothing, and sdl2-compat turns an index past the end of the list into
+    # display ID 0 -- the primary screen, which is the monitor being played on.
+    local before="$DISPLAY_INDEX"
+    resolve_display || die "$RESOLVE_ERROR"
+    if [[ "$DISPLAY_INDEX" != "$before" ]]; then
+        say "The screens were renumbered while Steam closed: $CONNECTOR is display $DISPLAY_INDEX now."
+        gamescope_argv argv
+    fi
+
     # Not exec: the EXIT trap has to run so the desktop HDMI device comes back.
     # gamescope often forks to gamescope-wl and the parent exits immediately.
     # Wait until that compositor is *up*, then until it is gone — otherwise we
