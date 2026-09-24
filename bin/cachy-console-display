@@ -139,11 +139,52 @@ def enumerate_sdl(driver):
             os.environ["SDL_VIDEODRIVER"] = previous
 
 
+def paired(x11, wayland):
+    """The two backend views lined up, each screen against itself.
+
+    Position is not a key the two views share. XWayland lays every screen out in
+    logical pixels multiplied by the largest scale any screen uses, so one screen
+    at 1.25 renames every position on the desktop: a 5120x1440 monitor at +1920
+    is reported as 6400x1800 at +2400, and XWayland calls its 240Hz 12Hz while it
+    is at it. Matching positions for equality there merges nothing, which is how a
+    projector came to be listed with a mode and a name belonging to no screen.
+
+    What that multiplication cannot do is reorder the screens, so rank by position
+    is a key where equality is not. It is only trusted when the two views agree on
+    the count, on which screens sit against an axis, on a single multiplier
+    between their positions, and on the mode fitting inside the box x11 draws
+    around it. Any of those failing means one view is stale, and a stale mode is
+    one console mode would hand to gamescope.
+    """
+    if len(x11) != len(wayland):
+        return []
+    if stacked_displays(x11) or stacked_displays(wayland):
+        return []
+    pairs = list(zip(sorted(x11, key=lambda e: (e["y"], e["x"])),
+                     sorted(wayland, key=lambda e: (e["y"], e["x"]))))
+    multipliers = set()
+    for mine, theirs in pairs:
+        for axis in ("x", "y"):
+            if bool(mine[axis]) != bool(theirs[axis]):
+                return []
+            if theirs[axis]:
+                multipliers.add(round(mine[axis] / theirs[axis], 3))
+        # x11 scales a screen's logical size back up by the largest scale in use,
+        # so its box is never smaller than the mode. Smaller means these are not
+        # the same screen.
+        if mine["w"] < theirs["w"] or mine["h"] < theirs["h"]:
+            return []
+    if len(multipliers) > 1:
+        return []
+    return pairs
+
+
 def displays():
     """Every display, merging what each SDL backend knows best.
 
     x11 is the authority on names and indices because that is the backend
-    gamescope runs; wayland is the authority on the mode.
+    gamescope runs; wayland is the authority on everything about the screen
+    itself, because XWayland's numbers are scaled and its refresh rates wrong.
     """
     x11 = enumerate_sdl("x11")
     if not x11:
@@ -155,29 +196,23 @@ def displays():
                 "SDL found no displays under either the x11 or wayland backend")
         return wayland
 
-    # Position is the only thing the two lists share, so a position claimed by
-    # more than one display identifies nothing and has to be dropped. This is not
-    # hypothetical: a screen that has just woken is placed at 0,0 until the
-    # arrangement is applied, and while it sits there it has the same position as
-    # whatever is really there. Merging on that key gave a projector the gaming
-    # monitor's 240Hz mode -- the number console mode then asked gamescope for.
-    claims = {}
-    for candidate in enumerate_sdl("wayland"):
-        key = (candidate["x"], candidate["y"])
-        claims[key] = None if key in claims else candidate
-    by_position = {key: found for key, found in claims.items() if found}
+    wayland = enumerate_sdl("wayland")
+    pairs = paired(x11, wayland)
     for display in x11:
         display.setdefault("model", "")
-        truth = by_position.get((display["x"], display["y"]))
-        if not truth:
-            continue
+        # Disputed: wayland described the screens and the two views could not be
+        # lined up, so what is left here is XWayland's own account of the mode --
+        # scaled, and 12Hz for a screen running at 240. Nothing is in dispute when
+        # wayland had nothing to say, as in a session that is not wayland at all.
+        display["disputed"] = bool(wayland) and not pairs
+    for mine, theirs in pairs:
         # The manufacturer string is far friendlier than a connector for
         # choosing a display, so keep it for matching and for display.
-        display["model"] = truth["name"]
-        # Only the refresh rate is taken from wayland: a mismatched resolution
-        # would mean the two views disagree about more than we can safely merge.
-        if truth["w"] == display["w"] and truth["h"] == display["h"]:
-            display["refresh"] = truth["refresh"]
+        mine["model"] = theirs["name"]
+        mine["x"], mine["y"] = theirs["x"], theirs["y"]
+        mine["w"], mine["h"] = theirs["w"], theirs["h"]
+        mine["refresh"] = theirs["refresh"]
+        mine["disputed"] = False
     return x11
 
 
@@ -361,12 +396,17 @@ def cmd_resolve(args):
     # --strict is for the moment before a session starts, where being told to wait
     # is more useful than being given an index that means nothing.
     if getattr(args, "strict", False):
-        stacked = stacked_displays(displays())
+        current = displays()
+        stacked = stacked_displays(current)
         if stacked:
             names = ", ".join(connector_of(entry) for entry in stacked)
             raise DisplayError(
                 f"displays are still arranging themselves ({names} report the "
                 "same position)")
+        if any(entry.get("disputed") for entry in current):
+            raise DisplayError(
+                "the two views of the screens do not line up, so the mode of "
+                "each one is still unknown")
 
     width = display["w"]
     height = display["h"]

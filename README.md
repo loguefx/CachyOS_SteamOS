@@ -351,10 +351,22 @@ on GNOME and Plasma. SDL is asked twice, because neither backend tells the
 whole truth: its **x11** backend names displays by connector and numbers them
 the way gamescope expects, but under XWayland it can report 60Hz for a 240Hz
 screen, while its **wayland** backend reports the true mode but names displays
-by manufacturer. The two views are matched up by screen position, taking names
-and indices from one and the mode from the other. Connector names are
-normalized so Plasma's `HDMI-A-1` and GNOME's `HDMI-1` stay the same saved
-display.
+by manufacturer. Names and indices come from the first, everything about the
+screen itself from the second. Connector names are normalized so Plasma's
+`HDMI-A-1` and GNOME's `HDMI-1` stay the same saved display.
+
+Lining the two views up is not as simple as matching positions, because
+**XWayland multiplies the whole desktop by the largest scale any screen uses**.
+One screen set to 125% therefore renames every position on the desktop: a
+5120x1440 monitor at +1920 is reported as 6400x1800 at +2400, and its 240Hz
+comes out as 12Hz. Matching positions for equality merges only whichever screen
+sits at the origin, and the rest are left described by numbers belonging to no
+screen at all. What the multiplication cannot do is reorder the screens, so they
+are paired by rank in position order instead — and only when the two views agree
+on how many screens there are, on which of them sit against an axis, on a single
+multiplier between their positions, and on each mode fitting inside the box x11
+draws around it. If they do not line up, `resolve --strict` refuses rather than
+answer with a mode it cannot vouch for.
 
 The index is the only lever there is, and it is a sharp one. `--prefer-output`
 is read by gamescope's DRM backend alone; nested, the connector name is passed
@@ -369,9 +381,10 @@ television on changes the arrangement while you are reaching for the Steam
 button. Two things follow from that, and both used to happen:
 
 - **A layout read mid-change.** A screen that has just woken is placed at 0,0,
-  on top of whatever is really there, until the arrangement is applied. Matching
-  the two SDL views by position while that is true attributes one screen's mode
-  to another — how a projector came to be asked for 240Hz. Readings taken during
+  on top of whatever is really there, until the arrangement is applied. Pairing
+  the two SDL views while that is true attributes one screen's mode to another —
+  how a projector came to be asked for 240Hz — so a view with two screens at one
+  position is not paired against at all. Readings taken during
   it also agree with each other perfectly while describing a layout about to
   change, so agreement alone is not enough: a reading with two screens at one
   position is refused, and console mode waits for the arrangement to hold.

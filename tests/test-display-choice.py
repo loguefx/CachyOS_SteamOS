@@ -72,6 +72,38 @@ check("the manufacturer comes from wayland",
 check("and so does the refresh rate, per screen",
       [d["refresh"] for d in found], [240, 60])
 
+print("\na screen with a scale of its own, which renames every position")
+# Measured with three screens attached, the projector at scale 1.25. XWayland
+# multiplies the whole desktop by the largest scale in use, so it agrees with
+# wayland about nothing: the 5120x1440 monitor at +1920 is 6400x1800 at +2400,
+# and its 240Hz is reported as 12Hz. Only the screen at the origin has a position
+# that survives, so matching positions for equality merged one screen in three.
+SCALED_X11 = [
+    screen(0, 'DP-1 49"', 2400, w=6400, h=1800, refresh=12),
+    screen(1, 'DP-2 25"', 0, w=2400, h=1350, refresh=240),
+    screen(2, 'HDMI-A-1 36"', 8800, refresh=240),
+]
+SCALED_WL = [
+    screen(0, "Samsung Electric Company Odyssey G93SC", 1920,
+           w=5120, h=1440, refresh=240),
+    screen(1, "BNQ ZOWIE XL LCD", 0, refresh=240),
+    screen(2, "Optoma Corporation Optoma UHD", 7040, refresh=240),
+]
+backends(SCALED_X11, SCALED_WL)
+found = cd.displays()
+check("every screen is merged, not just the one at the origin",
+      [d["model"] for d in found],
+      ["Samsung Electric Company Odyssey G93SC", "BNQ ZOWIE XL LCD",
+       "Optoma Corporation Optoma UHD"])
+check("the mode is the real one, not XWayland's scaled box",
+      [f"{d['w']}x{d['h']}@{d['refresh']}" for d in found],
+      ["5120x1440@240", "1920x1080@240", "1920x1080@240"])
+check("and the index gamescope needs is still x11's",
+      [(d["index"], cd.connector_of(d)) for d in found],
+      [(0, "DP-1"), (1, "DP-2"), (2, "HDMI-A-1")])
+check("nothing is in dispute", [d["disputed"] for d in found],
+      [False, False, False])
+
 print("\na screen that has just woken, still sitting at 0,0")
 # The projector has appeared to x11 at its real place, while wayland still has
 # it stacked on the monitor. Keying the merge on position alone hands the
@@ -139,6 +171,37 @@ check("and says which screens are stacked, so the wait is explicable",
 kind, answer = resolve("HDMI-A-1", False)
 check("without --strict the same layout still answers, for callers that must",
       (kind, json.loads(answer)["index"]), ("resolved", 1))
+
+backends([MONITOR, PROJECTOR],
+         [MONITOR_WL, screen(1, "Optoma UHD", 0, w=3840, h=2160)])
+kind, answer = resolve("HDMI-A-1", True)
+check("a layout only wayland sees moving is refused too",
+      (kind, "do not line up" in answer), ("refused", True))
+
+backends(SCALED_X11, SCALED_WL)
+kind, answer = resolve("HDMI-A-1", True)
+check("a scaled desktop resolves to the projector's own index and mode",
+      json.loads(answer[1] if kind == "refused" else answer),
+      {"index": 2, "width": 1920, "height": 1080, "refresh": 240,
+       "connector": "HDMI-A-1", "name": 'HDMI-A-1 36"'})
+kind, answer = resolve("DP-1", True)
+check("and asking for the scaled monitor gives 240Hz, not XWayland's 12",
+      (json.loads(answer)["refresh"], json.loads(answer)["width"]), (240, 5120))
+
+backends(SCALED_X11, SCALED_WL[:2])
+kind, answer = resolve("HDMI-A-1", True)
+check("a wayland view short of a screen is not something to line up against",
+      (kind, "do not line up" in answer), ("refused", True))
+
+backends([screen(0, "HDMI-A-1", 0)], [screen(0, "TV", 0, w=3840, h=2160)])
+kind, answer = resolve("HDMI-A-1", True)
+check("nor is a mode too big for the box x11 draws around it",
+      (kind, "do not line up" in answer), ("refused", True))
+
+backends(SCALED_X11, [])
+kind, answer = resolve("HDMI-A-1", True)
+check("but with no wayland view at all there is nothing in dispute",
+      (kind, json.loads(answer)["index"]), ("resolved", 2))
 
 print()
 if FAILURES:
