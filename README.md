@@ -297,8 +297,31 @@ keyboard is the easy half: Steam types through XTEST against gamescope's own X
 server, and that arrives whatever else is set — measured here, Ctrl+K opened
 Discord's quick switcher and Escape closed it again.
 
-The trackpad needs both `TRACKPAD_FIX` and `GRAB_CURSOR` on, which is why they
-are, and each is silent when it is wrong:
+The trackpad needs three things, and each is silent when it is missing. The
+first is a layout that makes it a mouse at all. Steam applies a controller
+layout per app to whatever has focus, and Discord is a non-Steam shortcut with
+none chosen, so it gets Steam's last-resort *Gamepad FPS* template: the right
+trackpad drives the right stick of a virtual gamepad and the left one a d-pad.
+Discord ignores gamepads, so the cursor that moved over Big Picture a moment
+earlier stops dead the moment Discord has focus. Console mode fills in Steam's
+*Web Browser* template for the shortcuts named in `MOUSE_LAYOUT_APPS` (Discord by
+default) on the Steam Controller:
+
+| Control | In Discord |
+| --- | --- |
+| Right trackpad | moves the cursor; pressing it clicks |
+| Right trigger / left trigger | left click / right click |
+| Left trackpad | scrolls |
+| A / B / X | Enter / back / Steam keyboard |
+
+It only fills a layout in where you have not picked one, so a layout chosen in
+Steam's controller settings wins. It is written in the gap between the desktop
+client exiting and the session's starting, because Steam writes these files back
+from memory when it exits. They name a non-Steam shortcut by its lowercased name
+(`discord`), not its appid; an appid entry is ignored and the fallback template
+applies anyway.
+
+The other two are `TRACKPAD_FIX` and `GRAB_CURSOR`, which is why they are on:
 
 - **`TRACKPAD_FIX=on`** because XTEST *motion*, unlike XTEST keys, moves nothing
   any client can see. Walked across Discord's window, the pointer the X server
@@ -342,6 +365,7 @@ edit by hand:
 | `VRR` | `on` | FreeSync / G-Sync inside console mode |
 | `HDR` | `off` | Only worth enabling if display and games support it |
 | `TRACKPAD_FIX` | `on` | Preload libextest, so Steam's trackpad emulation becomes a real device instead of XTEST calls no client reacts to. Off means the Steam keyboard still types and the trackpad does nothing |
+| `MOUSE_LAYOUT_APPS` | `Discord` | Non-Steam shortcuts, by name or appid, that get a trackpad mouse layout on the Steam Controller unless you picked one. Empty turns it off |
 | `GRAB_CURSOR` | `on` | Hold gamescope in relative mouse mode, which is what makes a nested gamescope draw its own cursor and keeps the pointer in the session. Off hands the cursor back to the desktop, which draws one only while the desktop's pointer is over the session's window |
 | `STEAM_BUTTON` | `on` | Let the Steam button open console mode |
 | `RESTART_STEAM` | `on` | Start the desktop Steam client again when console mode ends, minimised to the tray, so the Steam button has a client to open Big Picture in next time |
@@ -648,6 +672,15 @@ cachy-console controllers   # the one on js0 is player one
 
 Put that device's USB id in `IGNORE_CONTROLLERS`, then exit and Steam-button
 twice. It stays a gamepad on the desktop.
+
+**The cursor works in Big Picture but stops in Discord.** That is Discord's
+controller layout, not the cursor: with none chosen it is a gamepad layout.
+The startup output should say `Discord (…): trackpad mouse layout in …` the first
+time; if it does not, the shortcut is not named Discord (add its name to
+`MOUSE_LAYOUT_APPS`), or you chose a layout for it yourself, which is kept. Steam
+logs the one it used in `~/.local/share/Steam/logs/controller_ui.txt`:
+`Local Selection Path ... controller_neptune_webbrowser.vdf` is the mouse layout,
+`Last Resort Path ... gamepad_fps` the gamepad one.
 
 **No cursor at all from the trackpad.** Check the controller first, because a
 Steam Controller switches itself off after a few minutes and nothing on screen

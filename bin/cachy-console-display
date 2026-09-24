@@ -1174,6 +1174,201 @@ def cmd_controllers(args):
     return 0
 
 
+# Right trackpad moves the pointer and clicks when pressed, right trigger is a
+# left click, left trigger a right click, left trackpad scrolls.
+MOUSE_TEMPLATE = "controller_neptune_webbrowser.vdf"
+
+
+def steam_root():
+    for path in ("~/.local/share/Steam", "~/.steam/steam"):
+        path = os.path.expanduser(path)
+        if os.path.isdir(os.path.join(path, "userdata")):
+            return path
+    return None
+
+
+def read_binary_vdf(data):
+    """Steam's binary KeyValues, as in shortcuts.vdf, into nested dicts."""
+    pos = 0
+
+    def cstring():
+        nonlocal pos
+        end = data.index(b"\0", pos)
+        text = data[pos:end].decode("utf-8", "replace")
+        pos = end + 1
+        return text
+
+    def node():
+        nonlocal pos
+        out = {}
+        while pos < len(data):
+            kind = data[pos]
+            pos += 1
+            if kind == 0x08:
+                return out
+            key = cstring()
+            if kind == 0x00:
+                out[key] = node()
+            elif kind == 0x01:
+                out[key] = cstring()
+            elif kind == 0x02:
+                out[key] = int.from_bytes(data[pos:pos + 4], "little")
+                pos += 4
+            elif kind == 0x07:
+                out[key] = int.from_bytes(data[pos:pos + 8], "little")
+                pos += 8
+            else:
+                raise ValueError(f"unknown binary vdf type {kind:#x}")
+        return out
+
+    return node()
+
+
+def steam_shortcuts(path):
+    """[(appid, name)] for the non-Steam games in a shortcuts.vdf."""
+    try:
+        with open(path, "rb") as fh:
+            tree = read_binary_vdf(fh.read())
+    except (OSError, ValueError, IndexError):
+        return []
+    found = []
+    for entry in (tree.get("shortcuts") or {}).values():
+        if not isinstance(entry, dict):
+            continue
+        fields = {k.lower(): v for k, v in entry.items()}
+        if isinstance(fields.get("appid"), int) and fields.get("appname"):
+            found.append((fields["appid"], fields["appname"]))
+    return found
+
+
+def read_text_vdf(text):
+    """Steam's text KeyValues into nested dicts, keeping the order of keys."""
+    tokens = re.findall(r'"((?:[^"\\]|\\.)*)"|([{}])', text)
+    pos = 0
+
+    def node():
+        nonlocal pos
+        out = {}
+        while pos < len(tokens):
+            key, brace = tokens[pos]
+            pos += 1
+            if brace == "}":
+                return out
+            if pos >= len(tokens):
+                break
+            value, brace = tokens[pos]
+            pos += 1
+            out[key] = node() if brace == "{" else value
+        return out
+
+    return node()
+
+
+def write_text_vdf(tree, depth=0):
+    pad = "\t" * depth
+    lines = []
+    for key, value in tree.items():
+        if isinstance(value, dict):
+            lines += [f'{pad}"{key}"', pad + "{",
+                      write_text_vdf(value, depth + 1) + pad + "}"]
+        else:
+            lines.append(f'{pad}"{key}"\t\t"{value}"')
+    return "".join(line + "\n" for line in lines)
+
+
+def mouse_apps():
+    """Names and appids from MOUSE_LAYOUT_APPS, Discord unless set otherwise."""
+    raw = read_config().get("MOUSE_LAYOUT_APPS")
+    if raw is None:
+        raw = "Discord"
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def steam_controller_configsets(config_dir):
+    """configset files that decide layouts for the Steam Controller.
+
+    Steam names every pad "Steam Controller" in these files, DualSense included,
+    so the name says nothing. Only the Steam Controller's own preferences carry
+    its trackpad and gyro calibration under Valve's name for it, triton. The
+    per-type file covers one Steam has not seen yet.
+    """
+    found = []
+    for prefs in sorted(glob.glob(os.path.join(config_dir, "preferences_*.vdf"))):
+        try:
+            with open(prefs, errors="replace") as fh:
+                if "triton" not in fh.read():
+                    continue
+        except OSError:
+            continue
+        serial = os.path.basename(prefs)[len("preferences_"):]
+        found.append(os.path.join(config_dir, "configset_" + serial))
+    found.append(os.path.join(config_dir, "configset_controller_triton.vdf"))
+    return found
+
+
+def shortcut_layout_key(name):
+    """How configset files name a non-Steam shortcut: not by its appid, which
+    Steam ignores there, but lowercased with punctuation dropped, as in its own
+    "ea app" and "zshadercachekillersh" (from zShaderCacheKiller.sh)."""
+    return re.sub(r"[^a-z0-9 ]", "", name.lower())
+
+
+def set_mouse_layouts(root, wanted, dry_run=False):
+    """Give each wanted shortcut a mouse layout where none was chosen.
+
+    Returns a line per change or refusal. Steam keeps these files in memory and
+    writes them back when it exits, so this only sticks while Steam is closed.
+    """
+    report = []
+    configs = os.path.join(root, "steamapps", "common", "Steam Controller Configs")
+    for account in sorted(glob.glob(os.path.join(root, "userdata", "*"))):
+        config_dir = os.path.join(configs, os.path.basename(account), "config")
+        if not os.path.isdir(config_dir):
+            continue
+        shortcuts = steam_shortcuts(os.path.join(account, "config", "shortcuts.vdf"))
+        apps = []
+        for item in wanted:
+            for appid, name in shortcuts:
+                if item.lower() == name.lower() or item == str(appid):
+                    apps.append((appid, name))
+        if not apps:
+            continue
+        for path in steam_controller_configsets(config_dir):
+            try:
+                with open(path, errors="replace") as fh:
+                    tree = read_text_vdf(fh.read())
+            except FileNotFoundError:
+                tree = {}
+            except OSError as exc:
+                report.append(f"cannot read {path}: {exc}")
+                continue
+            layouts = tree.setdefault("controller_config", {})
+            changed = False
+            for appid, name in apps:
+                key = shortcut_layout_key(name)
+                if not key or key in layouts:
+                    continue
+                layouts[key] = {"template": MOUSE_TEMPLATE}
+                changed = True
+                report.append(f"{name} ({appid}): trackpad mouse layout in "
+                              f"{os.path.basename(path)}")
+            if changed and not dry_run:
+                tmp = path + ".tmp"
+                with open(tmp, "w") as fh:
+                    fh.write(write_text_vdf(tree))
+                os.replace(tmp, path)
+    return report
+
+
+def cmd_pad_layouts(args):
+    root = steam_root()
+    if not root:
+        return 0
+    for line in set_mouse_layouts(root, mouse_apps(), args.dry_run):
+        print(("would set " if args.dry_run else "") + line)
+    return 0
+
+
 def _remember_restore_state(target):
     previous_sink = _default_sink()
     previous_profile = target.get("card_profile")
@@ -1333,6 +1528,12 @@ def main():
     sub.add_parser("controllers",
                    help="gamepads and which ones console mode hides") \
         .set_defaults(func=cmd_controllers)
+
+    p = sub.add_parser("pad-layouts",
+                       help="give MOUSE_LAYOUT_APPS a trackpad mouse layout "
+                            "(only while Steam is closed)")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_pad_layouts)
 
     p = sub.add_parser("audio-route",
                        help="switch audio to the saved output")

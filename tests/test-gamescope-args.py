@@ -75,6 +75,14 @@ case "$1" in
     fi
     answer ;;
   audio-route)   echo "SINK alsa_output.fake" ;;
+  pad-layouts)
+    if [[ -n "$state" ]]; then
+        if [[ -f "$state/desktop-steam" ]]; then
+            echo "pad-layouts with steam running" >> "$state/sequence"
+        else
+            echo "pad-layouts" >> "$state/sequence"
+        fi
+    fi ;;
   audio-input-resolve) echo "alsa_input.fake" ;;
   audio-resolve) echo "alsa_output.fake" ;;
   has)           exit 0 ;;
@@ -330,6 +338,11 @@ check("gamescope is started before the desktop client is asked to quit",
 check("and Big Picture only once the desktop client has gone",
       (at("steam -gamepadui") is not None
        and at("steam -shutdown") < at("steam -gamepadui")), True)
+check("the trackpad mouse layouts are written between the two clients, the "
+      "only time Steam will not write over them",
+      (at("pad-layouts") is not None
+       and at("steam -shutdown") < at("pad-layouts") < at("steam -gamepadui")),
+      True)
 got = w.read("steam-env")
 check("Steam in the session still plays and listens where the settings say",
       [e for e in got if e.startswith("PULSE_")],

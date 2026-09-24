@@ -566,6 +566,9 @@ steam_in_session() {
         sleep 0.1
     done
 
+    # Steam writes its controller layouts back when it exits, so they are only
+    # ours to change in this gap between the two clients.
+    "$HELPER_DISPLAY" pad-layouts || warn "could not set the trackpad mouse layouts"
     route_audio
     if [[ -n "${CACHY_CONSOLE_PRELOAD:-}" ]]; then
         exec env -u CACHY_CONSOLE_PRELOAD \
@@ -785,6 +788,13 @@ AUDIO_FOCUS=on
 # like Discord whose audio process is not reliably named after the app.
 # Read by cachy-console-audio.service; restart it after changing this.
 AUDIO_NEVER_MUTE=Discord
+
+# Give these non-Steam shortcuts a mouse layout on the Steam Controller: right
+# trackpad moves the pointer and clicks when pressed, right trigger clicks, left
+# trigger right-clicks, left trackpad scrolls. Without one Steam falls back to a
+# gamepad layout, which Discord ignores, so the pointer does not move. Only fills
+# in a layout you have not picked yourself. Empty turns this off.
+MOUSE_LAYOUT_APPS=Discord
 
 # Hold the streams named above on the devices below, moving them if they end up
 # elsewhere. Discord keeps its own output and input choice, so without this it
