@@ -380,6 +380,43 @@ check("a preload with no overlay in it is untouched", left, "/usr/lib/only-mine.
 check("and reports nothing dropped", dropped, [])
 
 print()
+print("a launcher that runs a program of another name")
+check("spotify-launcher alone says nothing about spotify",
+      "spotify" in app.recognised_names("/usr/bin/spotify-launcher"), False)
+check("--process adds the name the running copy has",
+      app.recognised_names("/usr/bin/spotify-launcher", ["Spotify"]),
+      {"spotify-launcher", "spotify"})
+check("so a Spotify open on the desktop is found and quit first",
+      app.comm_matches("spotify\n",
+                       app.recognised_names("/usr/bin/spotify-launcher", ["spotify"])),
+      True)
+check("--process is accepted before the separator",
+      app.parse_args(["--process", "spotify"]).process, ["spotify"])
+
+print()
+print("quitting a player that ignores signals")
+BUS = """\
+:1.40                              1200 plasmashell  logue :1.40 user@1000.service -
+org.mpris.MediaPlayer2.spotify     4242 spotify      logue :1.88 user@1000.service -
+org.mpris.MediaPlayer2.firefox.instance_1_9 3100 firefox logue :1.70 user@1000.service -
+org.kde.StatusNotifierWatcher      1200 plasmashell  logue :1.40 user@1000.service -
+"""
+calls = []
+def fake_busctl(argv, timeout=5):
+    calls.append(argv)
+    return BUS if argv[2] == "list" else ""
+check("the player owned by our process is asked to quit",
+      app.mpris_quit({4242, 4243}, run=fake_busctl), ["org.mpris.MediaPlayer2.spotify"])
+check("with MPRIS's own Quit",
+      calls[-1][3:], ["org.mpris.MediaPlayer2.spotify", "/org/mpris/MediaPlayer2",
+                      "org.mpris.MediaPlayer2", "Quit"])
+calls.clear()
+check("someone else's player is left playing",
+      (app.mpris_quit({9999}, run=fake_busctl), len(calls)), ([], 1))
+check("no session bus is no players, not a crash",
+      app.mpris_quit({4242}, run=lambda argv, timeout=5: None), [])
+
+print()
 if FAILURES:
     print(f"{len(FAILURES)} failure(s): " + ", ".join(FAILURES))
     sys.exit(1)

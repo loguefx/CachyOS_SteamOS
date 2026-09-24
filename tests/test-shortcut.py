@@ -244,6 +244,35 @@ if art.Image is not None:
     # would give a washed-out lilac instead of the colour it is known by.
     check("the backdrop takes the icon's brand colour, not its average",
           art.dominant_color(swatch), (88, 101, 242))
+    check("a backdrop colour parses with or without #",
+          (art.parse_color("121212"), art.parse_color("#1DB954")),
+          ((18, 18, 18), (29, 185, 84)))
+    try:
+        art.parse_color("green")
+        refused = False
+    except ValueError:
+        refused = True
+    check("and anything else is refused rather than guessed", refused, True)
+    green = art.Image.new("RGBA", (64, 64), (30, 215, 96, 255))
+    tile = art.render("capsule", green, "Spotify", (18, 18, 18), (30, 215, 96))
+    corner = tile.getpixel((5, tile.height - 5))[:3]
+    check("a chosen backdrop is what the tile is made of, not the icon's colour",
+          max(corner) < 40, True)
+
+print()
+print("a launcher that runs a program of another name")
+check("the launch options tell the wrapper what the running copy is called",
+      ies.launch_options("/usr/bin/spotify-launcher", "Spotify",
+                         "/home/u/.local/bin/cachy-console-app", ["spotify"]),
+      '"/home/u/.local/bin/cachy-console-app" --process spotify -- %command%')
+check("and say nothing extra when there is nothing to say",
+      ies.launch_options("/usr/bin/discord", "Discord",
+                         "/home/u/.local/bin/cachy-console-app"),
+      '"/home/u/.local/bin/cachy-console-app" -- %command%')
+check("the appid still comes from the exe and name alone",
+      ies.build_entry("/usr/bin/spotify-launcher", "Spotify", "", "/w",
+                      ["spotify"])["appid"],
+      ies.shortcut_appid('"/usr/bin/spotify-launcher"', "Spotify"))
 
 print()
 if FAILURES:

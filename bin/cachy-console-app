@@ -321,6 +321,17 @@ def instance_names(program):
     return {name for name in names if name}
 
 
+def recognised_names(program, processes=()):
+    """instance_names plus names given with --process.
+
+    A launcher neither execs a script of its own name nor links to the program,
+    so nothing about /usr/bin/spotify-launcher says the copy to look for is
+    called spotify. Without being told, a Spotify already open on the desktop
+    is not quit, and the tile's copy hands off to it and exits.
+    """
+    return instance_names(program) | {p.lower() for p in processes if p}
+
+
 def comm_matches(comm, names):
     comm = comm.strip().lower()
     if not comm:
@@ -399,6 +410,29 @@ def stop(pids, grace, sleep=time.sleep, send=os.kill, alive=still_alive, step=0.
     return False
 
 
+MPRIS_PREFIX = "org.mpris.MediaPlayer2."
+
+
+def mpris_quit(pids, run=run):
+    """Ask media players owned by these processes to quit over D-Bus.
+
+    Spotify ignores SIGTERM, SIGINT and SIGHUP alike, so a signal only ever
+    ends it with the kill after the grace period. Its MPRIS Quit is a clean
+    exit in well under a second. Returns the bus names that were asked.
+    """
+    listing = run(["busctl", "--user", "list", "--no-legend"])
+    asked = []
+    for line in (listing or "").splitlines():
+        fields = line.split()
+        if (len(fields) < 2 or not fields[0].startswith(MPRIS_PREFIX)
+                or not fields[1].isdigit() or int(fields[1]) not in pids):
+            continue
+        if run(["busctl", "--user", "call", fields[0], "/org/mpris/MediaPlayer2",
+                "org.mpris.MediaPlayer2", "Quit"]) is not None:
+            asked.append(fields[0])
+    return asked
+
+
 # ---- deciding that the last window has gone ------------------------------
 
 
@@ -457,6 +491,10 @@ def parse_args(mine):
     ap.add_argument("--wm-class", action="append", default=[], metavar="CLASS",
                     help="also treat windows of this WM_CLASS as the "
                          "application's (default: the program's own name)")
+    ap.add_argument("--process", action="append", default=[], metavar="NAME",
+                    help="also treat processes called NAME as the application, "
+                         "for a launcher that runs a program of another name "
+                         "(spotify-launcher runs spotify)")
     ap.add_argument("--start-dir", default=None, metavar="DIR",
                     help="working directory (default: your home)")
     ap.add_argument("--close-grace", type=float, default=4.0, metavar="SECONDS",
@@ -499,7 +537,7 @@ def main():
     # application by comes from the program at the end of it.
     program = real_program(command)[0]
     name = os.path.basename(program)
-    names = instance_names(program)
+    names = recognised_names(program, args.process)
     classes = set(names) | {c.lower() for c in args.wm_class}
 
     if not args.keep_others:
@@ -509,6 +547,7 @@ def main():
             log(f"{name} is already running outside console mode (pid {listed}); "
                 f"quitting it, because a second copy would only hand its window "
                 f"to the first one and exit")
+            mpris_quit(set(others))
             if not stop(others, args.quit_grace):
                 log(f"{name} had to be killed; it may complain about an unclean "
                     f"shutdown next time")
@@ -586,7 +625,15 @@ def main():
         time.sleep(args.interval)
 
     log(f"quitting {name}: {reason}")
-    stop([proc.pid], args.quit_grace)
+    # Steam's reaper does not pass a SIGTERM on to the application, so the
+    # chain alone sits out the whole grace period before the application below
+    # it is even asked. Copies elsewhere were quit before the launch, so any
+    # found now are ours.
+    instances = running_instances(names, ignore={os.getpid()})
+    asked = mpris_quit(descendants(proc.pid) | set(instances))
+    if asked:
+        log(f"asked {', '.join(asked)} to quit")
+    stop([proc.pid] + instances, args.quit_grace)
     try:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:

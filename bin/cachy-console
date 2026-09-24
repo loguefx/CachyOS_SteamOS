@@ -783,18 +783,19 @@ AUDIO_FOCUS=on
 # Never mute these, even though Steam started them. Comma separated names or
 # appids. Voice chat belongs here: Discord launched from the library is a Steam
 # shortcut like any other, so without this it counts as a game and goes quiet
-# whenever you look at the one you are playing.
+# whenever you look at the one you are playing. Music started from the library
+# (Spotify) is the same, and would stop the moment a game had focus.
 # An appid works as well as a name, and is worth adding for an Electron app
 # like Discord whose audio process is not reliably named after the app.
 # Read by cachy-console-audio.service; restart it after changing this.
-AUDIO_NEVER_MUTE=Discord
+AUDIO_NEVER_MUTE=Discord, Spotify
 
 # Give these non-Steam shortcuts a mouse layout on the Steam Controller: right
 # trackpad moves the pointer and clicks when pressed, right trigger clicks, left
 # trigger right-clicks, left trackpad scrolls. Without one Steam falls back to a
-# gamepad layout, which Discord ignores, so the pointer does not move. Only fills
-# in a layout you have not picked yourself. Empty turns this off.
-MOUSE_LAYOUT_APPS=Discord
+# gamepad layout, which desktop apps ignore, so the pointer does not move. Only
+# fills in a layout you have not picked yourself. Empty turns this off.
+MOUSE_LAYOUT_APPS=Discord, Spotify
 
 # Hold the streams named above on the devices below, moving them if they end up
 # elsewhere. Discord keeps its own output and input choice, so without this it

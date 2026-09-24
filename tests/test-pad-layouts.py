@@ -163,7 +163,7 @@ print("\nthe setting")
 
 with tempfile.TemporaryDirectory() as tmp:
     cd.CONFIG_PATH = os.path.join(tmp, "config")
-    check("unset means Discord", cd.mouse_apps(), ["Discord"])
+    check("unset means Discord and Spotify", cd.mouse_apps(), ["Discord", "Spotify"])
     with open(cd.CONFIG_PATH, "w") as fh:
         fh.write("MOUSE_LAYOUT_APPS=\n")
     check("empty turns it off", cd.mouse_apps(), [])

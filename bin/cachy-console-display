@@ -1277,10 +1277,10 @@ def write_text_vdf(tree, depth=0):
 
 
 def mouse_apps():
-    """Names and appids from MOUSE_LAYOUT_APPS, Discord unless set otherwise."""
+    """Names and appids from MOUSE_LAYOUT_APPS, Discord and Spotify unless set."""
     raw = read_config().get("MOUSE_LAYOUT_APPS")
     if raw is None:
-        raw = "Discord"
+        raw = "Discord, Spotify"
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 

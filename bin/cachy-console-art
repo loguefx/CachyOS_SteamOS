@@ -197,12 +197,13 @@ def _shade(rgb, factor):
     return tuple(round(c * factor) for c in rgb)
 
 
-def _background(size, color):
+def _background(size, color, glow_color=None):
     """A vertical gradient with a soft glow where the icon will sit.
 
     Flat colour looks like a placeholder; a full illustration we cannot make
     from an icon. A gradient reads as deliberate at sofa distance and costs
-    nothing.
+    nothing. The glow is a lighter shade of the backdrop unless given a colour
+    of its own, which on a near-black backdrop is the only way it shows.
     """
     strip = Image.new("RGB", (1, 256))
     top, bottom = _shade(color, 1.25), _shade(color, 0.55)
@@ -217,9 +218,10 @@ def _background(size, color):
     radius = min(w, h) * 0.55
     ImageDraw.Draw(glow).ellipse(
         (w / 2 - radius, h * 0.42 - radius, w / 2 + radius, h * 0.42 + radius),
-        fill=70)
+        fill=40 if glow_color else 70)
     glow = glow.filter(ImageFilter.GaussianBlur(min(w, h) * 0.12))
-    back.paste(Image.new("RGBA", size, _shade(color, 1.6) + (255,)), (0, 0), glow)
+    tint = tuple(glow_color) if glow_color else _shade(color, 1.6)
+    back.paste(Image.new("RGBA", size, tint + (255,)), (0, 0), glow)
     return back
 
 
@@ -259,7 +261,7 @@ def _scaled(icon, box):
     return icon.resize((box, box), Image.LANCZOS)
 
 
-def render(kind, icon, name, color):
+def render(kind, icon, name, color, glow_color=None):
     """Compose one piece of artwork: icon on a branded backdrop, name beneath."""
     _, (w, h) = ART_TYPES[kind]
 
@@ -272,7 +274,7 @@ def render(kind, icon, name, color):
         _draw_label(out, name, (w // 2, 40 + box + 70), w - 60, 72)
         return out
 
-    out = _background((w, h), color)
+    out = _background((w, h), color, glow_color)
 
     if kind == "hero":
         # The logo lands on top of this, so the hero stays a backdrop: a faint
@@ -305,8 +307,20 @@ def paths_for(appid, directory=None):
              for kind in ART_TYPES} for d in dirs]
 
 
-def install(exe, name, icon=None, dry_run=False, quiet=False):
+def parse_color(text):
+    """"121212" or "#1DB954" as an (r, g, b) tuple."""
+    digits = text.strip().lstrip("#")
+    if not re.fullmatch(r"[0-9a-fA-F]{6}", digits):
+        raise ValueError(f"not a colour: {text!r} (want six hex digits, e.g. 121212)")
+    return tuple(int(digits[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def install(exe, name, icon=None, dry_run=False, quiet=False, color=None):
     """Write all four art files for this shortcut into every Steam account.
+
+    `color` replaces the backdrop taken from the icon, for a brand that puts its
+    icon on a colour other than its own: Spotify's green mark on green is mush,
+    and on its black it is the Spotify everyone recognises.
 
     Returns the icon that was used, which the caller wants for the shortcut's
     own `icon` field, or None when there was nothing to work from.
@@ -324,7 +338,12 @@ def install(exe, name, icon=None, dry_run=False, quiet=False):
         return source
 
     art = load_icon(source)
-    color = dominant_color(art)
+    glow = None
+    if color:
+        glow = dominant_color(art)
+        color = parse_color(color) if isinstance(color, str) else tuple(color)
+    else:
+        color = dominant_color(art)
     appid = grid_appid(f'"{exe}"', name)
     say(f"  artwork from {source} "
         f"(#{color[0]:02X}{color[1]:02X}{color[2]:02X}, appid {appid})")
@@ -336,7 +355,7 @@ def install(exe, name, icon=None, dry_run=False, quiet=False):
             continue
         os.makedirs(directory, exist_ok=True)
         for kind, path in group.items():
-            render(kind, art, name, color).save(path)
+            render(kind, art, name, color, glow).save(path)
         say(f"  wrote {len(group)} files to {directory}")
     return source
 
@@ -363,6 +382,8 @@ def main():
     ap.add_argument("--name", required=True, help="library entry name")
     ap.add_argument("--exe", required=True, help="program the entry runs")
     ap.add_argument("--icon", help="image to build the artwork from")
+    ap.add_argument("--color", metavar="HEX",
+                    help="backdrop colour instead of the icon's own")
     ap.add_argument("--revert", action="store_true", help="delete the artwork")
     ap.add_argument("--dry-run", action="store_true",
                     help="show what would change, write nothing")
@@ -378,7 +399,14 @@ def main():
     if args.icon and not os.path.exists(args.icon):
         print(f"no such image: {args.icon}", file=sys.stderr)
         return 1
-    return 0 if install(args.exe, args.name, args.icon, args.dry_run) else 1
+    if args.color:
+        try:
+            parse_color(args.color)
+        except ValueError as exc:
+            print(exc, file=sys.stderr)
+            return 1
+    return 0 if install(args.exe, args.name, args.icon, args.dry_run,
+                        color=args.color) else 1
 
 
 if __name__ == "__main__":

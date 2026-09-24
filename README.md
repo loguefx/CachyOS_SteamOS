@@ -196,6 +196,25 @@ than moved. So it is one Discord at a time, which follows you in and out:
 cachy-console shortcut --name Discord --exe /usr/bin/discord   # Steam closed
 ```
 
+Spotify works the same way, with two extra options:
+
+```bash
+cachy-console shortcut --name Spotify --exe /usr/bin/spotify-launcher \
+    --process spotify --color 121212                           # Steam closed
+```
+
+`--process spotify` because the tile runs `spotify-launcher`, which becomes a
+program called `spotify`. Nothing about the launcher's name says so, and without
+being told the wrapper would not recognise a Spotify already open on the desktop:
+the tile's copy would hand off to it and exit. `--color 121212` puts the tile on
+Spotify's own near-black instead of the icon's green, which on a green backdrop
+is a green circle on green. Spotify also ignores `SIGTERM`, `SIGINT` and `SIGHUP`
+alike, so a signal only ever ends it with a kill 15 seconds later; the wrapper
+asks any MPRIS media player belonging to the app to quit over D-Bus first, which
+Spotify does in about a second. `Spotify` is in `AUDIO_NEVER_MUTE` and
+`MOUSE_LAYOUT_APPS` by default, so music keeps playing while a game has focus
+and the trackpad is a mouse over it.
+
 The tile launches through `cachy-console-app`, which handles the two things a
 desktop application needs before it behaves like a library entry.
 
@@ -304,7 +323,7 @@ none chosen, so it gets Steam's last-resort *Gamepad FPS* template: the right
 trackpad drives the right stick of a virtual gamepad and the left one a d-pad.
 Discord ignores gamepads, so the cursor that moved over Big Picture a moment
 earlier stops dead the moment Discord has focus. Console mode fills in Steam's
-*Web Browser* template for the shortcuts named in `MOUSE_LAYOUT_APPS` (Discord by
+*Web Browser* template for the shortcuts named in `MOUSE_LAYOUT_APPS` (Discord and Spotify by
 default) on the Steam Controller:
 
 | Control | In Discord |
@@ -365,13 +384,13 @@ edit by hand:
 | `VRR` | `on` | FreeSync / G-Sync inside console mode |
 | `HDR` | `off` | Only worth enabling if display and games support it |
 | `TRACKPAD_FIX` | `on` | Preload libextest, so Steam's trackpad emulation becomes a real device instead of XTEST calls no client reacts to. Off means the Steam keyboard still types and the trackpad does nothing |
-| `MOUSE_LAYOUT_APPS` | `Discord` | Non-Steam shortcuts, by name or appid, that get a trackpad mouse layout on the Steam Controller unless you picked one. Empty turns it off |
+| `MOUSE_LAYOUT_APPS` | `Discord, Spotify` | Non-Steam shortcuts, by name or appid, that get a trackpad mouse layout on the Steam Controller unless you picked one. Empty turns it off |
 | `GRAB_CURSOR` | `on` | Hold gamescope in relative mouse mode, which is what makes a nested gamescope draw its own cursor and keeps the pointer in the session. Off hands the cursor back to the desktop, which draws one only while the desktop's pointer is over the session's window |
 | `STEAM_BUTTON` | `on` | Let the Steam button open console mode |
 | `RESTART_STEAM` | `on` | Start the desktop Steam client again when console mode ends, minimised to the tray, so the Steam button has a client to open Big Picture in next time |
 | `AUDIO_FOCUS` | `on` | Mute games you are not looking at |
 | `AUDIO_DEVICE` | *(follows display)* | HDMI monitor name (`Optoma UHD`) or device (`RODECaster Duo`). Kept until you change it in **Cachy Console** settings |
-| `AUDIO_NEVER_MUTE` | `Discord` | Left audible even though Steam started it. Comma-separated names or appids. Read by the audio service, so restart it after editing |
+| `AUDIO_NEVER_MUTE` | `Discord, Spotify` | Left audible even though Steam started it. Comma-separated names or appids. Read by the audio service, so restart it after editing |
 | `AUDIO_PIN_VOICE` | `on` | Hold those streams on `AUDIO_DEVICE` / `AUDIO_INPUT_DEVICE`, moving them back if the app sends them elsewhere. Only while a session is running |
 | `AUDIO_INPUT_DEVICE` | *(session default)* | Microphone for console mode, e.g. `HyperX Cloud III S Wireless`. Empty leaves input alone |
 | `IGNORE_CONTROLLERS` | empty | Devices console mode should not treat as gamepads, as `0x31e3/0x1400`, comma separated. List them with `cachy-console controllers` |
