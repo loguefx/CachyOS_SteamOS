@@ -52,10 +52,16 @@ CFG_EXTRA_GAMESCOPE_ARGS=""
 
 DRY_RUN=0
 DISPLAY_OVERRIDE=""
+# The session's gamescope while a start is under way, for the EXIT trap.
+GS_PID=""
 
 # A bare soname, so the dynamic linker picks /usr/lib32 for Steam's 32-bit
 # client and /usr/lib for its 64-bit children with no arch-mismatch noise.
 EXTEST_LIB="${CACHY_CONSOLE_EXTEST:-libextest.so}"
+
+# gamescope runs this script again as its child, to start Steam once the desktop
+# client is gone, so it needs a path that does not depend on the caller's cwd.
+SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 
 have() { command -v "$1" >/dev/null 2>&1; }
 say() { printf '%s\n' "$*"; }
@@ -225,24 +231,28 @@ leave_big_picture() {
     return 0
 }
 
-stop_steam() {
-    steam_running || return 0
-
-    # Restarting Steam takes any running game down with it, so never do that
-    # without saying so. Checked before anything else changes.
+# Restarting Steam takes any running game down with it, so never do that without
+# saying so. Checked before anything else changes.
+refuse_if_game_running() {
     if game_running && [[ -z "${CACHY_CONSOLE_FORCE:-}" ]]; then
         die "a game is running (AppID: $(running_appids)) — refusing to restart Steam.
 Quit the game first, or set CACHY_CONSOLE_FORCE=1 to override."
     fi
+}
 
+stop_steam() {
+    steam_running || return 0
+    refuse_if_game_running
     leave_big_picture
 
     say "Closing the running Steam client…"
     steam -shutdown >/dev/null 2>&1 || pkill -x steam || true
+    # Polled finely because Big Picture cannot start until this returns, and a
+    # one-second poll was up to a second of the start spent on nothing.
     local i
-    for i in $(seq 1 30); do
+    for i in $(seq 1 300); do
         steam_running || return 0
-        sleep 1
+        sleep 0.1
     done
     warn "Steam ignored the shutdown request; killing it."
     pkill -9 -x steam || true
@@ -481,17 +491,88 @@ gamescope_argv() {
           GDK_BACKEND=x11
           QT_QPA_PLATFORM=xcb)
 
-    # The preload is set on Steam here rather than exported, because gamescope
-    # carries CAP_SYS_NICE for realtime scheduling and file capabilities put a
-    # process into glibc's secure-execution mode. There LD_PRELOAD is not merely
-    # ignored -- glibc strips it from the environment so it cannot reach
-    # children -- so exporting it reached neither gamescope nor the Steam it
-    # starts, and the trackpad moved nothing at all. Handing it to env, which has
-    # no capabilities, sets it on Steam alone, which is the only process that
-    # makes XTEST calls anyway.
-    extest_wanted && out+=("LD_PRELOAD=${EXTEST_LIB}${LD_PRELOAD:+:$LD_PRELOAD}")
+    # The preload is never exported, because gamescope carries CAP_SYS_NICE for
+    # realtime scheduling and file capabilities put a process into glibc's
+    # secure-execution mode. There LD_PRELOAD is not merely ignored -- glibc
+    # strips it from the environment so it cannot reach children -- so exporting
+    # it reached neither gamescope nor the Steam it starts, and the trackpad moved
+    # nothing at all. It travels under a name of our own instead, and
+    # steam-in-session puts it on Steam alone, the only process making XTEST calls.
+    extest_wanted && out+=("CACHY_CONSOLE_PRELOAD=${EXTEST_LIB}")
 
-    out+=(steam -gamepadui)
+    # Not Steam itself: gamescope starts while the desktop client is still
+    # quitting, so the screen changes the moment the button is pressed rather
+    # than once Steam is gone, and the child waits for that before starting it.
+    out+=("$SELF" steam-in-session)
+}
+
+# Routes audio to the console display and exports what Steam should play through
+# and listen on. Run in the process that will exec Steam, so Steam inherits it.
+route_audio() {
+    local route_log sink attempt
+    # A screen that has just woken brings its HDMI audio port up a moment after
+    # the screen itself, and until it does the saved device cannot be matched: the
+    # route finds nothing, PULSE_SINK goes unset, and Steam plays through whatever
+    # the desktop happens to be using -- the complaint that console mode came up
+    # on the wrong audio device. Worth a few more tries before giving up on it.
+    for attempt in 1 2 3 4 5 6; do
+        route_log="$("$HELPER_DISPLAY" audio-route 2>&1)" \
+            || warn "could not switch HDMI audio to ${CONNECTOR:-the console display}"
+        sink="$(printf '%s\n' "$route_log" | awk '/^SINK /{print $2; exit}')"
+        [[ -n "$sink" ]] && break
+        (( attempt == 1 )) && say "Waiting for the audio device to appear…"
+        sleep 0.5
+    done
+    say "$route_log"
+    [[ -z "$sink" ]] && warn "no audio device matched ${CFG_AUDIO_DEVICE:-the saved choice}; Steam will use the desktop's own output."
+    # Steam and games inherit this, so they play on the TV even if the
+    # session default is still a headset.
+    [[ -n "$sink" ]] && export PULSE_SINK="$sink"
+
+    # Same idea for the microphone, which voice chat in console mode needs: the
+    # desktop default is likely the mic at your desk, not the one by the TV.
+    # Only set when saved, and only for what we launch, so the desktop's own
+    # default source is never changed.
+    local source
+    source="$("$HELPER_DISPLAY" audio-input-resolve 2>/dev/null || true)"
+    if [[ -n "$source" ]]; then
+        export PULSE_SOURCE="$source"
+        say "Microphone: $source"
+    fi
+    return 0
+}
+
+# gamescope's child. Starts Big Picture inside the session once the desktop
+# client has gone, which start_console is asking it to do at the same time.
+steam_in_session() {
+    # A second client started while the first still owns the IPC socket never
+    # becomes one: it hands its arguments to the running client and exits, which
+    # here would end the session and open Big Picture on the desktop instead.
+    # 40s, because stop_steam gives the client 30 before killing it.
+    local i
+    for i in $(seq 1 400); do
+        steam_running || break
+        sleep 0.1
+    done
+    if steam_running; then
+        warn "the desktop Steam client never exited; not starting a second one"
+        exit 1
+    fi
+    # The web helper outlives the client by a moment, holding the browser cache
+    # the new client's helper is about to open. Waited on, briefly: an orphaned
+    # helper that never exits must not keep console mode from starting.
+    for i in $(seq 1 30); do
+        pgrep -x steamwebhelper >/dev/null 2>&1 || break
+        sleep 0.1
+    done
+
+    route_audio
+    if [[ -n "${CACHY_CONSOLE_PRELOAD:-}" ]]; then
+        exec env -u CACHY_CONSOLE_PRELOAD \
+            "LD_PRELOAD=${CACHY_CONSOLE_PRELOAD}${LD_PRELOAD:+:$LD_PRELOAD}" \
+            steam -gamepadui
+    fi
+    exec steam -gamepadui
 }
 
 start_console() {
@@ -529,57 +610,15 @@ It will not choose a screen for you."
     # whole bug, and the number is what tells the two apart afterwards.
     say "Console mode on $CONNECTOR (display $DISPLAY_INDEX) at ${WIDTH}x${HEIGHT}@${REFRESH}Hz."
     warn_extest
+    # Checked here, before gamescope takes over a screen: stop_steam refuses too,
+    # but by then the session would already be on the television.
+    refuse_if_game_running
     # Before the wait below, not after it. This is the window sitting on the wrong
     # monitor, and clearing it is independent of anything to do with Steam's
     # lifetime -- so it should never be queued behind a lock. stop_steam asks
     # again, which costs nothing once there is nothing open.
     leave_big_picture
     await_steam_relaunch
-    stop_steam
-
-    # One GPU HDMI profile is visible at a time. Steam's audio list is that
-    # profile plus USB devices, so without this the projector never appears.
-    #
-    # Installed here, straight after stop_steam, so that whatever happens next
-    # -- a session that ran for hours or a gamescope that never came up -- the
-    # two things console mode took away are given back: the desktop's HDMI audio
-    # profile, and the Steam client. Audio first, so the desktop client does not
-    # enumerate its devices while the GPU profile still points at the television.
-    back_to_desktop() {
-        "$HELPER_DISPLAY" audio-restore || true
-        restart_desktop_steam || true
-    }
-    trap back_to_desktop EXIT
-    local route_log sink attempt
-    # A screen that has just woken brings its HDMI audio port up a moment after
-    # the screen itself, and until it does the saved device cannot be matched: the
-    # route finds nothing, PULSE_SINK goes unset, and Steam plays through whatever
-    # the desktop happens to be using -- the complaint that console mode came up
-    # on the wrong audio device. Worth a few more tries before giving up on it.
-    for attempt in 1 2 3 4 5 6; do
-        route_log="$("$HELPER_DISPLAY" audio-route 2>&1)" \
-            || warn "could not switch HDMI audio to $CONNECTOR"
-        sink="$(printf '%s\n' "$route_log" | awk '/^SINK /{print $2; exit}')"
-        [[ -n "$sink" ]] && break
-        (( attempt == 1 )) && say "Waiting for the audio device to appear…"
-        sleep 0.5
-    done
-    say "$route_log"
-    [[ -z "$sink" ]] && warn "no audio device matched ${CFG_AUDIO_DEVICE:-the saved choice}; Steam will use the desktop's own output."
-    # Steam and games inherit this, so they play on the TV even if the
-    # session default is still a headset.
-    [[ -n "$sink" ]] && export PULSE_SINK="$sink"
-
-    # Same idea for the microphone, which voice chat in console mode needs: the
-    # desktop default is likely the mic at your desk, not the one by the TV.
-    # Only set when saved, and only for what we launch, so the desktop's own
-    # default source is never changed.
-    local source
-    source="$("$HELPER_DISPLAY" audio-input-resolve 2>/dev/null || true)"
-    if [[ -n "$source" ]]; then
-        export PULSE_SOURCE="$source"
-        say "Microphone: $source"
-    fi
 
     # Hide devices that are only nominally gamepads. Anything holding a lower
     # js number than the controller is player one as far as a game is
@@ -610,35 +649,68 @@ It will not choose a screen for you."
 
     export SDL_VIDEODRIVER=x11
 
-    # Ask which screen it is one last time, as late as possible. The first answer
-    # was worked out before Steam was told to quit, and quitting Steam is the slow
-    # part of starting -- seconds during which a screen can sleep, wake, or be
-    # rearranged, and every one of those renumbers the list. SDL reads the index
-    # when it creates the window, not when we chose it, and a stale index is not an
-    # error anywhere: gamescope passes it to SDL_WINDOWPOS_UNDEFINED_DISPLAY and
-    # checks nothing, and sdl2-compat turns an index past the end of the list into
-    # display ID 0 -- the primary screen, which is the monitor being played on.
-    local before="$DISPLAY_INDEX"
-    resolve_display || die "$RESOLVE_ERROR"
-    if [[ "$DISPLAY_INDEX" != "$before" ]]; then
-        say "The screens were renumbered while Steam closed: $CONNECTOR is display $DISPLAY_INDEX now."
+    # Ask which screen it is one last time, as late as possible. SDL reads the
+    # index when it creates the window, not when we chose it, and the relaunch
+    # lock above can hold us for seconds during which a screen can sleep, wake,
+    # or be rearranged -- every one of which renumbers the list. A stale index is
+    # not an error anywhere: gamescope passes it to SDL_WINDOWPOS_UNDEFINED_DISPLAY
+    # and checks nothing, and sdl2-compat turns an index past the end of the list
+    # into display ID 0 -- the primary screen, which is the monitor being played
+    # on. One strict reading that matches is enough to go on; only a change is
+    # worth the full wait for the layout to settle.
+    local fresh
+    if ! fresh="$("$HELPER_DISPLAY" resolve --strict "${DISPLAY_OVERRIDE:-$CFG_DISPLAY}" 2>/dev/null)" \
+            || [[ "$fresh" != "$DISPLAY_INDEX $WIDTH $HEIGHT $REFRESH $CONNECTOR" ]]; then
+        local before="$DISPLAY_INDEX"
+        resolve_display || die "$RESOLVE_ERROR"
+        if [[ "$DISPLAY_INDEX" != "$before" ]]; then
+            say "The screens were renumbered: $CONNECTOR is display $DISPLAY_INDEX now."
+        fi
         gamescope_argv argv
     fi
 
-    # Not exec: the EXIT trap has to run so the desktop HDMI device comes back.
+    # One GPU HDMI profile is visible at a time. Steam's audio list is that
+    # profile plus USB devices, so without this the projector never appears.
+    #
+    # Installed before gamescope starts, so that whatever happens next -- a
+    # session that ran for hours, a gamescope that never came up, or the desktop
+    # client refusing to quit -- the two things console mode took away are given
+    # back: the desktop's HDMI audio profile, and the Steam client. Audio first, so
+    # the desktop client does not enumerate its devices while the GPU profile
+    # still points at the television. A gamescope still up at that point is one
+    # whose Steam never started, and it has to go first: the desktop client is
+    # not brought back while a session is running.
+    local helper_exit i
+    helper_exit="$(find_helper "$NAME-exit")"
+    back_to_desktop() {
+        if [[ -n "$GS_PID" ]] && kill -0 "$GS_PID" 2>/dev/null; then
+            kill "$GS_PID" 2>/dev/null || true
+            wait "$GS_PID" 2>/dev/null || true
+        fi
+        "$HELPER_DISPLAY" audio-restore || true
+        restart_desktop_steam || true
+    }
+    trap back_to_desktop EXIT
+
+    # gamescope first and the desktop client second, so the screen changes as soon
+    # as the button is pressed instead of after Steam has finished quitting --
+    # measured here, that wait was 3.3s of the 10 it took Big Picture to appear.
+    # Its child, steam-in-session, starts Big Picture once the desktop client is
+    # gone. Not exec: the EXIT trap has to run so the desktop HDMI device comes
+    # back.
+    "${argv[@]}" &
+    GS_PID=$!
+    stop_steam
+
     # gamescope often forks to gamescope-wl and the parent exits immediately.
     # Wait until that compositor is *up*, then until it is gone — otherwise we
     # restore Odyssey HDMI before Steam starts, and the list shows the monitor.
-    local helper_exit gs_pid i
-    helper_exit="$(find_helper "$NAME-exit")"
-    "${argv[@]}" &
-    gs_pid=$!
     for i in $(seq 1 250); do
         if "$helper_exit" --running; then
             "$HELPER_DISPLAY" audio-route >/dev/null || true
             break
         fi
-        if ! kill -0 "$gs_pid" 2>/dev/null; then
+        if ! kill -0 "$GS_PID" 2>/dev/null; then
             sleep 0.6
             "$helper_exit" --running && break
             warn "gamescope exited before console mode came up"
@@ -646,7 +718,8 @@ It will not choose a screen for you."
         fi
         sleep 0.1
     done
-    wait "$gs_pid" || true
+    wait "$GS_PID" || true
+    GS_PID=""
     while "$helper_exit" --running; do
         sleep 0.4
     done
@@ -989,7 +1062,7 @@ ARGS=()
 while (( $# )); do
     case "$1" in
         -h|--help|help)     usage ;;
-        start|setup|settings|status|check|displays|controllers|exit|stop|shortcut|restart-steam)
+        start|setup|settings|status|check|displays|controllers|exit|stop|shortcut|restart-steam|steam-in-session)
                             COMMAND="$1" ;;
         --display)          DISPLAY_OVERRIDE="${2-}"; shift ;;
         --display=*)        DISPLAY_OVERRIDE="${1#*=}" ;;
@@ -1015,4 +1088,6 @@ case "$COMMAND" in
     # How cachy-console-watch puts the client back when it, and not this
     # script, is the one left alive after a session.
     restart-steam) restart_desktop_steam ;;
+    # gamescope's child during a start; not something to run by hand.
+    steam-in-session) steam_in_session ;;
 esac

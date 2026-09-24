@@ -358,6 +358,73 @@ check("and points at the log that has the reason",
       ["/tmp/fake.log" in b for _, b in broken.announced], [True])
 
 print()
+print("polling fast for the button without paying for it")
+
+
+def idle_scans(polls, interval=0.2):
+    """/proc scans made over `polls` idle polls on a clock that keeps real time."""
+    session = FakeSession()
+    scans = {"n": 0}
+    real_running = session.running
+
+    def counted():
+        scans["n"] += 1
+        return real_running()
+
+    session.running = counted
+    clock = {"t": 0.0, "polls": 0}
+    stopping = {"now": False}
+
+    def sleep(secs):
+        clock["t"] += secs
+        clock["polls"] += 1
+        if clock["polls"] >= polls:
+            stopping["now"] = True
+
+    args = types.SimpleNamespace(interval=interval, engage_polls=2,
+                                 start_timeout=10, max_starts=3,
+                                 start_window=300.0)
+    pw.run_loop(FakeXprop([OTHER]), session, re.compile("big.?picture", re.I),
+                args, stopping, sleep, lambda: clock["t"],
+                announce=lambda *_: None)
+    return scans["n"]
+
+
+# Five polls a second is what makes the Steam button feel immediate. The scan for
+# a gamescope nobody told us about does not need to keep that pace.
+check("ten seconds idle at 0.2s is fifty polls but only ten /proc scans",
+      idle_scans(50), 10)
+
+
+def hand_started(ends_at_poll, polls, interval=0.2):
+    """A gamescope already running when the watcher looks, ending on its own."""
+    session = FakeSession()
+    session._alive = True
+    clock = {"t": 0.0, "polls": 0}
+    stopping = {"now": False}
+
+    def sleep(secs):
+        clock["t"] += secs
+        clock["polls"] += 1
+        if clock["polls"] == ends_at_poll:
+            session._alive = False
+        if clock["polls"] >= polls:
+            stopping["now"] = True
+
+    args = types.SimpleNamespace(interval=interval, engage_polls=2,
+                                 start_timeout=10, max_starts=3,
+                                 start_window=300.0)
+    pw.run_loop(FakeXprop([OTHER]), session, re.compile("big.?picture", re.I),
+                args, stopping, sleep, lambda: clock["t"],
+                announce=lambda *_: None)
+    return session.actions
+
+
+check("a session started by hand is still tracked, and the desktop client "
+      "comes back when it ends",
+      hand_started(ends_at_poll=3, polls=8), ["restore-audio", "relaunch-steam"])
+
+print()
 if FAILURES:
     print(f"{FAILURES} failure(s)")
     sys.exit(1)

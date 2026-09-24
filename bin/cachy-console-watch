@@ -195,6 +195,115 @@ class Xprop:
         return {"id": wid, "classes": classes, "name": name}
 
 
+class XlibProps:
+    """The same three questions as Xprop, asked over one X connection.
+
+    Xprop starts a process per window per poll -- about eleven every half
+    second on this desk, which is 32 minutes of CPU over a 2.4-hour login, and
+    the reason the poll could not be made faster to notice the Steam button
+    sooner. Reading the properties directly costs about a millisecond a poll.
+    """
+
+    _on_error = None
+
+    def __init__(self):
+        import ctypes
+        import ctypes.util
+        self._c = ctypes
+        path = ctypes.util.find_library("X11") or "libX11.so.6"
+        x = ctypes.CDLL(path)
+        x.XOpenDisplay.restype = ctypes.c_void_p
+        x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x.XDefaultRootWindow.restype = ctypes.c_ulong
+        x.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        x.XInternAtom.restype = ctypes.c_ulong
+        x.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        x.XGetWindowProperty.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_long,
+            ctypes.c_long, ctypes.c_int, ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_void_p)]
+        x.XFree.argtypes = [ctypes.c_void_p]
+        x.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        # A window can close between being listed and being asked about. Xlib's
+        # default answer to that BadWindow is to end the process, so it is
+        # swallowed here and the call reports failure instead. The handler is
+        # process-wide and kept on the class: one that belonged to an instance
+        # already collected is a segfault on the next error.
+        if XlibProps._on_error is None:
+            handler_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p,
+                                            ctypes.c_void_p)
+            XlibProps._on_error = handler_type(lambda _dpy, _event: 0)
+            x.XSetErrorHandler.argtypes = [handler_type]
+            x.XSetErrorHandler(XlibProps._on_error)
+        self._x = x
+        self._dpy = x.XOpenDisplay(None)
+        if not self._dpy:
+            raise OSError("cannot open the X display")
+        self._root = x.XDefaultRootWindow(self._dpy)
+        self._atoms = {name: x.XInternAtom(self._dpy, name.encode(), 0)
+                       for name in ("_NET_CLIENT_LIST", "_NET_ACTIVE_WINDOW",
+                                    "_NET_WM_NAME", "WM_CLASS")}
+
+    def _get(self, window, atom):
+        """(format, raw bytes, item count) of a property, or None."""
+        c = self._c
+        actual_type, actual_format = c.c_ulong(), c.c_int()
+        nitems, after, data = c.c_ulong(), c.c_ulong(), c.c_void_p()
+        status = self._x.XGetWindowProperty(
+            self._dpy, window, self._atoms[atom], 0, 1 << 16, 0, 0,
+            c.byref(actual_type), c.byref(actual_format), c.byref(nitems),
+            c.byref(after), c.byref(data))
+        # The error handler runs on the reply, which XGetWindowProperty has
+        # already waited for; nothing further to sync.
+        if status != 0 or not data.value:
+            return None
+        try:
+            if actual_format.value == 32:
+                # Format 32 comes back as C longs, whatever their width.
+                ids = c.cast(data, c.POINTER(c.c_ulong))
+                return [ids[i] for i in range(nitems.value)]
+            return c.string_at(data, nitems.value)
+        finally:
+            self._x.XFree(data)
+
+    def active_window(self):
+        ids = self._get(self._root, "_NET_ACTIVE_WINDOW")
+        if not ids or not isinstance(ids, list) or ids[0] == 0:
+            return None
+        return hex(ids[0])
+
+    def client_list(self):
+        ids = self._get(self._root, "_NET_CLIENT_LIST")
+        return [hex(i) for i in ids] if isinstance(ids, list) else []
+
+    def window(self, wid):
+        """Return {'id', 'classes', 'name'} for a window id."""
+        try:
+            window = int(wid, 16)
+        except ValueError:
+            return None
+        raw_class = self._get(window, "WM_CLASS")
+        raw_name = self._get(window, "_NET_WM_NAME")
+        if raw_class is None and raw_name is None:
+            return None
+        classes = set()
+        if isinstance(raw_class, bytes):
+            classes = {part.decode("utf-8", "replace").strip().lower()
+                       for part in raw_class.split(b"\0") if part.strip()}
+        name = raw_name.decode("utf-8", "replace") if isinstance(raw_name, bytes) else ""
+        return {"id": wid, "classes": classes, "name": name}
+
+
+def window_source():
+    """XlibProps where libX11 can be loaded and the display opened, else Xprop."""
+    try:
+        return XlibProps()
+    except (OSError, AttributeError):
+        return Xprop()
+
+
 # gamescope's own process name is gamescope-wl, which is why a plain
 # `pgrep -x gamescope` reports nothing while a session is clearly running.
 GAMESCOPE_COMMS = frozenset(("gamescope", "gamescope-wl"))
@@ -456,10 +565,10 @@ def main():
     ap.add_argument("--display", default=None,
                     help="which display to open console mode on; defaults to "
                          "the DISPLAY setting in the config file")
-    ap.add_argument("--interval", type=float, default=0.5,
-                    help="seconds between polls (default 0.5)")
+    ap.add_argument("--interval", type=float, default=0.2,
+                    help="seconds between polls (default 0.2)")
     ap.add_argument("--engage-polls", type=int, default=2,
-                    help="polls before acting, so ~1s (default 2)")
+                    help="polls before acting, so ~0.4s (default 2)")
     ap.add_argument("--start-timeout", type=float, default=90.0,
                     help="seconds to wait for gamescope to appear (default 90)")
     ap.add_argument("--max-starts", type=int, default=3,
@@ -499,7 +608,7 @@ def main():
 
     bpm_re = re.compile(args.bpm_pattern, re.I)
     ensure_session_env()
-    xprop = Xprop()
+    xprop = window_source()
 
     if xprop.active_window() is None and not xprop.client_list():
         log("cannot read X11 windows. Is DISPLAY/XAUTHORITY set? "
@@ -575,6 +684,10 @@ def run_loop(xprop, session, bpm_re, args, stopping, sleep,
     # Cachy Console. Wait until Big Picture has actually gone away, then treat
     # the next appearance as a real request.
     awaiting_bpm_clear = False
+    # When the /proc scan for a gamescope started by hand is next due. Ours is
+    # followed from STARTING, so the scan only finds sessions nothing is waiting
+    # on, and at five polls a second it was the watcher's largest cost.
+    next_scan = 0.0
 
     def stand_down(reason, message, headline=None):
         nonlocal last_standdown
@@ -621,7 +734,10 @@ def run_loop(xprop, session, bpm_re, args, stopping, sleep,
                 engage_streak = 0
 
         else:
-            if session.running():
+            scan = now() >= next_scan
+            if scan:
+                next_scan = now() + 1.0
+            if scan and session.running():
                 # Started by hand from a terminal, or left over from a restart.
                 log("tracking a gamescope session we did not start.")
                 state = GAME
@@ -701,7 +817,10 @@ def run_loop(xprop, session, bpm_re, args, stopping, sleep,
                                    f"{session.log_path} for what it said.",
                                    headline="Console mode could not start")
 
-        sleep(args.interval)
+        # The fast poll is for noticing the Steam button. In a session nothing is
+        # waiting on this loop but the return to the desktop, and half a second
+        # there is not worth a /proc scan five times a second for hours.
+        sleep(args.interval if state == IDLE else max(args.interval, 0.5))
 
 
 if __name__ == "__main__":

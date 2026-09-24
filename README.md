@@ -163,10 +163,20 @@ which clears that screen in about a second, and only then asked to quit.
 
 The wait after that is Steam starting up again inside gamescope, and there is no
 way around it: gamescope cannot adopt a window from another compositor, so Steam
-has to be relaunched as its child. Expect a few seconds to the display switching
-over and a few more before Big Picture has drawn — measured here, the wrong
-screen clears about 1.7s after Big Picture opens, and console mode has drawn by
-about 12s.
+has to be relaunched as its child. What there *is* a way around is waiting for
+the old client to finish quitting before anything appears. gamescope is started
+straight away, with a small launcher as its child in place of Steam; the
+launcher waits for the desktop client to exit and then becomes the new one. So
+the chosen screen goes black and belongs to console mode within a couple of
+seconds of the press, and Steam's own shutdown (often ten seconds or more)
+happens behind it instead of in front of it. Before this, the whole chain was
+serial and took about 25 seconds.
+
+The watcher also looks for the Big Picture window five times a second instead of
+twice, reading window properties straight from the X server rather than running
+`xprop` for each one, which is about thirty times cheaper per look. Scanning
+`/proc` for a hand-started session stays at once a second, and while a game runs
+it slows to twice a second, since nothing there needs a quick answer.
 
 That was thirty seconds longer until the relaunch lock stopped leaking. The lock
 exists so that two things racing to put the desktop client back cannot start two
@@ -389,10 +399,11 @@ button. Two things follow from that, and both used to happen:
   change, so agreement alone is not enough: a reading with two screens at one
   position is refused, and console mode waits for the arrangement to hold.
 - **An index that goes stale before it is used.** SDL resolves it when it
-  creates the window, not when we choose it, and closing Steam happens in
-  between — seconds, sometimes tens of them, in which a screen can sleep or
-  wake and renumber the list. So the display is resolved again immediately
-  before gamescope starts, and the session says which index it used:
+  creates the window, not when we choose it, and leaving Big Picture happens in
+  between, which is long enough for a screen to sleep or wake and renumber the
+  list. So the display is checked again immediately before gamescope starts
+  (and fully re-resolved if anything moved), and the session says which index
+  it used:
   `Console mode on HDMI-A-1 (display 2) at 1920x1080@60Hz`. A screen named in
   that line with the session on a different monitor is this fault; the number is
   what tells them apart.

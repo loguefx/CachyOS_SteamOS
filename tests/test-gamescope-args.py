@@ -42,14 +42,16 @@ def check(label, got, want):
 #
 #   strict-fails  how many `resolve --strict` calls refuse before answering,
 #                 which is what a layout caught mid-change looks like
-#   answer2       the answer to give once audio-route has been called -- the
-#                 point past which a screen waking or sleeping renumbers the
-#                 list, with the index already worked out and nothing to notice
+#   answer2       the answer to give once `flip-after` resolves have been
+#                 answered -- a screen waking or sleeping after the index was
+#                 first worked out, which renumbers the list with nothing to
+#                 notice
 HELPER = """#!/bin/bash
 state="${CACHY_TEST_STATE:-}"
 
 answer() {
-    if [[ -n "$state" && -f "$state/flipped" && -f "$state/answer2" ]]; then
+    if [[ -n "$state" && -f "$state/answer2" && -f "$state/flip-after" ]] \
+            && (( $(< "$state/resolves") > $(< "$state/flip-after") )); then
         cat "$state/answer2"
     else
         echo "2 1920 1080 240 HDMI-A-1"
@@ -59,6 +61,10 @@ answer() {
 case "$1" in
   saved)         echo "HDMI-A-1" ;;
   resolve)
+    if [[ -n "$state" ]]; then
+        n=0; [[ -f "$state/resolves" ]] && n="$(< "$state/resolves")"
+        echo $(( n + 1 )) > "$state/resolves"
+    fi
     if [[ "$2" == "--strict" && -n "$state" && -f "$state/strict-fails" ]]; then
         left="$(< "$state/strict-fails")"
         if (( left > 0 )); then
@@ -68,8 +74,7 @@ case "$1" in
         fi
     fi
     answer ;;
-  audio-route)   [[ -n "$state" ]] && : > "$state/flipped"
-                 echo "SINK alsa_output.fake" ;;
+  audio-route)   echo "SINK alsa_output.fake" ;;
   audio-input-resolve) echo "alsa_input.fake" ;;
   audio-resolve) echo "alsa_output.fake" ;;
   has)           exit 0 ;;
@@ -85,10 +90,41 @@ echo "  --force-grab-cursor  always use relative mouse mode"
 """
 
 
+# gamescope writes down what it was asked for, then runs its child the way the
+# real one does, so steam-in-session runs too.
+def gamescope_recorder(state):
+    return GAMESCOPE + f"""printf "%s\\n" "$@" > {state}/gamescope-argv
+echo gamescope >> {state}/sequence
+while (( $# )) && [[ "$1" != "--" ]]; do shift; done
+shift
+"$@"
+"""
+
+
+# A desktop client that is running until asked to quit, and a Steam started in
+# the session that writes down what it inherited.
+STEAM = """#!/bin/bash
+state="$CACHY_TEST_STATE"
+echo "steam $*" >> "$state/sequence"
+case "$1" in
+  -shutdown)  rm -f "$state/desktop-steam" ;;
+  -gamepadui) env | grep -E '^(PULSE_SINK|PULSE_SOURCE|LD_PRELOAD|CACHY_CONSOLE_PRELOAD)=' \
+                  | sort > "$state/steam-env" ;;
+esac
+exit 0
+"""
+
+PGREP = """#!/bin/bash
+[[ "$*" == "-x steam" && -f "$CACHY_TEST_STATE/desktop-steam" ]] && exit 0
+exit 1
+"""
+
+
 class World:
     """A cachy-console with fake helpers beside it and a config of our own."""
 
-    def __init__(self, config="", strict_fails=0, answer2=None):
+    def __init__(self, config="", strict_fails=0, answer2=None, flip_after=None,
+                 desktop_steam=False):
         self.dir = tempfile.mkdtemp(prefix="cachy-args-")
         self.bin = os.path.join(self.dir, "bin")
         os.makedirs(self.bin)
@@ -100,14 +136,15 @@ class World:
             self.write(os.path.join(self.state, "strict-fails"), str(strict_fails))
         if answer2:
             self.write(os.path.join(self.state, "answer2"), answer2)
+        if flip_after is not None:
+            self.write(os.path.join(self.state, "flip-after"), str(flip_after))
+        if desktop_steam:
+            self.write(os.path.join(self.state, "desktop-steam"), "")
         shutil.copy(WRAPPER, os.path.join(self.bin, "cachy-console"))
-        # gamescope writes down what it was asked for and leaves again, which is
-        # enough for a start to run through to the end.
-        recorder = GAMESCOPE + f'printf "%s\\n" "$@" > {self.state}/gamescope-argv\n'
         for name, body in (("cachy-console-display", HELPER),
-                           ("gamescope", recorder),
-                           ("steam", "#!/bin/bash\nexit 0\n"),
-                           ("pgrep", "#!/bin/bash\nexit 1\n"),
+                           ("gamescope", gamescope_recorder(self.state)),
+                           ("steam", STEAM),
+                           ("pgrep", PGREP),
                            ("cachy-console-exit", "#!/bin/bash\nexit 1\n")):
             path = os.path.join(self.bin, name)
             with open(path, "w") as fh:
@@ -131,7 +168,17 @@ class World:
         env["XDG_RUNTIME_DIR"] = self.run
         env["CACHY_TEST_STATE"] = self.state
         env["PATH"] = self.bin + os.pathsep + env.get("PATH", "")
+        # Nothing on this desk's real screen is to be taken for Big Picture.
+        env["CACHY_CONSOLE_BPM_PATTERN"] = "^cachy-test-never-matches$"
+        env["CACHY_CONSOLE_STEAM_TIMEOUT"] = "1"
         return env
+
+    def read(self, name):
+        path = os.path.join(self.state, name)
+        if not os.path.exists(path):
+            return []
+        with open(path) as fh:
+            return [line.rstrip("\n") for line in fh]
 
     def argv(self):
         """The gamescope command line `start --dry-run` would run."""
@@ -194,8 +241,9 @@ print("the trackpad Steam drives through XTEST")
 
 
 def preloaded(argv):
-    """Whether Steam is started with an extest preload, and nothing else is."""
-    return [a for a in argv if a.startswith("LD_PRELOAD=")]
+    """The extest preload handed on for Steam. Never as LD_PRELOAD on the
+    command line: gamescope's capabilities make glibc strip that."""
+    return [a for a in argv if a.startswith(("LD_PRELOAD=", "CACHY_CONSOLE_PRELOAD="))]
 
 
 # Only meaningful where extest exists: the wrapper will not preload a library
@@ -204,7 +252,7 @@ if os.path.exists("/usr/lib/libextest.so") or os.path.exists("/usr/lib32/libexte
     w = World("DISPLAY=HDMI-A-1\n")
     check("extest is preloaded into Steam by default, since XTEST alone moves "
           "nothing a client can see",
-          preloaded(w.argv()), ["LD_PRELOAD=libextest.so"])
+          preloaded(w.argv()), ["CACHY_CONSOLE_PRELOAD=libextest.so"])
     w.clean()
 else:
     print("  SKIP  extest is not installed here")
@@ -246,10 +294,11 @@ w.clean()
 
 print()
 print("the index is read again as late as it can be")
-# Closing Steam is the slow part of starting, and a screen sleeping or waking in
-# those seconds renumbers the list. SDL resolves the index when it creates the
-# window: stale, it silently uses display 0 -- the monitor being played on.
-w = World("DISPLAY=HDMI-A-1\n", answer2="1 1920 1080 60 HDMI-A-1")
+# A screen sleeping or waking after the index was first worked out renumbers the
+# list. SDL resolves the index when it creates the window: stale, it silently
+# uses display 0 -- the monitor being played on. Two resolves settle the first
+# answer, so the change lands on the check made just before gamescope starts.
+w = World("DISPLAY=HDMI-A-1\n", answer2="1 1920 1080 60 HDMI-A-1", flip_after=2)
 argv = w.started()
 check("gamescope is given the index resolved last, not the one resolved first",
       index_of(argv), "1")
@@ -263,6 +312,37 @@ w = World("DISPLAY=HDMI-A-1\n")
 argv = w.started()
 check("a layout that held still is not announced as having changed",
       (index_of(argv), "renumbered" in w.output), ("2", False))
+w.clean()
+
+print()
+print("the screen changes before Steam has finished quitting")
+# Quitting the desktop client was 3.3s of a 10s start, all of it with the old
+# screen still showing. gamescope now comes up first, and its child starts Big
+# Picture once the desktop client is gone.
+w = World("DISPLAY=HDMI-A-1\n", desktop_steam=True)
+w.started()
+order = w.read("sequence")
+def at(entry):
+    return order.index(entry) if entry in order else None
+check("gamescope is started before the desktop client is asked to quit",
+      (at("gamescope") is not None and at("steam -shutdown") is not None
+       and at("gamescope") < at("steam -shutdown")), True)
+check("and Big Picture only once the desktop client has gone",
+      (at("steam -gamepadui") is not None
+       and at("steam -shutdown") < at("steam -gamepadui")), True)
+got = w.read("steam-env")
+check("Steam in the session still plays and listens where the settings say",
+      [e for e in got if e.startswith("PULSE_")],
+      ["PULSE_SINK=alsa_output.fake", "PULSE_SOURCE=alsa_input.fake"])
+if os.path.exists("/usr/lib/libextest.so") or os.path.exists("/usr/lib32/libextest.so"):
+    check("and has extest preloaded, under its real name and nowhere else",
+          [e for e in got if "PRELOAD" in e], ["LD_PRELOAD=libextest.so"])
+w.clean()
+
+w = World("DISPLAY=HDMI-A-1\n")
+w.started()
+check("with no desktop client running, Big Picture starts straight away",
+      "steam -gamepadui" in w.read("sequence"), True)
 w.clean()
 
 print()
