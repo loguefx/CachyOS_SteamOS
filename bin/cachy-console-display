@@ -1166,9 +1166,11 @@ def cmd_controllers(args):
     print("  '-' marks one IGNORE_CONTROLLERS hides. A virtual pad is what")
     print("  Steam Input presents for a controller it has taken over.")
     if steam_controller_asleep():
-        print("  A Steam Controller dongle is plugged in with nothing connected to")
-        print("  it, so the trackpad will not move a cursor anywhere. Press the")
-        print("  controller's Steam button to wake it -- it sleeps by itself.")
+        print("  A Steam Controller receiver is plugged in with nothing connected")
+        print("  to it, so the trackpad will not move a cursor anywhere. Press the")
+        print("  controller's Steam button to wake it -- it sleeps by itself. If")
+        print("  that changes nothing, it is flat or no longer paired; a USB-C")
+        print("  cable both charges it and connects it without the receiver.")
     return 0
 
 
