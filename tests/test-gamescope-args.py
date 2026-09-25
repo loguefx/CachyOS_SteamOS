@@ -270,6 +270,24 @@ check("and turning it off leaves the cursor to the desktop",
 w.clean()
 
 print()
+print("the controller games are shown")
+SPOOF = "PROTON_SPOOF_STEAMINPUT_VIDPID=1"
+w = World("DISPLAY=HDMI-A-1\n")
+argv = w.argv()
+check("games see Steam's pad as an Xbox 360 pad by default, so ones that only "
+      "take pads they know still take it",
+      SPOOF in argv, True)
+check("set in the environment Steam starts with, which its games inherit",
+      argv.index(SPOOF) > argv.index("env") and argv.index(SPOOF) < len(argv) - 2,
+      True)
+w.clean()
+
+w = World("DISPLAY=HDMI-A-1\nSTEAM_PAD_AS_XBOX=off\n")
+check("and off leaves Proton showing the real Steam pad",
+      SPOOF in w.argv(), False)
+w.clean()
+
+print()
 print("the trackpad Steam drives through XTEST")
 
 

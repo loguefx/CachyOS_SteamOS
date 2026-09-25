@@ -395,6 +395,7 @@ edit by hand:
 | `AUDIO_INPUT_DEVICE` | *(session default)* | Microphone for console mode, e.g. `HyperX Cloud III S Wireless`. Empty leaves input alone |
 | `IGNORE_CONTROLLERS` | empty | Devices console mode should not treat as gamepads, as `0x31e3/0x1400`, comma separated. List them with `cachy-console controllers` |
 | `PRIMARY_CONTROLLER` | `steam` | Which controller is player one when several are connected: `steam`, `playstation`, `xbox`, `switch`, or `off` for Steam's own order. Also in Cachy Console |
+| `STEAM_PAD_AS_XBOX` | `on` | Show games Steam's controller as an Xbox 360 pad (`045e:028e`) instead of Steam's own virtual pad (`28de:11ff`), which older games that only accept pads they know refuse — Dead Rising 2 among them. Off only for a game that needs to see the real Steam pad |
 | `EXTRA_GAMESCOPE_ARGS` | empty | Passed straight through, e.g. `--mangoapp` |
 
 ## How it works
@@ -748,15 +749,19 @@ grep cachy-console-pads "$XDG_RUNTIME_DIR/cachy-console-session.log"
 **An older game ignores the controller that works in Big Picture.** Some games
 only accept gamepads whose USB id they know, and Steam's virtual pad (`28de:11ff`)
 is not one of them; Dead Rising 2 is one ("Unsupported gamepad"), with its own
-*Controller* switch in PC Settings greyed out. Proton can present the pad as an
-Xbox 360 controller instead — set this as the game's launch options:
+*Controller* switch in PC Settings greyed out. Console mode has Proton present
+the pad as an Xbox 360 controller instead, for every game, which is what
+`STEAM_PAD_AS_XBOX=on` does; check it is not off. Proton itself does this for only
+a few titles, so on the desktop, or with it off, the same thing per game is
+this as the launch options:
 
 ```text
 PROTON_SPOOF_STEAMINPUT_VIDPID=1 %command%
 ```
 
-Proton already does this itself for a few titles; it is per game, not a session
-setting, because every other game is better off seeing the real pad.
+What a game loses by it is the real pad's identity: an SDL game running under
+Proton shows Xbox button prompts rather than PlayStation ones for a DualSense
+going through Steam Input.
 
 **The cursor works in Big Picture but stops in Discord.** That is Discord's
 controller layout, not the cursor: with none chosen it is a gamepad layout.

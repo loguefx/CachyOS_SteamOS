@@ -49,6 +49,7 @@ CFG_AUDIO_DEVICE=""
 CFG_AUDIO_INPUT_DEVICE=""
 CFG_IGNORE_CONTROLLERS=""
 CFG_PRIMARY_CONTROLLER=steam
+CFG_STEAM_PAD_AS_XBOX=on
 CFG_EXTRA_GAMESCOPE_ARGS=""
 
 DRY_RUN=0
@@ -109,7 +110,7 @@ load_config() {
         value="${value%\"}"; value="${value#\"}"
         value="${value%\'}"; value="${value#\'}"
         case "$key" in
-            DISPLAY|DISPLAY_MODEL|RESOLUTION|REFRESH|HDR|VRR|TRACKPAD_FIX|GRAB_CURSOR|RESTART_STEAM|EXTRA_GAMESCOPE_ARGS|AUDIO_DEVICE|AUDIO_INPUT_DEVICE|IGNORE_CONTROLLERS|PRIMARY_CONTROLLER)
+            DISPLAY|DISPLAY_MODEL|RESOLUTION|REFRESH|HDR|VRR|TRACKPAD_FIX|GRAB_CURSOR|RESTART_STEAM|EXTRA_GAMESCOPE_ARGS|AUDIO_DEVICE|AUDIO_INPUT_DEVICE|IGNORE_CONTROLLERS|PRIMARY_CONTROLLER|STEAM_PAD_AS_XBOX)
                 printf -v "CFG_$key" '%s' "$value" ;;
             STEAM_BUTTON|AUDIO_FOCUS|AUDIO_NEVER_MUTE|AUDIO_PIN_VOICE) ;;   # read by the services, not by us
             "") ;;
@@ -510,6 +511,13 @@ gamescope_argv() {
           GDK_BACKEND=x11
           QT_QPA_PLATFORM=xcb)
 
+    # Proton hands games Steam Input's virtual pad as 28de:11ff, an id that
+    # games which only accept gamepads they know (Dead Rising 2: "Unsupported
+    # gamepad") reject, leaving the controller dead in them while Big Picture,
+    # which reads it directly, works. As an Xbox 360 pad every game takes it.
+    # Proton does this itself for a handful of titles; here it is for all of them.
+    is_on "$CFG_STEAM_PAD_AS_XBOX" && out+=(PROTON_SPOOF_STEAMINPUT_VIDPID=1)
+
     # The preload is never exported, because gamescope carries CAP_SYS_NICE for
     # realtime scheduling and file capabilities put a process into glibc's
     # secure-execution mode. There LD_PRELOAD is not merely ignored -- glibc
@@ -706,6 +714,7 @@ It will not choose a screen for you."
         say "  microphone: ${dry_source:-(session default)}"
         say "  hidden controllers: ${CFG_IGNORE_CONTROLLERS:-(none)}"
         say "  player one: ${CFG_PRIMARY_CONTROLLER:-off}"
+        say "  Steam's pad as an Xbox 360 pad in games: ${CFG_STEAM_PAD_AS_XBOX:-off}"
         return 0
     fi
 
@@ -930,6 +939,11 @@ IGNORE_CONTROLLERS=$CFG_IGNORE_CONTROLLERS
 # (bound to this machine only), and PlayStation controllers go through Steam
 # Input for the session so they can be ordered at all. Also in Cachy Console.
 PRIMARY_CONTROLLER=$CFG_PRIMARY_CONTROLLER
+
+# Show games Steam's controller as an Xbox 360 pad rather than as Steam's own
+# virtual pad, which older games that only accept pads they know (Dead Rising 2)
+# refuse. Off only if a game needs to see the real Steam pad.
+STEAM_PAD_AS_XBOX=$CFG_STEAM_PAD_AS_XBOX
 
 # Extra arguments passed straight to gamescope, for anything not covered above.
 # For example: EXTRA_GAMESCOPE_ARGS=--mangoapp
