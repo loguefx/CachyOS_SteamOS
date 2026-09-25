@@ -183,9 +183,26 @@ PRIMARY_HINT = (
 ONLY_HINT = (
     "Hide every other controller while that one is connected, so Big Picture "
     "and games only see player one. Turn this off for local multiplayer. "
-    "Needs the USB helper from ./install.sh. A change takes effect the next "
-    "time console mode starts."
+    "Needs the USB helper from ./install.sh or the AUR package. A change "
+    "takes effect the next time console mode starts."
 )
+
+TILES_HINT = (
+    "Adds Exit Console Mode, Discord and Spotify to your Steam library. "
+    "If Steam is running they are queued and written when it next quits."
+)
+
+
+def queue_couch_tiles():
+    helper = os.path.join(HERE, "cachy-console-shortcut")
+    try:
+        res = subprocess.run(
+            [helper, "--queue-defaults"], capture_output=True, text=True,
+            timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    text = ((res.stdout or "") + (res.stderr or "")).strip()
+    return res.returncode == 0, text or "queued"
 
 
 def run_gtk():
@@ -288,11 +305,15 @@ def run_gtk():
             buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             refresh = Gtk.Button(label="Refresh")
             refresh.connect("clicked", lambda *_: self.reload())
+            tiles = Gtk.Button(label="Add library tiles")
+            tiles.set_tooltip_text(TILES_HINT)
+            tiles.connect("clicked", self.on_queue_tiles)
             save = Gtk.Button(label="Save")
             save.get_style_context().add_class("suggested-action")
             save.connect("clicked", self.on_save)
             buttons.pack_end(save, False, False, 0)
             buttons.pack_end(refresh, False, False, 0)
+            buttons.pack_start(tiles, False, False, 0)
             outer.pack_end(buttons, False, False, 0)
             self.reload()
 
@@ -436,6 +457,11 @@ def run_gtk():
             self.status.set_text(apply_message(self.choice, audio, applied, mic)
                                  + f" Player one: {primary_label(primary)}."
                                  + hidden)
+
+        def on_queue_tiles(self, _button):
+            ok, text = queue_couch_tiles()
+            line = text.splitlines()[-1] if text else ""
+            self.status.set_text(line or ("queued" if ok else "could not queue tiles"))
 
     class App(Gtk.Application):
         def __init__(self):
@@ -588,10 +614,17 @@ def run_tk():
         status.set(apply_message(connector, audio, applied, mic)
                    + f" Player one: {primary_label(primary)}." + hidden)
 
+    def on_queue_tiles():
+        ok, text = queue_couch_tiles()
+        line = text.splitlines()[-1] if text else ""
+        status.set(line or ("queued" if ok else "could not queue tiles"))
+
     ttk.Label(frame, textvariable=status, wraplength=460, justify="left").pack(
         anchor="w", pady=(8, 8))
     btns = ttk.Frame(frame)
     btns.pack(fill="x")
+    ttk.Button(btns, text="Add library tiles", command=on_queue_tiles).pack(
+        side="left")
     ttk.Button(btns, text="Refresh", command=reload).pack(side="right")
     ttk.Button(btns, text="Save", command=on_save).pack(side="right", padx=8)
     reload()

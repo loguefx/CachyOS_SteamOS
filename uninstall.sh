@@ -56,7 +56,8 @@ fi
 
 say
 say "Five things this cannot undo for you:"
-say "  - the USB helper that hides other controllers during a session:"
+say "  - the USB helper that hides other controllers during a session. The"
+say "    AUR package removes its copy; a home install leaves:"
 say "      sudo rm -f /usr/local/libexec/cachy-console-usb"
 say "      sudo rm -f /usr/share/polkit-1/actions/org.cachyconsole.usb.policy"
 say "      sudo rm -f /etc/polkit-1/rules.d/50-cachy-console-usb.rules"

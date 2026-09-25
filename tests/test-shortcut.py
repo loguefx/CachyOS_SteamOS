@@ -302,6 +302,44 @@ check("both problems are named when they happen together",
       ("Discord", False, "not wrapped, muted"))
 
 print()
+print("queued tiles wait for Steam to quit:")
+qdir = tempfile.mkdtemp()
+qpath = os.path.join(qdir, "pending-shortcuts.json")
+ies.enqueue({"name": "Discord", "exe": "/usr/bin/discord"}, path=qpath)
+ies.enqueue({"name": "Discord", "exe": "/usr/bin/discord", "wrap": True},
+            path=qpath)
+check("a second queue of the same name replaces the first",
+      [item["name"] for item in ies.load_queue(qpath)], ["Discord"])
+ies.enqueue({"name": "Spotify", "exe": "/usr/bin/spotify-launcher",
+             "process": ["spotify"]}, path=qpath)
+check("a different name is kept beside it",
+      [item["name"] for item in ies.load_queue(qpath)], ["Discord", "Spotify"])
+check("flush leaves the queue alone while Steam is running",
+      ies.flush_queue(path=qpath, steam=lambda: True), 1)
+check("and the tiles are still there",
+      [item["name"] for item in ies.load_queue(qpath)], ["Discord", "Spotify"])
+
+libdir = tempfile.mkdtemp()
+lib = os.path.join(libdir, "shortcuts.vdf")
+# Steam userdata layout: userdata/<id>/config/shortcuts.vdf
+account = os.path.join(libdir, "userdata", "1", "config")
+os.makedirs(account)
+lib = os.path.join(account, "shortcuts.vdf")
+with open(lib, "wb") as fh:
+    fh.write(ies.dumps({"shortcuts": {}}))
+# apply_spec needs an executable. The test file itself is one.
+spec = {"name": "Exit Console Mode", "exe": os.path.abspath(__file__),
+        "art": False, "wrap": False}
+ies.enqueue(spec, path=qpath)
+# Drop Discord/Spotify so flush only writes the exit tile we can actually apply.
+ies.save_queue([spec], qpath)
+check("flush writes once Steam is gone",
+      ies.flush_queue(path=qpath, steam=lambda: False, paths=[lib]), 0)
+check("and the queue file is removed", os.path.exists(qpath), False)
+check("and the tile is in the library",
+      ies.load(lib)["shortcuts"]["0"]["AppName"], "Exit Console Mode")
+
+print()
 if FAILURES:
     print(f"{len(FAILURES)} failure(s): " + ", ".join(FAILURES))
     sys.exit(1)

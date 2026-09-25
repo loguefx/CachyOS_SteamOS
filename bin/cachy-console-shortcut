@@ -39,11 +39,14 @@ Usage:
                            [--name NAME] [--exe PATH]
                            [--icon PATH] [--color HEX] [--process NAME]
                            [--no-art]
+    cachy-console shortcut --queue-defaults
+    cachy-console shortcut --flush
 """
 
 import argparse
 import importlib.machinery
 import importlib.util
+import json
 import os
 import shutil
 import struct
@@ -288,6 +291,79 @@ COUCH_TILES = (
 )
 
 CONFIG_PATH = os.path.expanduser("~/.config/cachy-console/config")
+QUEUE_NAME = "pending-shortcuts.json"
+
+
+def queue_path(path=None):
+    if path:
+        return path
+    root = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(root, "cachy-console", QUEUE_NAME)
+
+
+def default_couch_tiles():
+    """Exit, Discord and Spotify — the tiles a first install should have."""
+    return [
+        {"name": DEFAULT_NAME, "exe": default_exe()},
+        {"name": "Discord", "exe": "/usr/bin/discord"},
+        {"name": "Spotify", "exe": "/usr/bin/spotify-launcher",
+         "process": ["spotify"], "color": "121212"},
+    ]
+
+
+def load_queue(path=None):
+    where = queue_path(path)
+    try:
+        with open(where) as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict) and item.get("name")]
+
+
+def save_queue(items, path=None):
+    where = queue_path(path)
+    os.makedirs(os.path.dirname(where), exist_ok=True)
+    tmp = where + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(items, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, where)
+
+
+def clear_queue(path=None):
+    where = queue_path(path)
+    try:
+        os.remove(where)
+    except OSError:
+        pass
+
+
+def spec_key(spec):
+    return (spec.get("name") or "").strip().lower()
+
+
+def enqueue(spec, path=None):
+    """Remember a tile until Steam is closed. Same name replaces the older one."""
+    items = [item for item in load_queue(path) if spec_key(item) != spec_key(spec)]
+    items.append(dict(spec))
+    save_queue(items, path)
+    return items
+
+
+def spec_from_args(args):
+    return {
+        "name": args.name,
+        "exe": args.exe,
+        "icon": args.icon or "",
+        "color": args.color or "",
+        "process": list(args.process or []),
+        "wrap": not args.no_wrap,
+        "art": not args.no_art,
+        "revert": bool(args.revert),
+    }
 
 
 def collect_shortcuts(paths=None):
@@ -381,7 +457,12 @@ def report_tiles(shortcuts=None, never_mute=None, out=None):
             continue
         bad += 1
         if detail == "missing":
-            print(f"    add with: {hints[name]}", file=dest)
+            pending = {spec_key(item) for item in load_queue()}
+            if name.lower() in pending:
+                print("    queued; will be written when Steam next quits",
+                      file=dest)
+            else:
+                print(f"    add with: {hints[name]}", file=dest)
         else:
             if "not wrapped" in detail:
                 print("    launch options should wrap cachy-console-app",
@@ -389,7 +470,125 @@ def report_tiles(shortcuts=None, never_mute=None, out=None):
             if "muted" in detail:
                 print(f"    add {name} (or its appid) to AUDIO_NEVER_MUTE",
                       file=dest)
+    pending = load_queue()
+    if pending:
+        names = ", ".join(item.get("name") or "?" for item in pending)
+        print(f"  queued                 {names}", file=dest)
     return 1 if bad else 0
+
+
+def apply_spec(spec, dry_run=False, paths=None):
+    """Write one queued or live shortcut into Steam's library."""
+    name = spec.get("name") or DEFAULT_NAME
+    exe = spec.get("exe") or default_exe()
+    revert = bool(spec.get("revert"))
+    if not revert and not os.access(exe, os.X_OK):
+        print(f"not executable: {exe}", file=sys.stderr)
+        return 1
+    found = config_paths() if paths is None else paths
+    if not found:
+        print(f"no Steam user config found under {STEAM_ROOT}/userdata",
+              file=sys.stderr)
+        return 1
+
+    icon = spec.get("icon") or ""
+    if artwork is not None and spec.get("art", True):
+        print("artwork:")
+        if revert:
+            artwork.remove(exe, name, dry_run)
+        else:
+            icon = artwork.install(exe, name, spec.get("icon") or None,
+                                   dry_run, color=spec.get("color") or None) or icon
+
+    wrapper = None if spec.get("wrap", True) is False else sibling("cachy-console-app")
+    processes = spec.get("process") or []
+    options = launch_options(exe, name, wrapper, processes)
+    if options:
+        print(f"launching through {wrapper}")
+
+    for path in found:
+        account = os.path.basename(os.path.dirname(os.path.dirname(path)))
+        print(f"account {account}:")
+        try:
+            obj = load(path)
+        except VDFError as exc:
+            print(f"  cannot parse existing shortcuts.vdf ({exc}); "
+                  f"leaving it alone", file=sys.stderr)
+            continue
+
+        shortcuts = obj["shortcuts"]
+        existing = find_entry(shortcuts, exe, name)
+
+        if revert:
+            if existing is None:
+                print("  no matching entry; nothing to remove")
+                continue
+            del shortcuts[existing]
+            obj["shortcuts"] = {str(n): v for n, v in enumerate(shortcuts.values())}
+            print(f"  removing {name!r}")
+        else:
+            entry = build_entry(exe, name, icon, wrapper, processes)
+            if existing is not None:
+                old_name = shortcuts[existing].get("AppName") or name
+                if old_name in LEGACY_NAMES and old_name != name:
+                    entry = build_entry(exe, old_name, icon, wrapper, processes)
+                shortcuts[existing] = entry
+                print(f"  updating existing entry {existing} -> {entry['AppName']!r} ({exe})")
+            else:
+                index = next_index(shortcuts)
+                shortcuts[index] = entry
+                print(f"  adding entry {index}: {name!r} -> {exe}")
+                other = len(shortcuts) - 1
+                if other:
+                    print(f"  ({other} existing shortcut(s) preserved)")
+
+        save(path, obj, dry_run)
+    return 0
+
+
+def flush_queue(path=None, dry_run=False, steam=None, paths=None):
+    """Write every queued tile now that Steam is not holding shortcuts.vdf."""
+    if (steam or steam_running)():
+        items = load_queue(path)
+        if items:
+            names = ", ".join(item.get("name") or "?" for item in items)
+            print(f"Steam is still running; leaving queued: {names}")
+        return 1 if items else 0
+    items = load_queue(path)
+    if not items:
+        return 0
+    leftover = []
+    status = 0
+    for spec in items:
+        if apply_spec(spec, dry_run=dry_run, paths=paths) != 0:
+            leftover.append(spec)
+            status = 1
+    if leftover:
+        save_queue(leftover, path)
+    else:
+        clear_queue(path)
+    return status
+
+
+def queue_defaults(path=None, steam=None):
+    """Queue Exit, Discord and Spotify; write them now if Steam is closed."""
+    queued = []
+    for spec in default_couch_tiles():
+        exe = spec.get("exe") or default_exe()
+        if spec.get("name") != DEFAULT_NAME and not os.access(exe, os.X_OK):
+            print(f"skipping {spec['name']}: {exe} is not installed")
+            continue
+        enqueue(spec, path)
+        queued.append(spec["name"])
+    if not queued:
+        print("nothing to queue")
+        return 0
+    if (steam or steam_running)():
+        print("Steam is running, so these are queued and will be written "
+              f"when it next quits: {', '.join(queued)}")
+        return 0
+    print("Steam is closed; writing queued tiles now.")
+    return flush_queue(path=path, steam=steam)
 
 
 def launch_options(exe, name, wrapper, processes=()):
@@ -462,9 +661,18 @@ def main():
     ap.add_argument("--check-tiles", action="store_true",
                     help="report whether Discord and Spotify tiles are wrapped "
                          "and listed in AUDIO_NEVER_MUTE")
+    ap.add_argument("--queue-defaults", action="store_true",
+                    help="queue Exit, Discord and Spotify; write them when "
+                         "Steam next quits")
+    ap.add_argument("--flush", action="store_true",
+                    help="write queued tiles now (no-op while Steam is running)")
     args = ap.parse_args()
     if args.check_tiles:
         return report_tiles()
+    if args.flush:
+        return flush_queue(dry_run=args.dry_run)
+    if args.queue_defaults:
+        return queue_defaults()
 
     if args.color and artwork is not None:
         try:
@@ -473,80 +681,14 @@ def main():
             print(exc, file=sys.stderr)
             return 1
 
+    spec = spec_from_args(args)
     if not args.dry_run and steam_running() and not args.force:
-        print("Steam is running. It rewrites shortcuts.vdf on exit, which would\n"
-              "discard this change. Close Steam first, or pass --force.",
-              file=sys.stderr)
-        return 1
-
-    if not args.revert and not os.access(args.exe, os.X_OK):
-        print(f"not executable: {args.exe}", file=sys.stderr)
-        return 1
-
-    paths = config_paths()
-    if not paths:
-        print(f"no Steam user config found under {STEAM_ROOT}/userdata",
-              file=sys.stderr)
-        return 1
-
-    # Steam gives a shortcut a blank grey tile, which from a sofa tells you
-    # nothing. The artwork is filed under the same appid as the entry, so it
-    # is generated here rather than being left as a manual step.
-    icon = args.icon or ""
-    if artwork is not None and not args.no_art:
-        print("artwork:")
-        if args.revert:
-            artwork.remove(args.exe, args.name, args.dry_run)
-        else:
-            icon = artwork.install(args.exe, args.name, args.icon,
-                                   args.dry_run, color=args.color) or icon
-
-    wrapper = None if args.no_wrap else sibling("cachy-console-app")
-    options = launch_options(args.exe, args.name, wrapper, args.process)
-    if options:
-        print(f"launching through {wrapper}")
-
-    for path in paths:
-        account = os.path.basename(os.path.dirname(os.path.dirname(path)))
-        print(f"account {account}:")
-        try:
-            obj = load(path)
-        except VDFError as exc:
-            print(f"  cannot parse existing shortcuts.vdf ({exc}); "
-                  f"leaving it alone", file=sys.stderr)
-            continue
-
-        shortcuts = obj["shortcuts"]
-        existing = find_entry(shortcuts, args.exe, args.name)
-
-        if args.revert:
-            if existing is None:
-                print("  no matching entry; nothing to remove")
-                continue
-            del shortcuts[existing]
-            # Steam expects consecutive numeric keys.
-            obj["shortcuts"] = {str(n): v for n, v in enumerate(shortcuts.values())}
-            print(f"  removing {args.name!r}")
-        else:
-            entry = build_entry(args.exe, args.name, icon, wrapper, args.process)
-            if existing is not None:
-                old_name = shortcuts[existing].get("AppName") or args.name
-                if old_name in LEGACY_NAMES and old_name != args.name:
-                    entry = build_entry(args.exe, old_name, icon, wrapper,
-                                        args.process)
-                shortcuts[existing] = entry
-                print(f"  updating existing entry {existing} -> {entry['AppName']!r} ({args.exe})")
-            else:
-                index = next_index(shortcuts)
-                shortcuts[index] = entry
-                print(f"  adding entry {index}: {args.name!r} -> {args.exe}")
-                other = len(shortcuts) - 1
-                if other:
-                    print(f"  ({other} existing shortcut(s) preserved)")
-
-        save(path, obj, args.dry_run)
-
-    return 0
+        enqueue(spec)
+        print("Steam is running, so this is queued and will be written "
+              "when it next quits. Pass --force to write now (Steam will "
+              "discard it on exit).")
+        return 0
+    return apply_spec(spec, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

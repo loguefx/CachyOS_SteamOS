@@ -58,8 +58,21 @@ then press the Steam button twice to open gamescope on the new display.
 
 ## Install
 
-One command. **pacman** installs the packages; the script only clones this repo
-and copies files into your home directory.
+On CachyOS or Arch, the package is the path that updates with the system:
+
+```bash
+paru -S cachy-console-git
+cachy-console first-run
+```
+
+`first-run` enables the Steam-button and audio services, picks a display, and
+queues Exit / Discord / Spotify library tiles. Steam rewrites its shortcut file
+from memory when it quits, so those tiles are written the next time Steam is
+not running — you do not have to close it first.
+
+The older one-command home install still works. **pacman** installs the
+dependencies; the script clones this repo and copies files into your home
+directory.
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/loguefx/CachyOS_SteamOS/main/get.sh)
@@ -144,10 +157,13 @@ Either way you get your ordinary Steam back with it, minimised to the tray, so
 the next double press on the Steam button opens console mode again without your
 having to go and start Steam first. Turn that off with `RESTART_STEAM=off`.
 
-Run `cachy-console shortcut` while **Steam is closed** — Steam rewrites its
-shortcuts file from memory when it exits and would otherwise discard the entry.
-An older "Exit Game Mode" tile that still pointed at `projector-exit` is updated
-to `cachy-console-exit` by that same command.
+If Steam is running, `cachy-console shortcut` queues the entry and writes it
+the next time Steam is not — the watcher flushes that queue, and so does
+leaving console mode. You can still pass `--force` to write immediately, which
+Steam will discard when it exits. An older "Exit Game Mode" tile that still
+pointed at `projector-exit` is updated to `cachy-console-exit` by that same
+command. `cachy-console shortcut --queue-defaults` queues Exit, Discord and
+Spotify together.
 
 ### Voice chat
 

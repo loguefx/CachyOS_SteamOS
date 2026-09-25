@@ -15,6 +15,7 @@
 #   cachy-console controllers  list gamepads and the ones console mode hides
 #   cachy-console hide-controllers  hide those from games too (asks for your password)
 #   cachy-console shortcut     add "Exit Console Mode" to your Steam library
+#   cachy-console first-run    enable services, pick a display, queue couch tiles
 #   cachy-console restart-steam  bring the desktop Steam client back
 #   cachy-console help
 #
@@ -62,8 +63,15 @@ GS_PID=""
 # A bare soname, so the dynamic linker picks /usr/lib32 for Steam's 32-bit
 # client and /usr/lib for its 64-bit children with no arch-mismatch noise.
 EXTEST_LIB="${CACHY_CONSOLE_EXTEST:-libextest.so}"
-# lib/ and lib32/ builds of share/extest-init, made by install.sh.
-EXTEST_INIT_DIR="${CACHY_CONSOLE_EXTEST_INIT:-$HOME/.local/lib/cachy-console}"
+# lib/ and lib32/ builds of share/extest-init, made by install.sh or the package.
+EXTEST_INIT_DIR="${CACHY_CONSOLE_EXTEST_INIT:-}"
+if [[ -z "$EXTEST_INIT_DIR" ]]; then
+    if [[ -e "$HOME/.local/lib/cachy-console/lib32/libcachy-extest-init.so" ]]; then
+        EXTEST_INIT_DIR="$HOME/.local/lib/cachy-console"
+    else
+        EXTEST_INIT_DIR="/usr/lib/cachy-console"
+    fi
+fi
 
 # gamescope runs this script again as its child, to start Steam once the desktop
 # client is gone, so it needs a path that does not depend on the caller's cwd.
@@ -114,7 +122,7 @@ load_config() {
         case "$key" in
             DISPLAY|DISPLAY_MODEL|RESOLUTION|REFRESH|HDR|VRR|TRACKPAD_FIX|GRAB_CURSOR|RESTART_STEAM|EXTRA_GAMESCOPE_ARGS|AUDIO_DEVICE|AUDIO_INPUT_DEVICE|IGNORE_CONTROLLERS|PRIMARY_CONTROLLER|PRIMARY_ONLY|STEAM_PAD_AS_XBOX)
                 printf -v "CFG_$key" '%s' "$value" ;;
-            STEAM_BUTTON|AUDIO_FOCUS|AUDIO_NEVER_MUTE|AUDIO_PIN_VOICE) ;;   # read by the services, not by us
+            STEAM_BUTTON|AUDIO_FOCUS|AUDIO_NEVER_MUTE|AUDIO_PIN_VOICE|MOUSE_LAYOUT_APPS) ;;   # read by the services, not by us
             "") ;;
             *) warn "ignoring unknown setting in $CONFIG_FILE: $key" ;;
         esac
@@ -353,6 +361,14 @@ restart_desktop_steam() {
     # Still there, so a client is already running and there is nothing to
     # restore -- console mode was left without ever stopping this one.
     steam_running && return 0
+
+    # Steam is down, so queued library tiles can be written before it comes back
+    # and starts holding shortcuts.vdf again. Missing helper is not a relaunch
+    # failure: a test tree, or a half-install, still needs the desktop client.
+    local shortcut
+    shortcut="$(dirname -- "$SELF")/$NAME-shortcut"
+    [[ -x "$shortcut" ]] || shortcut="$(command -v "$NAME-shortcut" || true)"
+    [[ -n "$shortcut" ]] && "$shortcut" --flush >/dev/null || true
 
     local exit_helper
     exit_helper="$(find_helper "$NAME-exit")"
@@ -1026,6 +1042,56 @@ Pick a display; console mode will not choose one by itself."
     say "Check everything with:          $NAME status"
 }
 
+# A leftover ./install.sh copies into ~/.local/bin and user systemd units.
+# Those win over the package: PATH prefers ~/.local/bin, and a user unit
+# shadows /usr/lib/systemd/user. Only retire them when the package is present.
+retire_home_install() {
+    [[ -x /usr/bin/cachy-console ]] || return 0
+    local bin_dir="${XDG_BIN_HOME:-$HOME/.local/bin}"
+    local unit_dir="${XDG_DATA_HOME:-$HOME/.local/share}/systemd/user"
+    local removed=0 tool unit
+    for tool in cachy-console cachy-console-display cachy-console-watch \
+                cachy-console-audio cachy-console-exit cachy-console-shortcut \
+                cachy-console-app cachy-console-art cachy-console-settings \
+                cachy-console-session cachy-console-pads projector-exit; do
+        if [[ -e "$bin_dir/$tool" ]]; then
+            rm -f "$bin_dir/$tool"
+            removed=1
+        fi
+    done
+    for unit in cachy-console-watch.service cachy-console-audio.service; do
+        if [[ -e "$unit_dir/$unit" ]]; then
+            rm -f "$unit_dir/$unit"
+            removed=1
+        fi
+    done
+    if (( removed )); then
+        systemctl --user daemon-reload 2>/dev/null || true
+        say "  removed leftover home-install copies so /usr is what runs"
+    fi
+}
+
+first_run() {
+    say "== $NAME first-run =="
+    retire_home_install
+    systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY \
+        XDG_SESSION_TYPE XDG_CURRENT_DESKTOP 2>/dev/null || true
+    if systemctl --user list-unit-files cachy-console-watch.service >/dev/null 2>&1; then
+        systemctl --user daemon-reload
+        systemctl --user enable --now cachy-console-watch.service
+        systemctl --user enable --now cachy-console-audio.service
+        say "  services enabled"
+    else
+        warn "user services are not installed; run ./install.sh or install the package"
+    fi
+    if [[ -z "${CFG_DISPLAY}" || "${CFG_DISPLAY}" == auto ]]; then
+        setup
+    else
+        say "  display already saved: $CFG_DISPLAY"
+    fi
+    "$(find_helper "$NAME-shortcut")" --queue-defaults
+}
+
 # ---- status -------------------------------------------------------------
 
 status() {
@@ -1217,6 +1283,8 @@ status() {
         say "  (Steam's DevTools port is turned on when console mode next starts)"
     fi
     if is_on "$CFG_PRIMARY_ONLY" && [[ "${CFG_PRIMARY_CONTROLLER,,}" != off \
+            && ! -x /usr/lib/cachy-console/cachy-console-usb \
+            && ! -x /usr/libexec/cachy-console-usb \
             && ! -x /usr/local/libexec/cachy-console-usb ]]; then
         warn "PRIMARY_ONLY is on but the USB helper is not installed, so other"
         warn "controllers stay visible in games. Grant it with ./install.sh."
@@ -1318,7 +1386,7 @@ ARGS=()
 while (( $# )); do
     case "$1" in
         -h|--help|help)     usage ;;
-        start|setup|settings|status|check|displays|controllers|hide-controllers|exit|stop|shortcut|restart-steam|steam-in-session)
+        start|setup|settings|status|check|displays|controllers|hide-controllers|exit|stop|shortcut|first-run|restart-steam|steam-in-session)
                             COMMAND="$1" ;;
         --display)          DISPLAY_OVERRIDE="${2-}"; shift ;;
         --display=*)        DISPLAY_OVERRIDE="${1#*=}" ;;
@@ -1342,6 +1410,7 @@ case "$COMMAND" in
     hide-controllers) hide_controllers ;;
     exit|stop)  exec "$(find_helper "$NAME-exit")" ;;
     shortcut)   exec "$(find_helper "$NAME-shortcut")" "${ARGS[@]+"${ARGS[@]}"}" ;;
+    first-run)  first_run ;;
     # How cachy-console-watch puts the client back when it, and not this
     # script, is the one left alive after a session.
     restart-steam) restart_desktop_steam ;;

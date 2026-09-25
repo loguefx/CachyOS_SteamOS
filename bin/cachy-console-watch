@@ -508,6 +508,26 @@ def find_console():
     return _sibling_or_path("cachy-console")
 
 
+def pending_shortcuts_path():
+    root = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(root, "cachy-console", "pending-shortcuts.json")
+
+
+def maybe_flush_shortcuts(run=subprocess.run):
+    """Write queued library tiles once Steam is no longer holding the file."""
+    if not os.path.isfile(pending_shortcuts_path()):
+        return
+    try:
+        helper = _sibling_or_path("cachy-console-shortcut")
+    except SystemExit:
+        return
+    try:
+        run([helper, "--flush"], timeout=30,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def classify(win, bpm_re):
     if win is None:
         return "none"
@@ -860,7 +880,8 @@ def main():
 
     guide = GuideButtons()
     try:
-        run_loop(xprop, session, bpm_re, args, stopping, time.sleep, guide=guide)
+        run_loop(xprop, session, bpm_re, args, stopping, time.sleep, guide=guide,
+                 flush_shortcuts=maybe_flush_shortcuts)
     finally:
         guide.close()
     log("stopped.")
@@ -871,7 +892,8 @@ IDLE, STARTING, GAME = "idle", "starting", "game"
 
 
 def run_loop(xprop, session, bpm_re, args, stopping, sleep,
-             now=time.monotonic, announce=notify, guide=None):
+             now=time.monotonic, announce=notify, guide=None,
+             flush_shortcuts=None):
     """The state machine, kept separate so it can be driven by fakes in tests."""
     state = IDLE
     engage_streak = 0
@@ -941,6 +963,8 @@ def run_loop(xprop, session, bpm_re, args, stopping, sleep,
             scan = now() >= next_scan
             if scan:
                 next_scan = now() + 1.0
+                if flush_shortcuts:
+                    flush_shortcuts()
             if scan and session.running():
                 # Started by hand from a terminal, or left over from a restart.
                 log("tracking a gamescope session we did not start.")

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# One-command install for people who do not want the step-by-step.
+# One-command home install for people who do not want the AUR package.
 #
-# Packages come from pacman (CachyOS / Arch official repos). This script only
-# clones the repo and runs install.sh, which copies files into your home
-# directory. It is not a third-party package manager.
+# Prefer:  paru -S cachy-console-git && cachy-console first-run
+# This script is the fallback: pacman for dependencies, then clone the repo
+# and run install.sh into your home directory.
 #
 #   bash <(curl -fsSL https://raw.githubusercontent.com/loguefx/CachyOS_SteamOS/main/get.sh)
 #

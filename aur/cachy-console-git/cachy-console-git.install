@@ -1,0 +1,29 @@
+post_install() {
+    echo
+    echo "  cachy-console is installed. Finish the per-user setup with:"
+    echo
+    echo "    cachy-console first-run"
+    echo
+    echo "  That enables the Steam-button and audio services, picks a display"
+    echo "  if you have not already, and queues Exit / Discord / Spotify tiles"
+    echo "  so they are written the next time Steam is not running."
+    echo "  If you used ./install.sh before, first-run removes those home"
+    echo "  copies so /usr is what runs."
+    echo
+}
+
+post_upgrade() {
+    echo
+    echo "  Restart the user services so they pick up the new files:"
+    echo
+    echo "    systemctl --user daemon-reload"
+    echo "    systemctl --user try-restart cachy-console-watch.service cachy-console-audio.service"
+    echo
+}
+
+post_remove() {
+    echo
+    echo "  Config is left in ~/.config/cachy-console. Remove it if you want."
+    echo "  Steam library tiles (Exit, Discord, Spotify) are yours to delete."
+    echo
+}

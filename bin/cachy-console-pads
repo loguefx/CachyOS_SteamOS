@@ -39,8 +39,16 @@ STATE = os.path.join(os.environ.get("XDG_STATE_HOME")
 PS_SAVED = os.path.join(STATE, "ps-support-saved")
 HIDDEN = os.path.join(STATE, "hidden-controllers")
 USB_DEVICES = os.environ.get("CACHY_CONSOLE_USB_DEVICES", "/sys/bus/usb/devices")
-USB_HELPER = os.environ.get("CACHY_CONSOLE_USB_HELPER",
-                            "/usr/local/libexec/cachy-console-usb")
+def _default_usb_helper():
+    for path in ("/usr/lib/cachy-console/cachy-console-usb",
+                 "/usr/libexec/cachy-console-usb",
+                 "/usr/local/libexec/cachy-console-usb"):
+        if os.access(path, os.X_OK):
+            return path
+    return "/usr/local/libexec/cachy-console-usb"
+
+
+USB_HELPER = os.environ.get("CACHY_CONSOLE_USB_HELPER") or _default_usb_helper()
 PKEXEC = os.environ.get("CACHY_CONSOLE_PKEXEC", "pkexec")
 # A Steam Controller drops out of Steam's list for a moment as it wakes and
 # reconnects; the others only come back once player one has really gone.

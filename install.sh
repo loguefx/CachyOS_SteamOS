@@ -173,7 +173,11 @@ fi
 USB_HELPER=/usr/local/libexec/cachy-console-usb
 USB_ACTION=/usr/share/polkit-1/actions/org.cachyconsole.usb.policy
 USB_RULE=/etc/polkit-1/rules.d/50-cachy-console-usb.rules
-if [[ ! -x "$USB_HELPER" ]] || ! grep -q "subject.user == \"$USER\"" "$USB_RULE" 2>/dev/null; then
+if [[ -x /usr/lib/cachy-console/cachy-console-usb ]]; then
+    say
+    say "== hide other controllers =="
+    say "  using the USB helper from the package."
+elif [[ ! -x "$USB_HELPER" ]] || ! grep -q "subject.user == \"$USER\"" "$USB_RULE" 2>/dev/null; then
     say
     say "== hide other controllers =="
     say "  Console mode can switch every pad but player one off, so Big Picture"
@@ -221,8 +225,14 @@ if (( WITH_SETUP )); then
 fi
 
 say
+say "== library tiles =="
+# Steam rewrites shortcuts.vdf from memory on exit, so these are queued when
+# it is running and written the next time it is not.
+"$BIN_DIR/cachy-console-shortcut" --queue-defaults || true
+
+say
 say "Installed. Useful commands:"
     say "  cachy-console settings    open Cachy Console (pick or change the display)"
 say "  cachy-console status     check everything"
 say "  cachy-console exit       back to the desktop"
-say "  cachy-console shortcut   add a controller-clickable exit to your library"
+say "  cachy-console shortcut --queue-defaults   Exit, Discord, Spotify tiles"

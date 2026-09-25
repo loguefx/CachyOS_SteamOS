@@ -1,0 +1,7 @@
+// Packaged rule: any active local session may hide other controllers
+// while console mode runs, without a password prompt on each start.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.cachyconsole.usb" && subject.local && subject.active) {
+        return polkit.Result.YES;
+    }
+});

@@ -1,0 +1,31 @@
+# Maintainer: loguefx <https://github.com/loguefx>
+pkgname=cachy-console-git
+pkgver=0
+pkgrel=1
+pkgdesc="Steam Big Picture in gamescope on one display, from the Steam button"
+arch=('x86_64')
+url="https://github.com/loguefx/CachyOS_SteamOS"
+license=('MIT')
+depends=('steam' 'gamescope' 'sdl2' 'libpulse' 'xorg-xprop' 'tk' 'python' 'polkit')
+optdepends=(
+    'python-pillow: artwork for Discord, Spotify and Exit library tiles'
+    'libextest-git: trackpad mouse on a gamescope built without libeis'
+    'discord: couch voice-chat tile'
+    'spotify-launcher: couch music tile'
+)
+makedepends=('git' 'gcc' 'lib32-glibc')
+provides=('cachy-console')
+conflicts=('cachy-console')
+install=cachy-console-git.install
+source=("git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd CachyOS_SteamOS
+    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+package() {
+    cd CachyOS_SteamOS
+    DESTDIR="$pkgdir" PREFIX=/usr bash ./packaging/install-files.sh
+}
