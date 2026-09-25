@@ -745,6 +745,19 @@ cachy-console-pads list     # each controller's player slot (0 is player one)
 grep cachy-console-pads "$XDG_RUNTIME_DIR/cachy-console-session.log"
 ```
 
+**An older game ignores the controller that works in Big Picture.** Some games
+only accept gamepads whose USB id they know, and Steam's virtual pad (`28de:11ff`)
+is not one of them; Dead Rising 2 is one ("Unsupported gamepad"), with its own
+*Controller* switch in PC Settings greyed out. Proton can present the pad as an
+Xbox 360 controller instead — set this as the game's launch options:
+
+```text
+PROTON_SPOOF_STEAMINPUT_VIDPID=1 %command%
+```
+
+Proton already does this itself for a few titles; it is per game, not a session
+setting, because every other game is better off seeing the real pad.
+
 **The cursor works in Big Picture but stops in Discord.** That is Discord's
 controller layout, not the cursor: with none chosen it is a gamepad layout.
 The startup output should say `Discord (…): trackpad mouse layout in …` the first
