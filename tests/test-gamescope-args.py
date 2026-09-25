@@ -123,6 +123,7 @@ exit 0
 """
 
 PGREP = """#!/bin/bash
+[[ "$1" == -P ]] && exec /usr/bin/pgrep "$@"
 [[ "$*" == "-x steam" && -f "$CACHY_TEST_STATE/desktop-steam" ]] && exit 0
 exit 1
 """
@@ -132,7 +133,7 @@ class World:
     """A cachy-console with fake helpers beside it and a config of our own."""
 
     def __init__(self, config="", strict_fails=0, answer2=None, flip_after=None,
-                 desktop_steam=False):
+                 desktop_steam=False, extest_guard=True):
         self.dir = tempfile.mkdtemp(prefix="cachy-args-")
         self.bin = os.path.join(self.dir, "bin")
         os.makedirs(self.bin)
@@ -159,6 +160,11 @@ class World:
                 fh.write(body)
             os.chmod(path, 0o755)
 
+        self.guard = os.path.join(self.dir, "guard")
+        if extest_guard:
+            os.makedirs(os.path.join(self.guard, "lib32"))
+            self.write(os.path.join(self.guard, "lib32", "libcachy-extest-init.so"), "")
+
         conf_dir = os.path.join(self.dir, "config", "cachy-console")
         os.makedirs(conf_dir)
         with open(os.path.join(conf_dir, "config"), "w") as fh:
@@ -179,6 +185,8 @@ class World:
         # Nothing on this desk's real screen is to be taken for Big Picture.
         env["CACHY_CONSOLE_BPM_PATTERN"] = "^cachy-test-never-matches$"
         env["CACHY_CONSOLE_STEAM_TIMEOUT"] = "1"
+        env["CACHY_CONSOLE_EXTEST_INIT"] = self.guard
+        env["WAYLAND_DISPLAY"] = "wayland-desk"
         return env
 
     def read(self, name):
@@ -258,9 +266,25 @@ def preloaded(argv):
 # that is not installed, and refusing to is the correct behaviour there.
 if os.path.exists("/usr/lib/libextest.so") or os.path.exists("/usr/lib32/libextest.so"):
     w = World("DISPLAY=HDMI-A-1\n")
+    argv = w.argv()
     check("extest is preloaded into Steam by default, since XTEST alone moves "
-          "nothing a client can see",
-          preloaded(w.argv()), ["CACHY_CONSOLE_PRELOAD=libextest.so"])
+          "nothing a client can see, with the guard in front of it",
+          preloaded(argv),
+          [f"CACHY_CONSOLE_PRELOAD={w.guard}/$LIB/libcachy-extest-init.so:libextest.so"])
+    check("and the guard is told the desktop's compositor, the one extest can "
+          "size its device against",
+          [a for a in argv if a.startswith("CACHY_CONSOLE_EXTEST_WAYLAND=")],
+          ["CACHY_CONSOLE_EXTEST_WAYLAND=wayland-desk"])
+    check("while Steam itself still gets no WAYLAND_DISPLAY",
+          "WAYLAND_DISPLAY" in argv[argv.index("-u") + 1:argv.index("-u") + 2], True)
+    w.clean()
+
+    w = World("DISPLAY=HDMI-A-1\n", extest_guard=False)
+    argv = w.argv()
+    check("without the guard extest is left off: alone, it aborts Steam at the "
+          "first trackpad movement",
+          preloaded(argv), [])
+    check("and says why", "extest guard is not built" in w.output, True)
     w.clean()
 else:
     print("  SKIP  extest is not installed here")
@@ -348,8 +372,62 @@ check("Steam in the session still plays and listens where the settings say",
       [e for e in got if e.startswith("PULSE_")],
       ["PULSE_SINK=alsa_output.fake", "PULSE_SOURCE=alsa_input.fake"])
 if os.path.exists("/usr/lib/libextest.so") or os.path.exists("/usr/lib32/libextest.so"):
-    check("and has extest preloaded, under its real name and nowhere else",
-          [e for e in got if "PRELOAD" in e], ["LD_PRELOAD=libextest.so"])
+    check("and has extest preloaded behind its guard, under its real name and "
+          "nowhere else",
+          [e for e in got if "PRELOAD" in e],
+          [f"LD_PRELOAD={w.guard}/$LIB/libcachy-extest-init.so:libextest.so"])
+w.clean()
+
+print()
+print("Steam exits and leaves something behind")
+# A Steam that crashed used to leave its apps re-parented to gamescopereaper,
+# which waits for them, so the session stayed up frozen on their last frame.
+w = World("DISPLAY=HDMI-A-1\n")
+# Like the real one: a subreaper, so what Steam leaves behind becomes its child,
+# and it only returns once every child has gone.
+reaper = os.path.join(w.dir, "gamescopereaper")
+with open(reaper + ".c", "w") as fh:
+    fh.write("""
+#include <sys/prctl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    prctl(PR_SET_CHILD_SUBREAPER, 1);
+    if (fork() == 0) { execv(argv[1], argv + 1); _exit(127); }
+    while (wait(NULL) > 0) {}
+    return 0;
+}
+""")
+built = subprocess.run(["gcc", "-o", reaper, reaper + ".c"],
+                       capture_output=True).returncode == 0
+if not built:
+    print("  SKIP  no gcc to build a stand-in gamescopereaper")
+else:
+    with open(os.path.join(w.bin, "steam"), "w") as fh:
+        fh.write('#!/bin/bash\n(exec -a orphan-app sleep 300 >/dev/null 2>&1 &)\n'
+                 'exit 134\n')
+    try:
+        res = subprocess.run([reaper, os.path.join(w.bin, "cachy-console"),
+                              "steam-in-session"],
+                             capture_output=True, text=True, timeout=30, env=w.env())
+        closed, said = True, res.stdout + res.stderr
+    except subprocess.TimeoutExpired:
+        closed, said = False, ""
+    check("what Steam left running is closed once Steam has gone, so the "
+          "session can end", closed, True)
+    check("and a crash is said out loud", "Steam exited with status 134" in said, True)
+    subprocess.run(["pkill", "-f", "^orphan-app"])
+w.clean()
+
+w = World("DISPLAY=HDMI-A-1\n")
+with open(os.path.join(w.bin, "steam"), "w") as fh:
+    fh.write('#!/bin/bash\n(exec -a orphan-app-2 sleep 300 >/dev/null 2>&1 &)\nexit 0\n')
+subprocess.run([os.path.join(w.bin, "cachy-console"), "steam-in-session"],
+               capture_output=True, text=True, timeout=60, env=w.env())
+left = subprocess.run(["pgrep", "-f", "^orphan-app-2"], capture_output=True).returncode == 0
+check("outside gamescope nothing is touched, since the parent is not its reaper",
+      left, True)
+subprocess.run(["pkill", "-f", "^orphan-app-2"])
 w.clean()
 
 w = World("DISPLAY=HDMI-A-1\n")

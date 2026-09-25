@@ -92,6 +92,30 @@ EOF
 chmod 755 "$BIN_DIR/projector-exit"
 printf '  %s -> %s (compat)\n' "projector-exit" "$BIN_DIR"
 
+# libextest aborts Steam at the first trackpad movement in console mode unless
+# this is loaded ahead of it; console mode leaves extest off when it is missing.
+# The Steam client is 32-bit, so the lib32 build is the one that matters.
+EXTEST_INIT_DIR="$HOME/.local/lib/cachy-console"
+EXTEST_INIT_SRC="$SRC/share/extest-init/cachy-extest-init.c"
+extest_built=1
+for arch in lib:-m64 lib32:-m32; do
+    dir="$EXTEST_INIT_DIR/${arch%%:*}"
+    mkdir -p "$dir"
+    if ! cc "${arch#*:}" -O2 -shared -fPIC -o "$dir/libcachy-extest-init.so.new" \
+            "$EXTEST_INIT_SRC" -ldl 2>/dev/null; then
+        extest_built=0
+        rm -f "$dir/libcachy-extest-init.so.new"
+        continue
+    fi
+    mv -f "$dir/libcachy-extest-init.so.new" "$dir/libcachy-extest-init.so"
+done
+if (( extest_built )); then
+    printf '  %s -> %s\n' "extest guard" "$EXTEST_INIT_DIR"
+else
+    say "  could not build the extest guard (needs gcc and lib32-glibc); console"
+    say "  mode will leave the trackpad fix off rather than let it crash Steam"
+fi
+
 mkdir -p "$APP_DIR"
 install -m644 "$SRC/share/applications/cachy-console.desktop" "$APP_DIR/"
 install -m644 "$SRC/share/applications/cachy-console-settings.desktop" "$APP_DIR/"

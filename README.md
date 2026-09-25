@@ -166,7 +166,7 @@ way around it: gamescope cannot adopt a window from another compositor, so Steam
 has to be relaunched as its child. What there *is* a way around is waiting for
 the old client to finish quitting before anything appears. gamescope is started
 straight away, with a small launcher as its child in place of Steam; the
-launcher waits for the desktop client to exit and then becomes the new one. So
+launcher waits for the desktop client to exit and then starts the new one. So
 the chosen screen goes black and belongs to console mode within a couple of
 seconds of the press, and Steam's own shutdown (often ten seconds or more)
 happens behind it instead of in front of it. Before this, the whole chain was
@@ -555,6 +555,25 @@ and file capabilities put a process into glibc's secure-execution mode, where
 ignore it there, it *strips* it from the environment so it cannot reach children
 — so an exported one reaches neither gamescope nor the Steam it starts, with the
 only clue a single `cannot be preloaded` line.
+
+**Why extest has a guard in front of it.** libextest sizes its device from the
+Wayland outputs, once, on the first XTEST call — the first time the trackpad
+moves. Inside console mode that lookup cannot succeed: Steam gets no
+`WAYLAND_DISPLAY` (with gamescope's own socket, games show a Vulkan error), and
+gamescope's socket has no `zxdg_output_manager_v1` anyway. libextest panics on
+either, the panic aborts Steam, and Steam Input goes with it, so the touch
+you'd feel on the pad and the cursor both stop. Whatever Steam had started
+(Discord, say) is then left orphaned in a session with nothing to draw it.
+
+`libcachy-extest-init.so`, built by `install.sh` into
+`~/.local/lib/cachy-console/{lib,lib32}` and preloaded ahead of libextest, does
+that lookup at Steam's start instead. It points it at the desktop compositor,
+KWin, and then takes the variable away again, so Steam and its games still see
+no `WAYLAND_DISPLAY`. It only acts inside the 32-bit Steam client and only when
+the desktop socket answers. If it isn't built, extest is left off and `status`
+says so, because a trackpad that does nothing is better than one that crashes
+Steam. Separately, when Steam exits inside the session, whatever it left running
+is closed, so gamescope ends instead of freezing on the last frame.
 
 **The trackpad prompt.** Steam drives the controller trackpad through XTEST. On
 Wayland, XWayland turns that into an xdg-desktop-portal request — the "allow

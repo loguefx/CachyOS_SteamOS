@@ -58,6 +58,8 @@ GS_PID=""
 # A bare soname, so the dynamic linker picks /usr/lib32 for Steam's 32-bit
 # client and /usr/lib for its 64-bit children with no arch-mismatch noise.
 EXTEST_LIB="${CACHY_CONSOLE_EXTEST:-libextest.so}"
+# lib/ and lib32/ builds of share/extest-init, made by install.sh.
+EXTEST_INIT_DIR="${CACHY_CONSOLE_EXTEST_INIT:-$HOME/.local/lib/cachy-console}"
 
 # gamescope runs this script again as its child, to start Steam once the desktop
 # client is gone, so it needs a path that does not depend on the caller's cwd.
@@ -408,8 +410,17 @@ extest_available() {
     [[ -e /usr/lib32/libextest.so || -e /usr/lib/libextest.so ]]
 }
 
+# libextest makes its device on the first fake input and unwraps a Wayland
+# connection to size it. Steam here has no WAYLAND_DISPLAY, so that first
+# trackpad movement aborted the whole client, taking Steam Input and the
+# session's apps down with it. The guard builds the device at Steam's start,
+# against the desktop's compositor, and without it extest is not preloaded.
+extest_guard_available() {
+    [[ -e "$EXTEST_INIT_DIR/lib32/libcachy-extest-init.so" ]]
+}
+
 extest_wanted() {
-    is_on "$CFG_TRACKPAD_FIX" && extest_available
+    is_on "$CFG_TRACKPAD_FIX" && extest_available && extest_guard_available
 }
 
 # extest writes its events to /dev/uinput, and a kernel with no rule granting it
@@ -424,6 +435,12 @@ warn_extest() {
     if ! extest_available; then
         warn "TRACKPAD_FIX is on but libextest is not installed."
         warn "install it with: paru -S libextest-git   (or yay -S libextest-git)"
+        return 0
+    fi
+    if ! extest_guard_available; then
+        warn "TRACKPAD_FIX is on but the extest guard is not built, and without it"
+        warn "libextest crashes Steam at the first trackpad movement. Leaving it off;"
+        warn "run install.sh again to build it (needs gcc and lib32-glibc)."
         return 0
     fi
     uinput_writable && return 0
@@ -498,7 +515,12 @@ gamescope_argv() {
     # it reached neither gamescope nor the Steam it starts, and the trackpad moved
     # nothing at all. It travels under a name of our own instead, and
     # steam-in-session puts it on Steam alone, the only process making XTEST calls.
-    extest_wanted && out+=("CACHY_CONSOLE_PRELOAD=${EXTEST_LIB}")
+    # $LIB is left for the dynamic linker, which picks lib32/ for the 32-bit
+    # client and lib/ for anything 64-bit that inherits it.
+    if extest_wanted; then
+        out+=("CACHY_CONSOLE_PRELOAD=${EXTEST_INIT_DIR}/\$LIB/libcachy-extest-init.so:${EXTEST_LIB}"
+              "CACHY_CONSOLE_EXTEST_WAYLAND=${WAYLAND_DISPLAY:-wayland-0}")
+    fi
 
     # Not Steam itself: gamescope starts while the desktop client is still
     # quitting, so the screen changes the moment the button is pressed rather
@@ -570,12 +592,40 @@ steam_in_session() {
     # ours to change in this gap between the two clients.
     "$HELPER_DISPLAY" pad-layouts || warn "could not set the trackpad mouse layouts"
     route_audio
+    local status=0
     if [[ -n "${CACHY_CONSOLE_PRELOAD:-}" ]]; then
-        exec env -u CACHY_CONSOLE_PRELOAD \
+        env -u CACHY_CONSOLE_PRELOAD \
             "LD_PRELOAD=${CACHY_CONSOLE_PRELOAD}${LD_PRELOAD:+:$LD_PRELOAD}" \
-            steam -gamepadui
+            steam -gamepadui || status=$?
+    else
+        steam -gamepadui || status=$?
     fi
-    exec steam -gamepadui
+    close_leftovers "$status"
+}
+
+# gamescope ends with its primary child, but that child is gamescopereaper, which
+# waits for everything below it -- and whatever Steam started is re-parented to
+# it when Steam goes. So a Steam that crashed left the session up with nothing
+# in it: Discord's last frame frozen on screen, no Big Picture and no exit tile.
+# Once Steam has exited, for whatever reason, what it left behind is closed too.
+close_leftovers() {
+    local status="$1" reaper="$PPID" comm pids i
+    comm="$(cat "/proc/$reaper/comm" 2>/dev/null || true)"
+    [[ "$comm" == gamescopereaper ]] || return 0
+    pids="$(pgrep -P "$reaper" 2>/dev/null | grep -vx "$$" | paste -sd' ' - || true)"
+    [[ -n "$pids" ]] || return 0
+    if (( status != 0 )); then
+        warn "Steam exited with status $status; closing what it left running"
+    fi
+    # shellcheck disable=SC2086
+    kill -TERM $pids 2>/dev/null || true
+    for i in $(seq 1 50); do
+        pids="$(pgrep -P "$reaper" 2>/dev/null | grep -vx "$$" | paste -sd' ' - || true)"
+        [[ -n "$pids" ]] || return 0
+        sleep 0.1
+    done
+    # shellcheck disable=SC2086
+    kill -KILL $pids 2>/dev/null || true
 }
 
 start_console() {
@@ -596,6 +646,7 @@ It will not choose a screen for you."
     gamescope_argv argv
 
     if (( DRY_RUN )); then
+        warn_extest
         say "Would run:"
         say "  ${argv[*]}"
         say "  HDMI audio:"
@@ -959,6 +1010,11 @@ status() {
             fi
             if ! uinput_writable; then
                 warn "/dev/uinput is not writable, so extest cannot inject input."
+                warnings=$(( warnings + 1 ))
+            fi
+            if extest_available && ! extest_guard_available; then
+                warn "the extest guard is not built, so extest is left off: alone it"
+                warn "crashes Steam at the first trackpad movement. Run install.sh again."
                 warnings=$(( warnings + 1 ))
             fi
         else

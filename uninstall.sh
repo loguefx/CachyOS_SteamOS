@@ -41,6 +41,7 @@ for tool in cachy-console cachy-console-display cachy-console-watch \
     fi
 done
 rm -f "$BIN_DIR/projector-exit"
+rm -rf "$HOME/.local/lib/cachy-console"
 
 rm -f "$APP_DIR/cachy-console.desktop" "$APP_DIR/cachy-console-settings.desktop"
 rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/cachy-console-session-env.desktop"
