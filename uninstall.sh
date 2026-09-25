@@ -55,7 +55,11 @@ else
 fi
 
 say
-say "Three things this cannot undo for you:"
+say "Four things this cannot undo for you:"
+say "  - the udev rule from cachy-console hide-controllers, if you ran it. Empty"
+say "    IGNORE_CONTROLLERS and run it again before uninstalling, or afterwards:"
+say "      sudo rm /etc/udev/rules.d/70-cachy-console-hide-controllers.rules"
+say "    and unplug the device once to get its gamepad back."
 say "  - Steam's DevTools port, turned on for the player-one setting. If nothing"
 say "    else uses it (Decky Loader does), turn it off and restart Steam:"
 say "      rm ~/.local/share/Steam/.cef-enable-remote-debugging"

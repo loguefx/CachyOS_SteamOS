@@ -1174,6 +1174,73 @@ def cmd_controllers(args):
     return 0
 
 
+# IGNORE_CONTROLLERS reaches Steam, but not the games it starts: Steam replaces
+# SDL_GAMECONTROLLER_IGNORE_DEVICES in a game's environment with its own list,
+# and that list is the only per-device filter Proton's input bus has. So a
+# keyboard's gamepad mode stays a controller to every Proton game. Where that
+# gamepad is its own Xbox-protocol USB interface -- vendor class ff, subclass
+# 5d (Xbox 360) or 47 (Xbox One) -- udev can switch off that interface alone,
+# which removes the pad from everything while the keyboard's HID interfaces
+# carry on typing.
+UDEV_RULES = "/etc/udev/rules.d/70-cachy-console-hide-controllers.rules"
+XBOX_SUBCLASSES = ("5d", "47")
+USB_DEVICES = os.environ.get("CACHY_CONSOLE_USB_DEVICES", "/sys/bus/usb/devices")
+
+
+def hide_rules(pairs):
+    """The udev rules for pairs, or "" when there is nothing to hide."""
+    if not pairs:
+        return ""
+    lines = ["# Written by cachy-console hide-controllers from IGNORE_CONTROLLERS.",
+             "# Switches off only the Xbox-protocol interface, so a keyboard keeps typing."]
+    for vendor, product in sorted(pairs):
+        lines.append(
+            'ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", '
+            f'ATTRS{{idVendor}}=="{vendor}", ATTRS{{idProduct}}=="{product}", '
+            'ATTR{bInterfaceClass}=="ff", '
+            f'ATTR{{bInterfaceSubClass}}=="{"|".join(XBOX_SUBCLASSES)}", '
+            'ATTR{authorized}="0"')
+    return "\n".join(lines) + "\n"
+
+
+def xbox_interfaces():
+    """[(interface dir, (vendor, product), authorized)] for every connected
+    Xbox-protocol USB interface."""
+    def read(path):
+        try:
+            with open(path) as fh:
+                return fh.read().strip().lower()
+        except OSError:
+            return ""
+
+    found = []
+    for iface in sorted(glob.glob(os.path.join(USB_DEVICES, "*:*"))):
+        if read(os.path.join(iface, "bInterfaceClass")) != "ff":
+            continue
+        if read(os.path.join(iface, "bInterfaceSubClass")) not in XBOX_SUBCLASSES:
+            continue
+        device = os.path.join(USB_DEVICES, os.path.basename(iface).split(":")[0])
+        ids = (read(os.path.join(device, "idVendor")), read(os.path.join(device, "idProduct")))
+        found.append((iface, ids, read(os.path.join(iface, "authorized")) != "0"))
+    return found
+
+
+def cmd_hide_rules(args):
+    sys.stdout.write(hide_rules(ignored_pairs(saved_ignored_controllers())))
+    return 0
+
+
+def cmd_hide_interfaces(args):
+    """Interfaces to switch off now (or, with --restore, back on): listed ones
+    still on, or unlisted ones a previous list switched off."""
+    ignored = ignored_pairs(saved_ignored_controllers())
+    for iface, ids, on in xbox_interfaces():
+        listed = ids in ignored
+        if (args.restore and not listed and not on) or (not args.restore and listed and on):
+            print(iface)
+    return 0
+
+
 # Right trackpad moves the pointer and clicks when pressed, right trigger is a
 # left click, left trigger a right click, left trackpad scrolls.
 MOUSE_TEMPLATE = "controller_neptune_webbrowser.vdf"
@@ -1528,6 +1595,16 @@ def main():
     sub.add_parser("controllers",
                    help="gamepads and which ones console mode hides") \
         .set_defaults(func=cmd_controllers)
+
+    sub.add_parser("hide-rules",
+                   help="udev rules that switch off listed controllers' Xbox interfaces") \
+        .set_defaults(func=cmd_hide_rules)
+
+    p = sub.add_parser("hide-interfaces",
+                       help="connected Xbox interfaces to switch off now")
+    p.add_argument("--restore", action="store_true",
+                   help="instead, the ones to switch back on")
+    p.set_defaults(func=cmd_hide_interfaces)
 
     p = sub.add_parser("pad-layouts",
                        help="give MOUSE_LAYOUT_APPS a trackpad mouse layout "

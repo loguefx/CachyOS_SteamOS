@@ -393,7 +393,7 @@ edit by hand:
 | `AUDIO_NEVER_MUTE` | `Discord, Spotify` | Left audible even though Steam started it. Comma-separated names or appids. Read by the audio service, so restart it after editing |
 | `AUDIO_PIN_VOICE` | `on` | Hold those streams on `AUDIO_DEVICE` / `AUDIO_INPUT_DEVICE`, moving them back if the app sends them elsewhere. Only while a session is running |
 | `AUDIO_INPUT_DEVICE` | *(session default)* | Microphone for console mode, e.g. `HyperX Cloud III S Wireless`. Empty leaves input alone |
-| `IGNORE_CONTROLLERS` | empty | Devices console mode should not treat as gamepads, as `0x31e3/0x1400`, comma separated. List them with `cachy-console controllers` |
+| `IGNORE_CONTROLLERS` | empty | Devices console mode should not treat as gamepads, as `0x31e3/0x1400`, comma separated. List them with `cachy-console controllers`. Hides them from Steam only; `cachy-console hide-controllers` hides them from games too |
 | `PRIMARY_CONTROLLER` | `steam` | Which controller is player one when several are connected: `steam`, `playstation`, `xbox`, `switch`, or `off` for Steam's own order. Also in Cachy Console |
 | `STEAM_PAD_AS_XBOX` | `on` | Show games Steam's controller as an Xbox 360 pad (`045e:028e`) instead of Steam's own virtual pad (`28de:11ff`), which older games that only accept pads they know refuse — Dead Rising 2 among them. Off only for a game that needs to see the real Steam pad |
 | `EXTRA_GAMESCOPE_ARGS` | empty | Passed straight through, e.g. `--mangoapp` |
@@ -527,14 +527,32 @@ Input's virtual pad cannot appear until Steam is up and therefore always lands
 behind it. The symptom is a controller that moves nothing in the menus because
 it is player two, and a player one that is a keyboard pretending to be a pad.
 `IGNORE_CONTROLLERS` hides such a device by USB id, via SDL's own ignore list,
-which is what both Steam and Proton's controller layer read. It is appended to
-rather than replacing what Steam puts there, since Steam uses the same list to
-hide the physical controller it presents through Steam Input. This applies to
-console mode only, so the device is still a gamepad on the desktop:
+which is what Steam reads. It is appended to rather than replacing what Steam
+puts there, since Steam uses the same list to hide the physical controller it
+presents through Steam Input. This applies to console mode only, so the device
+is still a gamepad on the desktop:
 
 ```bash
 cachy-console controllers   # names, USB ids, and which slot each one holds
 ```
+
+That hides it from Steam, not from the games Steam starts. Steam writes its own
+list into every game's environment, replacing this one, and that variable is
+the only per-device filter Proton's input layer has — so under Proton the
+keyboard is still an Xbox pad, and can still be player one. For a device whose
+gamepad is its own Xbox-protocol USB interface, as the Wooting's is (a separate
+`xpad` interface beside the keyboard's HID ones), this hides it from everything:
+
+```bash
+cachy-console hide-controllers   # asks for your password once
+```
+
+It writes a udev rule switching off just that interface for each device in
+`IGNORE_CONTROLLERS`, and switches it off now. The keyboard keeps typing; the
+pad is gone system-wide, desktop included, which is the point for a keyboard
+that is only ever a keyboard. Take the id out of the list and run it again to
+get the pad back. A device whose gamepad shares a HID interface with its keys
+cannot be split this way, and is left alone.
 
 **Steam Controller first, even with a DualSense connected.** Among real
 controllers, Steam gives out player slots in the order the controllers turn up.
@@ -735,7 +753,9 @@ cachy-console controllers   # the one on js0 is player one
 ```
 
 Put that device's USB id in `IGNORE_CONTROLLERS`, then exit and Steam-button
-twice. It stays a gamepad on the desktop.
+twice. It stays a gamepad on the desktop. If it is still player one inside
+games, run `cachy-console hide-controllers`; Steam does not pass the list on to
+them.
 
 **The Steam Controller does nothing in a game while a DualSense is on.** The
 DualSense has player one. Check that *Player one* in Cachy Console (or

@@ -13,6 +13,7 @@
 #   cachy-console status       check the setup and show what would run
 #   cachy-console displays     list displays, their modes and gamescope indices
 #   cachy-console controllers  list gamepads and the ones console mode hides
+#   cachy-console hide-controllers  hide those from games too (asks for your password)
 #   cachy-console shortcut     add "Exit Console Mode" to your Steam library
 #   cachy-console restart-steam  bring the desktop Steam client back
 #   cachy-console help
@@ -1197,6 +1198,60 @@ status() {
     say "No problems. $warnings warning(s)."
 }
 
+# ---- hiding controllers from games -----------------------------------------
+
+# IGNORE_CONTROLLERS only reaches Steam: Steam rewrites the same list in every
+# game's environment, so under Proton a keyboard's gamepad mode is still a pad,
+# and can take player one. This makes the list stick below Steam, as a udev rule
+# that switches off just the listed devices' Xbox-protocol USB interface, and
+# applies it now as well as from the next plug-in. It is system-wide -- the pad
+# is gone from the desktop too -- and running it again after emptying the list
+# takes the rule out and switches those interfaces back on.
+HIDE_RULES="/etc/udev/rules.d/70-cachy-console-hide-controllers.rules"
+
+hide_controllers() {
+    local tmp hide=() restore=()
+    tmp="$(mktemp)" || die "cannot make a temporary file"
+    "$HELPER_DISPLAY" hide-rules >"$tmp" || { rm -f "$tmp"; die "could not build the rules"; }
+    mapfile -t hide < <("$HELPER_DISPLAY" hide-interfaces)
+    mapfile -t restore < <("$HELPER_DISPLAY" hide-interfaces --restore)
+
+    if [[ -s "$tmp" ]]; then
+        say "Hiding from everything, including games: ${CFG_IGNORE_CONTROLLERS}"
+    else
+        say "IGNORE_CONTROLLERS is empty, so nothing is hidden below Steam."
+    fi
+    (( ${#hide[@]} )) && say "  switching off now: ${hide[*]}"
+    (( ${#restore[@]} )) && say "  switching back on: ${restore[*]}"
+    if (( DRY_RUN )); then
+        say "Would write $HIDE_RULES:"; sed 's/^/  /' "$tmp"
+        rm -f "$tmp"; return 0
+    fi
+    if [[ ! -s "$tmp" && ! -e "$HIDE_RULES" && ${#restore[@]} -eq 0 ]]; then
+        rm -f "$tmp"; return 0
+    fi
+    have pkexec || { rm -f "$tmp"; die "needs pkexec (polkit) to write $HIDE_RULES"; }
+
+    # One root shell, so one password prompt. The paths come from sysfs via the
+    # helper, and are checked again here before anything is written to them.
+    local split=$(( ${#hide[@]} + 4 )) status=0
+    # shellcheck disable=SC2016
+    pkexec /bin/sh -c '
+        tmp=$1 rules=$2 split=$3; shift 3
+        if [ -s "$tmp" ]; then install -m 0644 "$tmp" "$rules"; else rm -f "$rules"; fi
+        udevadm control --reload
+        i=4
+        for iface in "$@"; do
+            case "$iface" in /sys/bus/usb/devices/*:*) ;; *) exit 2 ;; esac
+            if [ "$i" -lt "$split" ]; then echo 0; else echo 1; fi >"$iface/authorized"
+            i=$((i + 1))
+        done' sh "$tmp" "$HIDE_RULES" "$split" "${hide[@]+"${hide[@]}"}" \
+        "${restore[@]+"${restore[@]}"}" || status=$?
+    rm -f "$tmp"
+    (( status == 0 )) || die "not changed (pkexec exited $status)"
+    say "Done. The keyboard keeps typing; its gamepad is gone until you run this again with it unlisted."
+}
+
 # ---- main ---------------------------------------------------------------
 
 COMMAND=start
@@ -1205,7 +1260,7 @@ ARGS=()
 while (( $# )); do
     case "$1" in
         -h|--help|help)     usage ;;
-        start|setup|settings|status|check|displays|controllers|exit|stop|shortcut|restart-steam|steam-in-session)
+        start|setup|settings|status|check|displays|controllers|hide-controllers|exit|stop|shortcut|restart-steam|steam-in-session)
                             COMMAND="$1" ;;
         --display)          DISPLAY_OVERRIDE="${2-}"; shift ;;
         --display=*)        DISPLAY_OVERRIDE="${1#*=}" ;;
@@ -1226,6 +1281,7 @@ case "$COMMAND" in
     status|check) status ;;
     displays)   "$HELPER_DISPLAY" list ;;
     controllers) "$HELPER_DISPLAY" controllers ;;
+    hide-controllers) hide_controllers ;;
     exit|stop)  exec "$(find_helper "$NAME-exit")" ;;
     shortcut)   exec "$(find_helper "$NAME-shortcut")" "${ARGS[@]+"${ARGS[@]}"}" ;;
     # How cachy-console-watch puts the client back when it, and not this

@@ -21,6 +21,7 @@ loader = importlib.machinery.SourceFileLoader("cd", TARGET)
 spec = importlib.util.spec_from_loader("cd", loader)
 cd = importlib.util.module_from_spec(spec)
 loader.exec_module(cd)
+REAL_GLOB = cd.glob.glob
 
 FAILURES = []
 
@@ -181,6 +182,79 @@ check("and once Steam presents a pad for it, it is awake",
 fake_devices(OTHER, [{"virtual": False}])
 check("no dongle at all is not a sleeping controller, it is someone else's "
       "setup", cd.steam_controller_asleep(), False)
+
+
+print()
+print("hiding a listed pad from games, below Steam")
+
+# Steam rewrites SDL_GAMECONTROLLER_IGNORE_DEVICES for every game it starts, so
+# IGNORE_CONTROLLERS alone leaves a keyboard's gamepad visible to Proton. The
+# rule switches off that pad's own USB interface and nothing else.
+cd.glob.glob = REAL_GLOB
+rules = cd.hide_rules({("31e3", "1400")})
+rule = [line for line in rules.splitlines() if not line.startswith("#")]
+check("one rule per listed device", len(rule), 1)
+check("matching the device by its ids", 'ATTRS{idVendor}=="31e3"' in rule[0]
+      and 'ATTRS{idProduct}=="1400"' in rule[0], True)
+check("but acting only on an Xbox-protocol interface, so the keyboard's HID "
+      "interfaces keep typing",
+      'ATTR{bInterfaceClass}=="ff"' in rule[0]
+      and 'ATTR{bInterfaceSubClass}=="5d|47"' in rule[0], True)
+check("which it switches off rather than unbinding a driver",
+      rule[0].endswith('ATTR{authorized}="0"'), True)
+check("and an empty list writes no rules at all, so the file is removed",
+      cd.hide_rules(set()), "")
+
+
+def fake_usb(interfaces):
+    """A throwaway /sys/bus/usb/devices with devices and their interfaces."""
+    root = tempfile.mkdtemp()
+    for name, attrs in interfaces.items():
+        path = os.path.join(root, name)
+        os.makedirs(path)
+        for key, value in attrs.items():
+            with open(os.path.join(path, key), "w") as fh:
+                fh.write(value + "\n")
+    cd.USB_DEVICES = root
+    return root
+
+
+def listed(restore, raw):
+    cd.saved_ignored_controllers = lambda: raw
+    lines = []
+    real_print = cd.print if hasattr(cd, "print") else print
+    cd.print = lambda *a, **k: lines.append(" ".join(map(str, a)))
+    try:
+        cd.cmd_hide_interfaces(type("A", (), {"restore": restore})())
+    finally:
+        cd.print = real_print
+    return [os.path.basename(line) for line in lines]
+
+
+fake_usb({
+    "5-1": {"idVendor": "31e3", "idProduct": "1400"},
+    "5-1:1.0": {"bInterfaceClass": "ff", "bInterfaceSubClass": "5d", "authorized": "1"},
+    "5-1:1.1": {"bInterfaceClass": "03", "bInterfaceSubClass": "01", "authorized": "1"},
+    "3-2": {"idVendor": "045e", "idProduct": "028e"},
+    "3-2:1.0": {"bInterfaceClass": "ff", "bInterfaceSubClass": "5d", "authorized": "1"},
+    "1-4": {"idVendor": "28de", "idProduct": "1304"},
+    "1-4:1.0": {"bInterfaceClass": "03", "bInterfaceSubClass": "00", "authorized": "1"},
+})
+check("only the listed keyboard's pad interface is switched off now",
+      listed(False, "0x31e3/0x1400"), ["5-1:1.0"])
+check("never its keyboard interface, and never a real Xbox pad that is not listed",
+      "5-1:1.1" not in listed(False, "0x31e3/0x1400")
+      and "3-2:1.0" not in listed(False, "0x31e3/0x1400"), True)
+check("nothing needs switching back on while it is still listed",
+      listed(True, "0x31e3/0x1400"), [])
+
+fake_usb({
+    "5-1": {"idVendor": "31e3", "idProduct": "1400"},
+    "5-1:1.0": {"bInterfaceClass": "ff", "bInterfaceSubClass": "5d", "authorized": "0"},
+})
+check("one already off is not switched off again", listed(False, "0x31e3/0x1400"), [])
+check("and once it is taken off the list it is switched back on",
+      listed(True, ""), ["5-1:1.0"])
 
 print()
 if FAILURES:
