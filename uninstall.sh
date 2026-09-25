@@ -34,7 +34,7 @@ say "== commands =="
 for tool in cachy-console cachy-console-display cachy-console-watch \
             cachy-console-audio cachy-console-exit cachy-console-shortcut \
             cachy-console-app cachy-console-art cachy-console-settings \
-            cachy-console-session; do
+            cachy-console-session cachy-console-pads; do
     if [[ -e "$BIN_DIR/$tool" ]]; then
         rm -f "$BIN_DIR/$tool"
         say "  removed $tool"
@@ -55,7 +55,10 @@ else
 fi
 
 say
-say "Two things this cannot undo for you:"
+say "Three things this cannot undo for you:"
+say "  - Steam's DevTools port, turned on for the player-one setting. If nothing"
+say "    else uses it (Decky Loader does), turn it off and restart Steam:"
+say "      rm ~/.local/share/Steam/.cef-enable-remote-debugging"
 say "  - the \"Exit Console Mode\" entry in your Steam library."
 say "    Remove it before uninstalling with: cachy-console shortcut --revert"
 say "  - CAP_SYS_NICE on gamescope, if you granted it. To drop it:"

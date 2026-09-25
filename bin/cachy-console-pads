@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""Put the chosen controller in player one's slot, through the Steam client.
+
+Steam hands out XInput slots in the order controllers turn up, and a DualSense
+is up the moment Steam starts while a Steam Controller still has to find its
+dongle -- so the DualSense ends up player one, and in a single-player game the
+Steam Controller then drives nothing at all. The Steam client can reorder the
+slots (Quick Access > Controller > Rearrange controller order), but only
+through its own UI, so this talks to that UI over the client's DevTools port
+(~/.local/share/Steam/.cef-enable-remote-debugging, bound to 127.0.0.1).
+
+Reordering only reaches controllers that go through Steam Input: a DualSense
+the game reads directly is outside Steam's slots, and in a Proton game it takes
+player one whatever Steam's order says. So while this runs, PlayStation
+controllers are put through Steam Input in every game, and the setting the
+user had is put back when the session ends.
+"""
+
+import argparse
+import base64
+import json
+import os
+import socket
+import struct
+import sys
+import time
+import urllib.request
+
+CDP_PORT = int(os.environ.get("CACHY_CONSOLE_CDP_PORT", "8080"))
+RECONNECT_WAIT = float(os.environ.get("CACHY_CONSOLE_PADS_RECONNECT", "15"))
+GAMESCOPE_NAMES = tuple(os.environ.get("CACHY_CONSOLE_GAMESCOPE_COMM",
+                                       "gamescope,gamescope-wl").split(","))
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME")
+                     or os.path.expanduser("~/.local/state"), "cachy-console")
+PS_SAVED = os.path.join(STATE, "ps-support-saved")
+
+# CMsgClientSettings.controller_ps_support: 0 off, 1 in games without
+# PlayStation support, 2 always.
+PS_SUPPORT_FIELD = 14003
+PS_ALWAYS = 2
+
+# PRIMARY_CONTROLLER values, in the order the settings app offers them.
+CHOICES = [
+    ("steam", "Steam Controller"),
+    ("playstation", "PlayStation controller (DualSense, DualShock 4)"),
+    ("xbox", "Xbox controller"),
+    ("switch", "Nintendo Switch controller"),
+    ("off", "Leave the order to Steam"),
+]
+DEFAULT = "steam"
+
+# Steam's EControllerType. Everything below 30 is Valve hardware.
+XBOX_TYPES = {30, 31, 32}
+PLAYSTATION_TYPES = {33, 34, 45, 46}
+SWITCH_TYPES = {38, 39, 40, 41, 42, 44}
+PLAYSTATION_NAMES = ("dualsense", "dualshock", "playstation", "ps5", "ps4")
+
+
+def normalize(value):
+    value = (value or "").strip().lower()
+    return value if value in dict(CHOICES) else ""
+
+
+def is_kind(controller, kind):
+    ctype = controller.get("type")
+    name = (controller.get("name") or "").lower()
+    if kind == "steam":
+        return isinstance(ctype, int) and 0 < ctype < 30
+    if kind == "playstation":
+        return ctype in PLAYSTATION_TYPES or any(n in name for n in PLAYSTATION_NAMES)
+    if kind == "xbox":
+        return ctype in XBOX_TYPES and not any(n in name for n in PLAYSTATION_NAMES)
+    if kind == "switch":
+        return ctype in SWITCH_TYPES
+    return False
+
+
+def swap_needed(controllers, kind):
+    """The (from, to) slot swap that puts `kind` in player one, or None.
+
+    Slots below 0 are controllers outside Steam Input, which Steam cannot
+    reorder. The lowest-slotted match is the one moved, so two of a kind keep
+    their order relative to each other."""
+    matches = sorted((c for c in controllers
+                      if is_kind(c, kind) and isinstance(c.get("slot"), int)
+                      and c["slot"] >= 0), key=lambda c: c["slot"])
+    if not matches or matches[0]["slot"] == 0:
+        return None
+    return matches[0]["slot"], 0
+
+
+def layout_key(controllers):
+    """What decides the order: who is connected, and who has a slot at all."""
+    def slotted(c):
+        return isinstance(c.get("slot"), int) and c["slot"] >= 0
+    return tuple(sorted((c.get("index"), slotted(c)) for c in controllers))
+
+
+def say(msg):
+    print(f"cachy-console-pads: {msg}", flush=True)
+
+
+class CDPError(Exception):
+    pass
+
+
+class Page:
+    """One DevTools page, spoken to over a bare RFC 6455 client."""
+
+    def __init__(self, ws_url, timeout=5):
+        rest = ws_url.split("://", 1)[1]
+        hostport, path = rest.split("/", 1)
+        host, port = hostport.split(":")
+        self.sock = socket.create_connection((host, int(port)), timeout=timeout)
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((f"GET /{path} HTTP/1.1\r\nHost: {hostport}\r\n"
+                           "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                           f"Sec-WebSocket-Key: {key}\r\n"
+                           "Sec-WebSocket-Version: 13\r\n\r\n").encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise CDPError("DevTools closed the connection")
+            head += chunk
+        if b" 101 " not in head.split(b"\r\n", 1)[0]:
+            raise CDPError("DevTools refused the websocket")
+        self.buf = head.split(b"\r\n\r\n", 1)[1]
+        self.next_id = 0
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def _send(self, text):
+        data = text.encode()
+        mask = os.urandom(4)
+        n = len(data)
+        if n < 126:
+            hdr = struct.pack("!BB", 0x81, 0x80 | n)
+        elif n < 65536:
+            hdr = struct.pack("!BBH", 0x81, 0x80 | 126, n)
+        else:
+            hdr = struct.pack("!BBQ", 0x81, 0x80 | 127, n)
+        body = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        self.sock.sendall(hdr + mask + body)
+
+    def _read(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise CDPError("DevTools closed the connection")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def _recv(self):
+        message = b""
+        while True:
+            b0, b1 = self._read(2)
+            n = b1 & 0x7F
+            if n == 126:
+                n = struct.unpack("!H", self._read(2))[0]
+            elif n == 127:
+                n = struct.unpack("!Q", self._read(8))[0]
+            payload = self._read(n)
+            op = b0 & 0x0F
+            if op == 0x8:
+                raise CDPError("DevTools closed the connection")
+            if op in (0x9, 0xA):
+                continue
+            message += payload
+            if b0 & 0x80:
+                return message.decode()
+
+    def evaluate(self, expression):
+        self.next_id += 1
+        mine = self.next_id
+        self._send(json.dumps({"id": mine, "method": "Runtime.evaluate",
+                               "params": {"expression": expression,
+                                          "returnByValue": True,
+                                          "awaitPromise": True}}))
+        while True:
+            reply = json.loads(self._recv())
+            if reply.get("id") != mine:
+                continue
+            if "error" in reply:
+                raise CDPError(reply["error"].get("message", "evaluate failed"))
+            result = reply["result"]
+            if "exceptionDetails" in result:
+                raise CDPError(result["exceptionDetails"].get("exception", {})
+                               .get("description", "script threw"))
+            return result["result"].get("value")
+
+
+def shared_context():
+    """The client's own JS context, where SteamClient and its stores live."""
+    with urllib.request.urlopen(f"http://127.0.0.1:{CDP_PORT}/json",
+                                timeout=2) as res:
+        targets = json.load(res)
+    for t in targets:
+        if t.get("title") == "SharedJSContext" and t.get("webSocketDebuggerUrl"):
+            return Page(t["webSocketDebuggerUrl"])
+    raise CDPError("no SharedJSContext yet")
+
+
+def connect(wait):
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            page = shared_context()
+            if page.evaluate("typeof SteamClient !== 'undefined' && "
+                             "!!window.ControllerStore"):
+                return page
+            page.close()
+        except (OSError, CDPError, ValueError):
+            pass
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(1)
+
+
+LIST_JS = """(() => {
+  const s = window.ControllerStore;
+  const list = s.m_controllerList || s.GetControllers?.() || [];
+  return Array.from(list.values ? list.values() : list).map(c => ({
+    index: c.nControllerIndex, slot: c.nXInputIndex, type: c.eControllerType,
+    name: c.strName || "", serial: c.strSerialNumber || ""}));
+})()"""
+
+
+def controllers(page):
+    return page.evaluate(LIST_JS) or []
+
+
+def varint(n):
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        out.append(b | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
+def ps_support_message(value):
+    return base64.b64encode(varint(PS_SUPPORT_FIELD << 3) + varint(value)).decode()
+
+
+PS_GET_JS = "window.settingsStore?.clientSettings?.controller_ps_support"
+
+
+def ps_support(page):
+    value = page.evaluate(PS_GET_JS)
+    return value if isinstance(value, int) else None
+
+
+def set_ps_support(page, value):
+    page.evaluate(f"SteamClient.Settings.SetSetting('{ps_support_message(value)}')")
+
+
+def force_ps_support(page):
+    """Always Steam Input for PlayStation controllers, saving what the user had.
+
+    The saved value is only written when there is none yet: a session that
+    ended without a restore leaves ours in place, and saving again would
+    record our own 2 as the user's choice."""
+    current = ps_support(page)
+    if current is None or current == PS_ALWAYS:
+        return
+    if not os.path.exists(PS_SAVED):
+        os.makedirs(STATE, exist_ok=True)
+        with open(PS_SAVED, "w") as fh:
+            fh.write(f"{current}\n")
+    set_ps_support(page, PS_ALWAYS)
+    say("PlayStation controllers go through Steam Input for this session")
+
+
+def cmd_watch(kind, wait, interval):
+    page = connect(wait)
+    if page is None:
+        say("the Steam client's DevTools port never answered; "
+            "the controller order is left to Steam")
+        return 1
+    last = None
+    while True:
+        try:
+            force_ps_support(page)
+            while True:
+                pads = controllers(page)
+                key = layout_key(pads)
+                # Only when the set of controllers changes: a reorder made by
+                # hand in the Quick Access menu afterwards is the user's.
+                if key != last:
+                    swap = swap_needed(pads, kind)
+                    if swap:
+                        page.evaluate("SteamClient.Input.SwapControllerOrder"
+                                      f"({swap[0]},{swap[1]})")
+                        say(f"moved the {dict(CHOICES)[kind]} from player "
+                            f"{swap[0] + 1} to player one")
+                        time.sleep(interval)
+                        key = layout_key(controllers(page))
+                    last = key
+                time.sleep(interval)
+        except (OSError, CDPError, ValueError):
+            page.close()
+        # The UI reloading drops the connection as well as Steam exiting;
+        # only a client that stops answering altogether ends the watch.
+        page = connect(RECONNECT_WAIT)
+        if page is None:
+            return 0
+
+
+def console_running():
+    """A gamescope is up, so the Steam answering is the session's."""
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/comm") as fh:
+                if fh.read().strip() in GAMESCOPE_NAMES:
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def cmd_restore(wait):
+    """Put the user's PlayStation setting back into a desktop client.
+
+    Called while the session's client may still be going down, so it keeps
+    trying until a client that is not the session's takes the setting."""
+    try:
+        with open(PS_SAVED) as fh:
+            saved = int(fh.read().strip())
+    except (OSError, ValueError):
+        return 0
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        if console_running():
+            time.sleep(2)
+            continue
+        page = connect(min(5, max(0, deadline - time.monotonic())))
+        if page is None:
+            continue
+        try:
+            if ps_support(page) is not None and not console_running():
+                set_ps_support(page, saved)
+                time.sleep(1)
+                if ps_support(page) == saved:
+                    os.unlink(PS_SAVED)
+                    say("PlayStation Steam Input is back to the desktop setting")
+                    return 0
+        except (OSError, CDPError, ValueError):
+            pass
+        finally:
+            page.close()
+        time.sleep(1)
+    say("no desktop Steam client took the PlayStation setting back; "
+        "it is tried again after the next session")
+    return 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list")
+    w = sub.add_parser("watch")
+    w.add_argument("--primary", default=DEFAULT)
+    w.add_argument("--wait", type=float, default=180)
+    w.add_argument("--interval", type=float, default=1)
+    r = sub.add_parser("restore")
+    r.add_argument("--wait", type=float, default=240)
+    args = ap.parse_args()
+
+    if args.cmd == "watch":
+        kind = normalize(args.primary)
+        if not kind:
+            say(f"unknown PRIMARY_CONTROLLER {args.primary!r}; "
+                f"use one of {', '.join(k for k, _ in CHOICES)}")
+            return 2
+        if kind == "off":
+            return 0
+        return cmd_watch(kind, args.wait, args.interval)
+    if args.cmd == "restore":
+        return cmd_restore(args.wait)
+
+    page = connect(2)
+    if page is None:
+        say("the Steam client's DevTools port is not answering")
+        return 1
+    try:
+        print(json.dumps({"controllers": controllers(page),
+                          "ps_support": ps_support(page)}, indent=1))
+    finally:
+        page.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

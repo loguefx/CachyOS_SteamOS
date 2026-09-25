@@ -48,6 +48,7 @@ CFG_RESTART_STEAM=on
 CFG_AUDIO_DEVICE=""
 CFG_AUDIO_INPUT_DEVICE=""
 CFG_IGNORE_CONTROLLERS=""
+CFG_PRIMARY_CONTROLLER=steam
 CFG_EXTRA_GAMESCOPE_ARGS=""
 
 DRY_RUN=0
@@ -108,7 +109,7 @@ load_config() {
         value="${value%\"}"; value="${value#\"}"
         value="${value%\'}"; value="${value#\'}"
         case "$key" in
-            DISPLAY|DISPLAY_MODEL|RESOLUTION|REFRESH|HDR|VRR|TRACKPAD_FIX|GRAB_CURSOR|RESTART_STEAM|EXTRA_GAMESCOPE_ARGS|AUDIO_DEVICE|AUDIO_INPUT_DEVICE|IGNORE_CONTROLLERS)
+            DISPLAY|DISPLAY_MODEL|RESOLUTION|REFRESH|HDR|VRR|TRACKPAD_FIX|GRAB_CURSOR|RESTART_STEAM|EXTRA_GAMESCOPE_ARGS|AUDIO_DEVICE|AUDIO_INPUT_DEVICE|IGNORE_CONTROLLERS|PRIMARY_CONTROLLER)
                 printf -v "CFG_$key" '%s' "$value" ;;
             STEAM_BUTTON|AUDIO_FOCUS|AUDIO_NEVER_MUTE|AUDIO_PIN_VOICE) ;;   # read by the services, not by us
             "") ;;
@@ -323,6 +324,7 @@ launch_desktop_steam() {
 # session, and the watcher is not running at all when STEAM_BUTTON is off. The
 # lock is what keeps two survivors from starting two clients.
 restart_desktop_steam() {
+    restore_player_one
     is_on "$CFG_RESTART_STEAM" || return 0
     have steam || return 0
 
@@ -592,6 +594,8 @@ steam_in_session() {
     # ours to change in this gap between the two clients.
     "$HELPER_DISPLAY" pad-layouts || warn "could not set the trackpad mouse layouts"
     route_audio
+    local pads_pid=""
+    pads_pid="$(start_player_one)"
     local status=0
     if [[ -n "${CACHY_CONSOLE_PRELOAD:-}" ]]; then
         env -u CACHY_CONSOLE_PRELOAD \
@@ -600,7 +604,53 @@ steam_in_session() {
     else
         steam -gamepadui || status=$?
     fi
+    [[ -n "$pads_pid" ]] && kill "$pads_pid" 2>/dev/null
     close_leftovers "$status"
+}
+
+# ---- player one -----------------------------------------------------------
+
+STEAM_DEVTOOLS_FLAG="${CACHY_CONSOLE_STEAM_ROOT:-$HOME/.local/share/Steam}/.cef-enable-remote-debugging"
+
+# Steam gives out XInput slots in the order controllers turn up, and a DualSense
+# is there the moment Steam starts while a Steam Controller is still finding its
+# dongle -- so the DualSense was player one, and in a single-player game the
+# Steam Controller drove nothing. cachy-console-pads moves the chosen kind into
+# player one through the client's own reorder, which it reaches over the
+# DevTools port the flag file turns on. The flag is read when Steam starts, so it
+# is put down here, in the gap before the session's client.
+# Prints the helper's pid, or nothing when there is nothing to run.
+# Only ever the helper installed beside this script: the one on PATH may belong
+# to another copy, and it changes settings in whichever Steam is running.
+pads_helper() {
+    local helper
+    helper="$(dirname -- "$SELF")/$NAME-pads"
+    [[ -x "$helper" ]] && printf '%s\n' "$helper"
+}
+
+start_player_one() {
+    local primary="${CFG_PRIMARY_CONTROLLER,,}" helper
+    [[ -z "$primary" || "$primary" == off ]] && return 0
+    helper="$(pads_helper)" || return 0
+    if [[ ! -e "$STEAM_DEVTOOLS_FLAG" ]]; then
+        touch "$STEAM_DEVTOOLS_FLAG" 2>/dev/null || {
+            warn "could not turn on Steam's DevTools port; the controller order is left to Steam"
+            return 0
+        }
+    fi
+    "$helper" watch --primary "$primary" </dev/null >&2 &
+    printf '%s\n' "$!"
+}
+
+# The session puts PlayStation controllers through Steam Input in every game,
+# and that is a client setting that outlives it. Put back once a desktop client
+# is up; the helper keeps waiting for one, and leaves it alone while console mode
+# is running again.
+restore_player_one() {
+    local helper
+    helper="$(pads_helper)" || return 0
+    setsid "$helper" restore </dev/null >/dev/null 2>&1 9>&- &
+    disown 2>/dev/null || true
 }
 
 # gamescope ends with its primary child, but that child is gamescopereaper, which
@@ -655,6 +705,7 @@ It will not choose a screen for you."
         dry_source="$("$HELPER_DISPLAY" audio-input-resolve 2>/dev/null || true)"
         say "  microphone: ${dry_source:-(session default)}"
         say "  hidden controllers: ${CFG_IGNORE_CONTROLLERS:-(none)}"
+        say "  player one: ${CFG_PRIMARY_CONTROLLER:-off}"
         return 0
     fi
 
@@ -872,6 +923,13 @@ AUDIO_INPUT_DEVICE=$CFG_AUDIO_INPUT_DEVICE
 # controller. Empty hides nothing. They stay gamepads on the desktop.
 # List them with: cachy-console controllers
 IGNORE_CONTROLLERS=$CFG_IGNORE_CONTROLLERS
+
+# Which controller is player one when more than one is connected: steam,
+# playstation, xbox, switch, or off to leave Steam's order alone. Moved there
+# through Steam's own controller reorder, which needs Steam's DevTools port
+# (bound to this machine only), and PlayStation controllers go through Steam
+# Input for the session so they can be ordered at all. Also in Cachy Console.
+PRIMARY_CONTROLLER=$CFG_PRIMARY_CONTROLLER
 
 # Extra arguments passed straight to gamescope, for anything not covered above.
 # For example: EXTRA_GAMESCOPE_ARGS=--mangoapp
@@ -1097,6 +1155,10 @@ status() {
     say
     say "== controllers =="
     "$HELPER_DISPLAY" controllers || true
+    say "  player one: ${CFG_PRIMARY_CONTROLLER:-off}"
+    if [[ "${CFG_PRIMARY_CONTROLLER,,}" != off && ! -e "$STEAM_DEVTOOLS_FLAG" ]]; then
+        say "  (Steam's DevTools port is turned on when console mode next starts)"
+    fi
 
     say
     say "== what would run =="

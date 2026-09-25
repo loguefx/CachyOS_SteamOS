@@ -122,6 +122,15 @@ esac
 exit 0
 """
 
+# Writes down how it was started, and stays up like the real watcher until
+# something stops it.
+PADS = """#!/bin/bash
+echo "pads $*" >> "$CACHY_TEST_STATE/sequence"
+[[ "$1" == watch ]] || exit 0
+trap 'echo "pads stopped" >> "$CACHY_TEST_STATE/sequence"; exit 0' TERM
+sleep 30 & wait
+"""
+
 PGREP = """#!/bin/bash
 [[ "$1" == -P ]] && exec /usr/bin/pgrep "$@"
 [[ "$*" == "-x steam" && -f "$CACHY_TEST_STATE/desktop-steam" ]] && exit 0
@@ -133,7 +142,7 @@ class World:
     """A cachy-console with fake helpers beside it and a config of our own."""
 
     def __init__(self, config="", strict_fails=0, answer2=None, flip_after=None,
-                 desktop_steam=False, extest_guard=True):
+                 desktop_steam=False, extest_guard=True, pads=False):
         self.dir = tempfile.mkdtemp(prefix="cachy-args-")
         self.bin = os.path.join(self.dir, "bin")
         os.makedirs(self.bin)
@@ -159,6 +168,13 @@ class World:
             with open(path, "w") as fh:
                 fh.write(body)
             os.chmod(path, 0o755)
+        if pads:
+            path = os.path.join(self.bin, "cachy-console-pads")
+            with open(path, "w") as fh:
+                fh.write(PADS)
+            os.chmod(path, 0o755)
+        self.steam_root = os.path.join(self.dir, "steamroot")
+        os.makedirs(self.steam_root)
 
         self.guard = os.path.join(self.dir, "guard")
         if extest_guard:
@@ -187,6 +203,7 @@ class World:
         env["CACHY_CONSOLE_STEAM_TIMEOUT"] = "1"
         env["CACHY_CONSOLE_EXTEST_INIT"] = self.guard
         env["WAYLAND_DISPLAY"] = "wayland-desk"
+        env["CACHY_CONSOLE_STEAM_ROOT"] = self.steam_root
         return env
 
     def read(self, name):
@@ -434,6 +451,47 @@ w = World("DISPLAY=HDMI-A-1\n")
 w.started()
 check("with no desktop client running, Big Picture starts straight away",
       "steam -gamepadui" in w.read("sequence"), True)
+w.clean()
+
+print()
+print("Player one")
+import time
+w = World("DISPLAY=HDMI-A-1\n", pads=True)
+w.started()
+time.sleep(0.5)
+seq = w.read("sequence")
+check("by default the Steam Controller is kept in player one for the session",
+      [e for e in seq if e.startswith("pads watch")], ["pads watch --primary steam"])
+check("and the watch ends with the session's Steam", "pads stopped" in seq, True)
+check("Steam's DevTools port is turned on before the client that reads it starts",
+      os.path.exists(os.path.join(w.steam_root, ".cef-enable-remote-debugging")), True)
+w.clean()
+
+w = World("DISPLAY=HDMI-A-1\nPRIMARY_CONTROLLER=PlayStation\n", pads=True)
+w.started()
+time.sleep(0.5)
+check("the choice comes from the config, in any case",
+      [e for e in w.read("sequence") if e.startswith("pads watch")],
+      ["pads watch --primary playstation"])
+w.clean()
+
+w = World("DISPLAY=HDMI-A-1\nPRIMARY_CONTROLLER=off\n", pads=True)
+w.started()
+time.sleep(0.5)
+seq = w.read("sequence")
+check("off leaves Steam's order alone and starts no watch",
+      [e for e in seq if e.startswith("pads watch")], [])
+check("though leaving still puts back a setting an earlier session changed",
+      "pads restore" in seq, True)
+check("and does not turn the DevTools port on",
+      os.path.exists(os.path.join(w.steam_root, ".cef-enable-remote-debugging")), False)
+check("nor warns about an unknown setting", "unknown setting" in w.output, False)
+w.clean()
+
+w = World("DISPLAY=HDMI-A-1\n")
+w.started()
+check("with no helper beside it, a session still starts, and nothing on PATH "
+      "is borrowed", "steam -gamepadui" in w.read("sequence"), True)
 w.clean()
 
 print()

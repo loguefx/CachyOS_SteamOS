@@ -24,6 +24,12 @@ spec = importlib.util.spec_from_loader("ccd", loader)
 ccd = importlib.util.module_from_spec(spec)
 loader.exec_module(ccd)
 
+pads_loader = importlib.machinery.SourceFileLoader(
+    "ccpads", os.path.join(HERE, "cachy-console-pads"))
+pads_spec = importlib.util.spec_from_loader("ccpads", pads_loader)
+pads = importlib.util.module_from_spec(pads_spec)
+pads_loader.exec_module(pads)
+
 
 def snapshot():
     """Currently connected displays plus the saved target, even if it is off."""
@@ -64,6 +70,18 @@ def save_audio(device):
 
 def save_audio_input(device):
     ccd.update_config({"AUDIO_INPUT_DEVICE": device})
+
+
+def saved_primary():
+    return pads.normalize(ccd.read_config().get("PRIMARY_CONTROLLER")) or pads.DEFAULT
+
+
+def save_primary(kind):
+    ccd.update_config({"PRIMARY_CONTROLLER": kind})
+
+
+def primary_label(kind):
+    return dict(pads.CHOICES).get(kind, kind)
 
 
 def snapshot_input():
@@ -141,6 +159,14 @@ INPUT_HINT = (
 
 DEFAULT_INPUT_LABEL = "Session default (leave input alone)"
 
+PRIMARY_HINT = (
+    "With more than one controller connected, this one is player one — the "
+    "one a single-player game listens to. Steam otherwise gives player one to "
+    "whichever controller it saw first, which is usually a DualSense. "
+    "PlayStation controllers go through Steam Input during console mode so they "
+    "can be ordered. A change takes effect the next time console mode starts."
+)
+
 
 def run_gtk():
     import gi
@@ -210,6 +236,20 @@ def run_gtk():
 
             self.input_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
             box.pack_start(self.input_box, True, True, 0)
+
+            primary_title = Gtk.Label()
+            primary_title.set_markup("<b>Player one</b>")
+            primary_title.set_xalign(0)
+            box.pack_start(primary_title, False, False, 0)
+
+            primary_hint = Gtk.Label(label=PRIMARY_HINT)
+            primary_hint.set_line_wrap(True)
+            primary_hint.set_xalign(0)
+            primary_hint.set_max_width_chars(56)
+            box.pack_start(primary_hint, False, False, 0)
+
+            self.primary_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            box.pack_start(self.primary_box, True, True, 0)
 
             self.status = Gtk.Label()
             self.status.set_line_wrap(True)
@@ -294,6 +334,18 @@ def run_gtk():
                 radio.connect("toggled", self.on_input_toggle, row)
                 self.input_box.pack_start(radio, False, False, 0)
 
+            for child in list(self.primary_box.get_children()):
+                self.primary_box.remove(child)
+            saved_kind = saved_primary()
+            group = None
+            for kind, label in pads.CHOICES:
+                radio = Gtk.RadioButton.new_with_label_from_widget(group, label)
+                if group is None:
+                    group = radio
+                radio.primary = kind
+                radio.set_active(kind == saved_kind)
+                self.primary_box.pack_start(radio, False, False, 0)
+
             if saved:
                 extra = " Console mode is running on the previous display." if console_running() else ""
                 audio = f" Audio: {saved_audio}." if saved_audio else ""
@@ -335,16 +387,22 @@ def run_gtk():
                 if isinstance(child, Gtk.RadioButton) and child.get_active():
                     mic = getattr(child, "audio_input", mic)
                     self.choice_input = mic
+            primary = saved_primary()
+            for child in self.primary_box.get_children():
+                if isinstance(child, Gtk.RadioButton) and child.get_active():
+                    primary = child.primary
             save_connector(self.choice, model)
             if audio:
                 save_audio(audio)
             # Written even when empty: that is how the session default is chosen.
             save_audio_input(mic)
+            save_primary(primary)
             applied = False
             if audio and console_running():
                 applied = apply_audio_now()
-            self.status.set_text(apply_message(self.choice, audio, applied, mic))
             self.reload()
+            self.status.set_text(apply_message(self.choice, audio, applied, mic)
+                                 + f" Player one: {primary_label(primary)}.")
 
     class App(Gtk.Application):
         def __init__(self):
@@ -405,8 +463,19 @@ def run_tk():
         anchor="w", pady=(4, 8))
     input_radios = ttk.Frame(frame)
     input_radios.pack(fill="both", expand=True)
+    primary_var = tk.StringVar()
+    ttk.Label(frame, text="Player one", font=("", 12, "bold")).pack(
+        anchor="w", pady=(8, 0))
+    ttk.Label(frame, text=PRIMARY_HINT, wraplength=460, justify="left").pack(
+        anchor="w", pady=(4, 8))
+    primary_radios = ttk.Frame(frame)
+    primary_radios.pack(fill="both", expand=True)
+    for kind, label in pads.CHOICES:
+        ttk.Radiobutton(primary_radios, text=label, value=kind,
+                        variable=primary_var).pack(anchor="w", pady=2)
 
     def reload():
+        primary_var.set(saved_primary())
         for child in radios.winfo_children():
             child.destroy()
         for child in audio_radios.winfo_children():
@@ -470,9 +539,12 @@ def run_tk():
             save_audio(audio)
         # Written even when empty: that is how the session default is chosen.
         save_audio_input(mic)
+        primary = pads.normalize(primary_var.get()) or pads.DEFAULT
+        save_primary(primary)
         applied = bool(audio and console_running() and apply_audio_now())
-        status.set(apply_message(connector, audio, applied, mic))
         reload()
+        status.set(apply_message(connector, audio, applied, mic)
+                   + f" Player one: {primary_label(primary)}.")
 
     ttk.Label(frame, textvariable=status, wraplength=460, justify="left").pack(
         anchor="w", pady=(8, 8))

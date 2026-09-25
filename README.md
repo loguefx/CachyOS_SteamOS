@@ -394,6 +394,7 @@ edit by hand:
 | `AUDIO_PIN_VOICE` | `on` | Hold those streams on `AUDIO_DEVICE` / `AUDIO_INPUT_DEVICE`, moving them back if the app sends them elsewhere. Only while a session is running |
 | `AUDIO_INPUT_DEVICE` | *(session default)* | Microphone for console mode, e.g. `HyperX Cloud III S Wireless`. Empty leaves input alone |
 | `IGNORE_CONTROLLERS` | empty | Devices console mode should not treat as gamepads, as `0x31e3/0x1400`, comma separated. List them with `cachy-console controllers` |
+| `PRIMARY_CONTROLLER` | `steam` | Which controller is player one when several are connected: `steam`, `playstation`, `xbox`, `switch`, or `off` for Steam's own order. Also in Cachy Console |
 | `EXTRA_GAMESCOPE_ARGS` | empty | Passed straight through, e.g. `--mangoapp` |
 
 ## How it works
@@ -533,6 +534,30 @@ console mode only, so the device is still a gamepad on the desktop:
 ```bash
 cachy-console controllers   # names, USB ids, and which slot each one holds
 ```
+
+**Steam Controller first, even with a DualSense connected.** Among real
+controllers, Steam gives out player slots in the order the controllers turn up.
+A DualSense is there the moment Steam starts, while a Steam Controller still
+has to reach its dongle, so the DualSense became player one. In a single-player
+game like Dead Rising 2, the Steam Controller then drove nothing at all. On top
+of that, in games Steam thinks can read a PlayStation pad themselves, the
+DualSense skipped Steam Input entirely and went to the game through Proton,
+outside Steam's order.
+
+`PRIMARY_CONTROLLER` (default `steam`, also in Cachy Console under *Player one*)
+fixes both for the session. `cachy-console-pads` runs next to the session's
+Steam, puts PlayStation controllers through Steam Input in every game so there
+is one order to change, and moves the chosen kind into player one with Steam's
+own *Rearrange controller order*. It does this again whenever a controller
+connects, but a reorder you make by hand in the Quick Access menu afterwards is
+left alone. Your PlayStation setting is written down first and put back once
+the desktop client is up again.
+
+Steam only offers that reorder through its UI, so the helper reaches it over the
+client's DevTools port. That port is turned on by
+`~/.local/share/Steam/.cef-enable-remote-debugging`, the same file Decky Loader
+uses, and listens on `127.0.0.1` only. `PRIMARY_CONTROLLER=off` never creates
+it, but it doesn't remove one that is already there.
 
 **The trackpad, and why `TRACKPAD_FIX` is on.** Steam moves the trackpad cursor by
 making XTEST calls against whatever X server it is on — its client carries
@@ -710,6 +735,15 @@ cachy-console controllers   # the one on js0 is player one
 
 Put that device's USB id in `IGNORE_CONTROLLERS`, then exit and Steam-button
 twice. It stays a gamepad on the desktop.
+
+**The Steam Controller does nothing in a game while a DualSense is on.** The
+DualSense has player one. Check that *Player one* in Cachy Console (or
+`PRIMARY_CONTROLLER`) is *Steam Controller*, and look at what the helper did:
+
+```bash
+cachy-console-pads list     # each controller's player slot (0 is player one)
+grep cachy-console-pads "$XDG_RUNTIME_DIR/cachy-console-session.log"
+```
 
 **The cursor works in Big Picture but stops in Discord.** That is Discord's
 controller layout, not the cursor: with none chosen it is a gamepad layout.

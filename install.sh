@@ -79,7 +79,7 @@ mkdir -p "$BIN_DIR"
 for tool in cachy-console cachy-console-display cachy-console-watch \
             cachy-console-audio cachy-console-exit cachy-console-shortcut \
             cachy-console-app cachy-console-art cachy-console-settings \
-            cachy-console-session; do
+            cachy-console-session cachy-console-pads; do
     install -m755 "$SRC/bin/$tool" "$BIN_DIR/$tool"
     printf '  %s -> %s\n' "$tool" "$BIN_DIR"
 done
