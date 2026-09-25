@@ -478,6 +478,21 @@ def cmd_set(args):
     return 0
 
 
+def cmd_config_set(args):
+    """Patch KEY=VALUE pairs without rewriting the rest of the file."""
+    updates = {}
+    for item in args.assignments:
+        if "=" not in item:
+            raise DisplayError(f"not KEY=VALUE: {item}")
+        key, _, value = item.partition("=")
+        key = key.strip()
+        if not key:
+            raise DisplayError(f"not KEY=VALUE: {item}")
+        updates[key] = value
+    update_config(updates)
+    return 0
+
+
 def cmd_probe(args):
     for driver in ([args.driver] if args.driver else ["x11", "wayland"]):
         print(f"== SDL_VIDEODRIVER={driver} ==")
@@ -1561,6 +1576,11 @@ def main():
     p = sub.add_parser("set", help="save the only display console mode will use")
     p.add_argument("connector")
     p.set_defaults(func=cmd_set)
+
+    p = sub.add_parser("config-set",
+                       help="change keys in the config file; leave the rest")
+    p.add_argument("assignments", nargs="+", metavar="KEY=VALUE")
+    p.set_defaults(func=cmd_config_set)
 
     p = sub.add_parser("probe", help="raw SDL enumeration, for debugging")
     p.add_argument("--driver")

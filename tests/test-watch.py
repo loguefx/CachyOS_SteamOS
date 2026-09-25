@@ -116,9 +116,22 @@ def run(script, **kw):
     return run_session(script, **kw).actions
 
 
+class FakeGuide:
+    """Fires a double-press on the listed clock ticks."""
+
+    def __init__(self, ticks=()):
+        self.ticks = set(ticks)
+
+    def double_pressed(self, now):
+        return now in self.ticks
+
+    def close(self):
+        pass
+
+
 def run_session(script, connected=True, engage_polls=2, start_ok=True, up_after=1,
                 lifetime=None, max_starts=3, start_window=300.0, polls=None,
-                display="HDMI-1"):
+                display="HDMI-1", guide=None):
     """The session itself, for the few tests that also care what was said."""
     xprop = FakeXprop(script)
     session = FakeSession(connected, start_ok, up_after, lifetime)
@@ -144,7 +157,8 @@ def run_session(script, connected=True, engage_polls=2, start_ok=True, up_after=
     said = []
     pw.run_loop(xprop, session, re.compile("big.?picture", re.I), args,
                 stopping, sleep, now,
-                announce=lambda summary, body: said.append((summary, body)))
+                announce=lambda summary, body: said.append((summary, body)),
+                guide=guide)
     session.announced = said
     return session
 
@@ -166,6 +180,26 @@ print("starting a session:")
 
 check("desktop only never starts anything",
       run([DESKTOP] * 8), [])
+
+print()
+print("Steam button without Big Picture:")
+check("two presses start a session even when Steam is not focused",
+      run([DESKTOP] * 8, guide=FakeGuide({2})), ["start"])
+check("and a desktop game is left alone",
+      run([GAME] * 8, guide=FakeGuide({2})), [])
+
+print()
+print("double-press timing:")
+d = pw.DoublePress(window=0.55, debounce=0.04)
+check("one press is not enough", d.feed(1.0), False)
+check("a second press inside the window is", d.feed(1.4), True)
+check("and the pair is consumed", d.feed(1.41), False)
+d = pw.DoublePress(window=0.55, debounce=0.04)
+d.feed(1.0)
+check("the same press seen twice is ignored", d.feed(1.02), False)
+d = pw.DoublePress(window=0.55, debounce=0.04)
+d.feed(1.0)
+check("a late second press is not a double", d.feed(1.7), False)
 
 check("a game launched from the desktop never starts anything",
       run([GAME] * 8), [])

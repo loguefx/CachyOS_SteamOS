@@ -43,13 +43,14 @@ CFG_RESOLUTION=auto
 CFG_REFRESH=auto
 CFG_HDR=off
 CFG_VRR=on
-CFG_TRACKPAD_FIX=on
+CFG_TRACKPAD_FIX=off
 CFG_GRAB_CURSOR=on
 CFG_RESTART_STEAM=on
 CFG_AUDIO_DEVICE=""
 CFG_AUDIO_INPUT_DEVICE=""
 CFG_IGNORE_CONTROLLERS=""
 CFG_PRIMARY_CONTROLLER=steam
+CFG_PRIMARY_ONLY=on
 CFG_STEAM_PAD_AS_XBOX=on
 CFG_EXTRA_GAMESCOPE_ARGS=""
 
@@ -111,7 +112,7 @@ load_config() {
         value="${value%\"}"; value="${value#\"}"
         value="${value%\'}"; value="${value#\'}"
         case "$key" in
-            DISPLAY|DISPLAY_MODEL|RESOLUTION|REFRESH|HDR|VRR|TRACKPAD_FIX|GRAB_CURSOR|RESTART_STEAM|EXTRA_GAMESCOPE_ARGS|AUDIO_DEVICE|AUDIO_INPUT_DEVICE|IGNORE_CONTROLLERS|PRIMARY_CONTROLLER|STEAM_PAD_AS_XBOX)
+            DISPLAY|DISPLAY_MODEL|RESOLUTION|REFRESH|HDR|VRR|TRACKPAD_FIX|GRAB_CURSOR|RESTART_STEAM|EXTRA_GAMESCOPE_ARGS|AUDIO_DEVICE|AUDIO_INPUT_DEVICE|IGNORE_CONTROLLERS|PRIMARY_CONTROLLER|PRIMARY_ONLY|STEAM_PAD_AS_XBOX)
                 printf -v "CFG_$key" '%s' "$value" ;;
             STEAM_BUTTON|AUDIO_FOCUS|AUDIO_NEVER_MUTE|AUDIO_PIN_VOICE) ;;   # read by the services, not by us
             "") ;;
@@ -464,13 +465,23 @@ gamescope_has_rt() {
     [[ "$caps" == *cap_sys_nice* ]]
 }
 
+# This gamescope hosts its own emulated-input socket, so Steam's trackpad XTEST
+# stays inside the session instead of becoming a mouse on the desk.
+gamescope_has_eis() {
+    have gamescope || return 1
+    ldd "$(command -v gamescope)" 2>/dev/null | grep -q libeis
+}
+
 gamescope_argv() {
     local -n out=$1
     out=(gamescope
+         -w "$WIDTH" -h "$HEIGHT"
          -W "$WIDTH" -H "$HEIGHT"
          -r "$REFRESH"
          --fullscreen
+         --force-windows-fullscreen
          --steam
+         --xwayland-count 2
          --expose-wayland)
 
     is_on "$CFG_VRR" && out+=(--adaptive-sync)
@@ -508,9 +519,14 @@ gamescope_argv() {
     # instead of inside gamescope. The WSI layer then shows a GTK dialog on the
     # desktop, where a controller cannot reach it to click OK.
     # Strip WAYLAND_DISPLAY and force toolkit dialogs onto gamescope's X11.
+    # Two Xwaylands, the way SteamOS does it: Steam and Discord on the first,
+    # the game on the second. Switching to Discord is then a compositor switch,
+    # not an X11 focus loss, so a Proton game does not drop exclusive fullscreen
+    # and come back as a postage stamp in the corner.
     out+=(-- env -u WAYLAND_DISPLAY
           GDK_BACKEND=x11
-          QT_QPA_PLATFORM=xcb)
+          QT_QPA_PLATFORM=xcb
+          STEAM_MULTIPLE_XWAYLANDS=1)
 
     # Proton hands games Steam Input's virtual pad as 28de:11ff, an id that
     # games which only accept gamepads they know (Dead Rising 2: "Unsupported
@@ -647,7 +663,9 @@ start_player_one() {
             return 0
         }
     fi
-    "$helper" watch --primary "$primary" </dev/null >&2 &
+    local args=(watch --primary "$primary")
+    is_on "$CFG_PRIMARY_ONLY" && args+=(--only)
+    "$helper" "${args[@]}" </dev/null >&2 &
     printf '%s\n' "$!"
 }
 
@@ -715,6 +733,7 @@ It will not choose a screen for you."
         say "  microphone: ${dry_source:-(session default)}"
         say "  hidden controllers: ${CFG_IGNORE_CONTROLLERS:-(none)}"
         say "  player one: ${CFG_PRIMARY_CONTROLLER:-off}"
+        say "  hide other controllers: ${CFG_PRIMARY_ONLY:-off}"
         say "  Steam's pad as an Xbox 360 pad in games: ${CFG_STEAM_PAD_AS_XBOX:-off}"
         return 0
     fi
@@ -844,6 +863,18 @@ It will not choose a screen for you."
 
 write_config() {
     mkdir -p "$CONFIG_DIR"
+    # An existing file is patched, not rewritten. setup only asked about the
+    # display and two flags; AUDIO_NEVER_MUTE, MOUSE_LAYOUT_APPS and the rest
+    # are the user's. The last time this wrote the whole file it reset Discord
+    # to the default names and dropped the appid that keeps it audible.
+    if [[ -r "$CONFIG_FILE" ]]; then
+        "$HELPER_DISPLAY" config-set \
+            "DISPLAY=$CFG_DISPLAY" \
+            "VRR=$CFG_VRR" \
+            "HDR=$CFG_HDR"
+        say "Updated $CONFIG_FILE (other settings left as they were)"
+        return
+    fi
     cat > "$CONFIG_FILE" <<EOF
 # cachy-console configuration
 # Written by 'cachy-console setup'; safe to edit by hand.
@@ -865,17 +896,14 @@ VRR=$CFG_VRR
 # HDR. Only worth turning on if the display and your games support it.
 HDR=$CFG_HDR
 
-# Preload extest so Steam's trackpad XTEST calls become uinput events, which a
-# desktop Wayland session needs to avoid an "allow remote interaction" prompt.
-# Leave this off: gamescope emulates input itself, so the trackpad already moves
-# its cursor, and extest would replay the calls on the desktop instead -- no
-# cursor in console mode at all. Only for a gamescope too old to emulate input.
+# Preload extest so Steam's trackpad becomes a real mouse on the desk. Off,
+# because this gamescope already turns those XTEST calls into its own cursor,
+# and extest would move the desktop pointer instead — Discord and Spotify
+# then follow the desk mouse. Only on for a gamescope built without libeis.
 TRACKPAD_FIX=$CFG_TRACKPAD_FIX
 
-# Keep the pointer inside gamescope by holding it in relative mouse mode. Off,
-# because on means no cursor is ever drawn: a desktop application in the session
-# -- Discord -- cannot be clicked, however much the trackpad moves. Turn it on
-# only for a mouse on a desk that keeps sliding onto another monitor mid-game.
+# Hold gamescope in relative mouse mode so it draws its own cursor and keeps
+# the pointer in the session. Off hands the cursor back to the desktop.
 GRAB_CURSOR=$CFG_GRAB_CURSOR
 
 # Start the ordinary desktop Steam client again when console mode ends. Leaving
@@ -940,6 +968,11 @@ IGNORE_CONTROLLERS=$CFG_IGNORE_CONTROLLERS
 # (bound to this machine only), and PlayStation controllers go through Steam
 # Input for the session so they can be ordered at all. Also in Cachy Console.
 PRIMARY_CONTROLLER=$CFG_PRIMARY_CONTROLLER
+
+# Hide every other controller while the one above is connected, so Big Picture
+# and games only see player one. Off for local multiplayer. Needs the USB
+# helper ./install.sh can grant (one sudo, then no password).
+PRIMARY_ONLY=$CFG_PRIMARY_ONLY
 
 # Show games Steam's controller as an Xbox 360 pad rather than as Steam's own
 # virtual pad, which older games that only accept pads they know (Dead Rising 2)
@@ -1068,6 +1101,11 @@ status() {
             warnings=$(( warnings + 1 ))
         fi
         if is_on "$CFG_TRACKPAD_FIX"; then
+            if gamescope_has_eis; then
+                warn "TRACKPAD_FIX is on, so the trackpad is a mouse on the desk as well"
+                warn "as in the session. Turn it off to keep the two cursors apart."
+                warnings=$(( warnings + 1 ))
+            fi
             if ! extest_available; then
                 warn "TRACKPAD_FIX is on but libextest is not installed."
                 say "       paru -S libextest-git"
@@ -1090,10 +1128,13 @@ status() {
                 warn "crashes Steam at the first trackpad movement. Run install.sh again."
                 warnings=$(( warnings + 1 ))
             fi
+        elif gamescope_has_eis; then
+            say "  TRACKPAD_FIX is off, so the trackpad moves gamescope's cursor and"
+            say "  leaves the desktop pointer alone."
         else
-            warn "TRACKPAD_FIX is off, so Steam's trackpad emulation reaches the session"
-            warn "as XTEST, which moves the X pointer without any client noticing. The"
-            warn "Steam keyboard still types; the trackpad does nothing."
+            warn "TRACKPAD_FIX is off, and this gamescope cannot emulate the trackpad"
+            warn "itself. The Steam keyboard still types; the trackpad does nothing."
+            warn "Turn TRACKPAD_FIX on, or use a gamescope built with libeis."
             warnings=$(( warnings + 1 ))
         fi
 
@@ -1171,8 +1212,25 @@ status() {
     say "== controllers =="
     "$HELPER_DISPLAY" controllers || true
     say "  player one: ${CFG_PRIMARY_CONTROLLER:-off}"
+    say "  hide other controllers: ${CFG_PRIMARY_ONLY:-off}"
     if [[ "${CFG_PRIMARY_CONTROLLER,,}" != off && ! -e "$STEAM_DEVTOOLS_FLAG" ]]; then
         say "  (Steam's DevTools port is turned on when console mode next starts)"
+    fi
+    if is_on "$CFG_PRIMARY_ONLY" && [[ "${CFG_PRIMARY_CONTROLLER,,}" != off \
+            && ! -x /usr/local/libexec/cachy-console-usb ]]; then
+        warn "PRIMARY_ONLY is on but the USB helper is not installed, so other"
+        warn "controllers stay visible in games. Grant it with ./install.sh."
+        warnings=$(( warnings + 1 ))
+    fi
+
+    say
+    say "== library tiles =="
+    # Discord and Spotify are how voice and music get on the couch. A missing
+    # wrapper or AUDIO_NEVER_MUTE entry is the silent failure status is for.
+    if "$(find_helper "$NAME-shortcut")" --check-tiles; then
+        :
+    else
+        warnings=$(( warnings + 1 ))
     fi
 
     say

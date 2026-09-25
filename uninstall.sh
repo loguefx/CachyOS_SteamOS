@@ -55,7 +55,11 @@ else
 fi
 
 say
-say "Four things this cannot undo for you:"
+say "Five things this cannot undo for you:"
+say "  - the USB helper that hides other controllers during a session:"
+say "      sudo rm -f /usr/local/libexec/cachy-console-usb"
+say "      sudo rm -f /usr/share/polkit-1/actions/org.cachyconsole.usb.policy"
+say "      sudo rm -f /etc/polkit-1/rules.d/50-cachy-console-usb.rules"
 say "  - the udev rule from cachy-console hide-controllers, if you ran it. Empty"
 say "    IGNORE_CONTROLLERS and run it again before uninstalling, or afterwards:"
 say "      sudo rm /etc/udev/rules.d/70-cachy-console-hide-controllers.rules"

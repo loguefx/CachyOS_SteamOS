@@ -250,6 +250,19 @@ check("the resolved index is passed through",
 check("and the connector by name as well, for a backend that can use it",
       argv[argv.index("--prefer-output") + 1] if "--prefer-output" in argv else None,
       "HDMI-A-1")
+check("the nested size matches the television, so a DLC or store window cannot "
+      "shrink the session to a postage stamp in the corner",
+      (argv[argv.index("-w") + 1], argv[argv.index("-h") + 1],
+       argv[argv.index("-W") + 1], argv[argv.index("-H") + 1]),
+      (argv[argv.index("-W") + 1], argv[argv.index("-H") + 1],
+       argv[argv.index("-W") + 1], argv[argv.index("-H") + 1]))
+check("and every window is forced to that size",
+      "--force-windows-fullscreen" in argv, True)
+check("a second Xwayland holds the game, so opening Discord is not a focus loss",
+      argv[argv.index("--xwayland-count") + 1] if "--xwayland-count" in argv else None,
+      "2")
+check("and Steam is told to put games there",
+      "STEAM_MULTIPLE_XWAYLANDS=1" in argv, True)
 w.clean()
 
 print()
@@ -297,13 +310,19 @@ def preloaded(argv):
     return [a for a in argv if a.startswith(("LD_PRELOAD=", "CACHY_CONSOLE_PRELOAD="))]
 
 
+w = World("DISPLAY=HDMI-A-1\n")
+check("by default the trackpad stays inside gamescope, so the desktop cursor "
+      "is a different pointer",
+      preloaded(w.argv()), [])
+w.clean()
+
 # Only meaningful where extest exists: the wrapper will not preload a library
 # that is not installed, and refusing to is the correct behaviour there.
 if os.path.exists("/usr/lib/libextest.so") or os.path.exists("/usr/lib32/libextest.so"):
-    w = World("DISPLAY=HDMI-A-1\n")
+    w = World("DISPLAY=HDMI-A-1\nTRACKPAD_FIX=on\n")
     argv = w.argv()
-    check("extest is preloaded into Steam by default, since XTEST alone moves "
-          "nothing a client can see, with the guard in front of it",
+    check("asking for the old host-mouse path preloads extest, with the guard "
+          "in front of it",
           preloaded(argv),
           [f"CACHY_CONSOLE_PRELOAD={w.guard}/$LIB/libcachy-extest-init.so:libextest.so"])
     check("and the guard is told the desktop's compositor, the one extest can "
@@ -314,7 +333,7 @@ if os.path.exists("/usr/lib/libextest.so") or os.path.exists("/usr/lib32/libexte
           "WAYLAND_DISPLAY" in argv[argv.index("-u") + 1:argv.index("-u") + 2], True)
     w.clean()
 
-    w = World("DISPLAY=HDMI-A-1\n", extest_guard=False)
+    w = World("DISPLAY=HDMI-A-1\nTRACKPAD_FIX=on\n", extest_guard=False)
     argv = w.argv()
     check("without the guard extest is left off: alone, it aborts Steam at the "
           "first trackpad movement",
@@ -406,11 +425,8 @@ got = w.read("steam-env")
 check("Steam in the session still plays and listens where the settings say",
       [e for e in got if e.startswith("PULSE_")],
       ["PULSE_SINK=alsa_output.fake", "PULSE_SOURCE=alsa_input.fake"])
-if os.path.exists("/usr/lib/libextest.so") or os.path.exists("/usr/lib32/libextest.so"):
-    check("and has extest preloaded behind its guard, under its real name and "
-          "nowhere else",
-          [e for e in got if "PRELOAD" in e],
-          [f"LD_PRELOAD={w.guard}/$LIB/libcachy-extest-init.so:libextest.so"])
+check("and does not turn the trackpad into a desktop mouse",
+      [e for e in got if "PRELOAD" in e], [])
 w.clean()
 
 print()
@@ -479,7 +495,8 @@ w.started()
 time.sleep(0.5)
 seq = w.read("sequence")
 check("by default the Steam Controller is kept in player one for the session",
-      [e for e in seq if e.startswith("pads watch")], ["pads watch --primary steam"])
+      [e for e in seq if e.startswith("pads watch")],
+      ["pads watch --primary steam --only"])
 check("and the watch ends with the session's Steam", "pads stopped" in seq, True)
 check("Steam's DevTools port is turned on before the client that reads it starts",
       os.path.exists(os.path.join(w.steam_root, ".cef-enable-remote-debugging")), True)
@@ -490,7 +507,15 @@ w.started()
 time.sleep(0.5)
 check("the choice comes from the config, in any case",
       [e for e in w.read("sequence") if e.startswith("pads watch")],
-      ["pads watch --primary playstation"])
+      ["pads watch --primary playstation --only"])
+w.clean()
+
+w = World("DISPLAY=HDMI-A-1\nPRIMARY_ONLY=off\n", pads=True)
+w.started()
+time.sleep(0.5)
+check("turning PRIMARY_ONLY off still reorders, and leaves the others connected",
+      [e for e in w.read("sequence") if e.startswith("pads watch")],
+      ["pads watch --primary steam"])
 w.clean()
 
 w = World("DISPLAY=HDMI-A-1\nPRIMARY_CONTROLLER=off\n", pads=True)

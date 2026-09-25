@@ -1,0 +1,32 @@
+#!/bin/bash
+# Switches USB controllers off (0) and back on (1) for console mode's "only
+# player one" setting. Run as root through pkexec by cachy-console-pads, which
+# a polkit rule lets the installing user do without a password -- so this takes
+# nothing but bus names like 5-2 or 5-1:1.0, touches nothing but their
+# `authorized` file, and never a hub, whose ports would take every device on
+# them along.
+#
+#   cachy-console-usb 0|1 NAME...
+set -eu
+PATH=/usr/bin:/bin
+ROOT="${CACHY_CONSOLE_USB_DEVICES:-/sys/bus/usb/devices}"
+
+value="${1-}"
+case "$value" in
+    0|1) shift ;;
+    *) echo "usage: cachy-console-usb 0|1 NAME..." >&2; exit 2 ;;
+esac
+
+for name in "$@"; do
+    if [[ ! "$name" =~ ^[0-9]+-[0-9]+(\.[0-9]+)*(:[0-9]+\.[0-9]+)?$ ]]; then
+        echo "cachy-console-usb: refusing $name" >&2
+        exit 2
+    fi
+    dir="$ROOT/$name"
+    [[ -e "$dir/authorized" ]] || continue
+    if [[ "$name" != *:* && "$(cat "$dir/bDeviceClass" 2>/dev/null)" == 09 ]]; then
+        echo "cachy-console-usb: refusing hub $name" >&2
+        exit 2
+    fi
+    echo "$value" > "$dir/authorized"
+done

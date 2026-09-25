@@ -208,11 +208,14 @@ class World:
         except OSError:
             return None
 
-    def watch(self, primary="steam", **extra):
-        return subprocess.Popen([TARGET, "watch", "--primary", primary,
-                                 "--wait", "5", "--interval", "0.1"],
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, env=self.env(**extra))
+    def watch(self, primary="steam", only=False, **extra):
+        cmd = [TARGET, "watch", "--primary", primary,
+               "--wait", "5", "--interval", "0.1"]
+        if only:
+            cmd.append("--only")
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True,
+                                env=self.env(**extra))
 
     def settle(self, until, timeout=5):
         deadline = time.monotonic() + timeout
@@ -368,6 +371,102 @@ check("while console mode is running, the session's client is left alone",
 fake_gs.kill()
 fake_gs.wait()
 w.clean()
+
+print()
+print("Hiding every controller but player one")
+
+
+def write_attr(path, name, value):
+    os.makedirs(path, exist_ok=True)
+    with open(os.path.join(path, name), "w") as fh:
+        fh.write(value + "\n")
+
+
+def fake_usb(root, devices):
+    """A throwaway /sys/bus/usb/devices the helper's scanner will accept."""
+    for spec in devices:
+        dev = os.path.join(root, spec["name"])
+        write_attr(dev, "idVendor", spec["vendor"])
+        write_attr(dev, "idProduct", spec.get("product", "0000"))
+        write_attr(dev, "bDeviceClass", spec.get("class", "00"))
+        write_attr(dev, "authorized", spec.get("authorized", "1"))
+        for iface in spec.get("ifaces", []):
+            ipath = os.path.join(root, spec["name"] + ":" + iface["n"])
+            write_attr(ipath, "bInterfaceClass", iface["class"])
+            write_attr(ipath, "bInterfaceSubClass", iface.get("sub", "00"))
+            write_attr(ipath, "bInterfaceProtocol", iface.get("proto", "00"))
+            write_attr(ipath, "authorized", iface.get("authorized", "1"))
+            if iface.get("js"):
+                js = os.path.join(ipath, "input", "input1", "js0")
+                os.makedirs(js, exist_ok=True)
+    return root
+
+
+usb = tempfile.mkdtemp()
+pads.USB_DEVICES = usb
+fake_usb(usb, [
+    {"name": "5-2", "vendor": "054c", "product": "0ce6",
+     "ifaces": [{"n": "1.0", "class": "03"}]},
+    {"name": "5-3", "vendor": "28de", "product": "1142",
+     "ifaces": [{"n": "1.0", "class": "03", "sub": "01", "proto": "01"}]},
+    {"name": "3-2", "vendor": "045e", "product": "028e",
+     "ifaces": [{"n": "1.0", "class": "ff", "sub": "5d"}]},
+    {"name": "5-1", "vendor": "31e3", "product": "1400",
+     "ifaces": [{"n": "1.0", "class": "ff", "sub": "5d"},
+                {"n": "1.1", "class": "03", "sub": "01", "proto": "01"}]},
+    {"name": "usb5", "vendor": "1d6b", "class": "09"},
+])
+found = {(c["kind"], tuple(c["targets"])) for c in pads.usb_controllers()}
+check("a DualSense is a PlayStation pad to hide as a whole device",
+      ("playstation", ("5-2",)) in found, True)
+check("a Steam dongle is Steam, even though the kernel only sees a keyboard",
+      ("steam", ("5-3",)) in found, True)
+check("an Xbox pad is Xbox", ("xbox", ("3-2",)) in found, True)
+check("a keyboard's gamepad is only its Xbox interface, so it still types",
+      ("xbox", ("5-1:1.0",)) in found, True)
+check("and a hub is never a controller",
+      any("usb5" in c["targets"] or c["targets"] == ("usb5",) for c in pads.usb_controllers()),
+      False)
+
+off, on = pads.plan("steam", True, set())
+check("with a Steam Controller present, the DualSense and the Xbox pad go",
+      set(off), {"5-2", "3-2", "5-1:1.0"})
+check("and nothing is restored that we did not hide", on, [])
+off, on = pads.plan("steam", True, {"5-2"})
+check("one already off is not switched off again",
+      "5-2" not in off and "3-2" in off, True)
+off, on = pads.plan("steam", False, {"5-2", "3-2"})
+check("when player one is gone, what we hid comes back",
+      (off, set(on)), ([], {"5-2", "3-2"}))
+shutil.rmtree(usb)
+
+usb = tempfile.mkdtemp()
+fake_usb(usb, [
+    {"name": "5-2", "vendor": "054c", "product": "0ce6",
+     "ifaces": [{"n": "1.0", "class": "03"}]},
+])
+helper = os.path.join(usb, "helper")
+log = os.path.join(usb, "calls")
+with open(helper, "w") as fh:
+    fh.write("#!/bin/bash\n"
+             f"printf '%s\\n' \"$*\" >> {log!r}\n"
+             "val=$1; shift\n"
+             "for n; do printf '%s\\n' \"$val\" "
+             "> \"$CACHY_CONSOLE_USB_DEVICES/$n/authorized\"; done\n")
+os.chmod(helper, 0o755)
+w = World([pad(DUALSENSE, 0), pad(STEAM_CONTROLLER, 1)])
+proc = w.watch(only=True, CACHY_CONSOLE_USB_DEVICES=usb,
+               CACHY_CONSOLE_USB_HELPER=helper, CACHY_CONSOLE_PKEXEC="")
+w.settle(lambda: os.path.exists(log) and "0 5-2" in open(log).read())
+check("the DualSense is switched off once the Steam Controller is player one",
+      os.path.exists(log) and "0 5-2" in open(log).read(), True)
+check("and stays off on the bus",
+      open(os.path.join(usb, "5-2", "authorized")).read().strip(), "0")
+finish(proc)
+check("leaving the session switches it back on",
+      open(os.path.join(usb, "5-2", "authorized")).read().strip(), "1")
+w.clean()
+shutil.rmtree(usb)
 
 print()
 if FAILURES:

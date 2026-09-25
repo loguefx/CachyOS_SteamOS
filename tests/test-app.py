@@ -84,6 +84,9 @@ class FakeXprop:
         if self.display_gone:
             return None
         if argv[3] == "-root":
+            # xprop -root with no property: the display answered.
+            if len(argv) < 5:
+                return None if self.display_gone else "\n"
             return self.props.get(argv[4])
         return self.props.get((argv[4], argv[5]))
 
@@ -110,6 +113,14 @@ check("a desktop falls back to the ordinary client list", windows.listed(),
 windows, _ = windows_with({}, display_gone=True)
 check("an unreachable X server is None, not an empty screen",
       windows.listed(), None)
+
+windows, _ = windows_with({app.GAMESCOPE_WINDOW_LIST: GAMESCOPE_ABSENT,
+                           app.DESKTOP_WINDOW_LIST: MISSING})
+check("a live display with no window list is empty, not gone",
+      windows.listed(), [])
+windows, _ = windows_with({})
+check("and so is one whose list atoms xprop cannot name",
+      windows.listed(), [])
 
 print()
 print("whose window is it:")
@@ -415,6 +426,35 @@ check("someone else's player is left playing",
       (app.mpris_quit({9999}, run=fake_busctl), len(calls)), ([], 1))
 check("no session bus is no players, not a crash",
       app.mpris_quit({4242}, run=lambda argv, timeout=5: None), [])
+
+print()
+print("which Xwayland a desktop tile uses")
+# STEAM_GAME_DISPLAY_0 is the game server. Steam itself stays on DISPLAY=:1.
+check("Discord sits on Steam's display, not the game's",
+      app.ui_display({"DISPLAY": ":1", "STEAM_GAME_DISPLAY_0": ":2"}), ":1")
+check("a tile Steam already pointed at the game server is moved back",
+      app.ui_display({"DISPLAY": ":2", "STEAM_GAME_DISPLAY_0": ":2"},
+                     probe=lambda d: d == ":1"), ":1")
+check("and with only one Xwayland that is the one it already has",
+      app.ui_display({"DISPLAY": ":1"}), ":1")
+check("no display at all is refused rather than guessed",
+      app.ui_display({}), "")
+
+print()
+print("the session log sees what Steam does not")
+sink = os.path.join(tempfile.mkdtemp(), "session.log")
+app.log("started discord (pid 1) on :1 in /home/u",
+        stream=open(os.devnull, "w"), log_path=sink)
+with open(sink) as fh:
+    logged = fh.read()
+check("a wrapper line is appended to the session log",
+      logged, "[cachy-console-app] started discord (pid 1) on :1 in /home/u\n")
+app.log("quitting discord: the display went away",
+        stream=open(os.devnull, "w"), log_path=sink)
+with open(sink) as fh:
+    logged = fh.read()
+check("and a later quit reason is kept after it",
+      "the display went away" in logged, True)
 
 print()
 if FAILURES:

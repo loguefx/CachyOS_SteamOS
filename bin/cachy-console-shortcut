@@ -277,6 +277,121 @@ def start_dir(exe):
     return where
 
 
+# Tiles a couch session expects, and the breakage we keep rediscovering by
+# hand: missing, launched without the wrapper, or muted like a game.
+COUCH_TILES = (
+    {"name": "Discord",
+     "hint": "cachy-console shortcut --name Discord --exe /usr/bin/discord"},
+    {"name": "Spotify",
+     "hint": ("cachy-console shortcut --name Spotify "
+              "--exe /usr/bin/spotify-launcher --process spotify")},
+)
+
+CONFIG_PATH = os.path.expanduser("~/.config/cachy-console/config")
+
+
+def collect_shortcuts(paths=None):
+    """Every non-Steam shortcut across Steam accounts, ignoring bad files."""
+    entries = []
+    for path in (config_paths() if paths is None else paths):
+        try:
+            obj = load(path)
+        except (OSError, VDFError):
+            continue
+        for entry in obj.get("shortcuts", {}).values():
+            if isinstance(entry, dict):
+                entries.append(entry)
+    return entries
+
+
+def never_mute_items(raw):
+    return {item.strip().lower()
+            for item in (raw or "").replace(";", ",").split(",")
+            if item.strip()}
+
+
+def read_never_mute(path=None):
+    path = CONFIG_PATH if path is None else path
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if line.startswith("AUDIO_NEVER_MUTE="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return ""
+
+
+def find_named_tile(shortcuts, name):
+    want = name.lower()
+    for entry in shortcuts:
+        if (entry.get("AppName") or "").strip().lower() == want:
+            return entry
+    return None
+
+
+def tile_is_wrapped(entry, marker="cachy-console-app"):
+    return marker in (entry.get("LaunchOptions") or "")
+
+
+def tile_never_muted(entry, names):
+    app = (entry.get("AppName") or "").strip().lower()
+    appid = str(entry.get("appid") or "")
+    return app in names or appid in names
+
+
+def check_couch_tiles(shortcuts, never_mute=""):
+    """[(name, ok, detail)] for Discord and Spotify."""
+    names = never_mute_items(never_mute)
+    rows = []
+    for spec in COUCH_TILES:
+        entry = find_named_tile(shortcuts, spec["name"])
+        if entry is None:
+            rows.append((spec["name"], False, "missing"))
+            continue
+        problems = []
+        if not tile_is_wrapped(entry):
+            problems.append("not wrapped")
+        if not tile_never_muted(entry, names):
+            problems.append("muted")
+        if problems:
+            rows.append((spec["name"], False, ", ".join(problems)))
+        else:
+            rows.append((spec["name"], True, "present, wrapped, never muted"))
+    return rows
+
+
+def report_tiles(shortcuts=None, never_mute=None, out=None):
+    """Print the couch-tile report. Non-zero if anything is off."""
+    dest = out or sys.stdout
+    if shortcuts is None:
+        paths = config_paths()
+        if not paths:
+            print("  no Steam library found", file=dest)
+            return 1
+        shortcuts = collect_shortcuts(paths)
+    if never_mute is None:
+        never_mute = read_never_mute()
+    hints = {spec["name"]: spec["hint"] for spec in COUCH_TILES}
+    bad = 0
+    for name, ok, detail in check_couch_tiles(shortcuts, never_mute):
+        print(f"  {name:<22} {detail}", file=dest)
+        if ok:
+            continue
+        bad += 1
+        if detail == "missing":
+            print(f"    add with: {hints[name]}", file=dest)
+        else:
+            if "not wrapped" in detail:
+                print("    launch options should wrap cachy-console-app",
+                      file=dest)
+            if "muted" in detail:
+                print(f"    add {name} (or its appid) to AUDIO_NEVER_MUTE",
+                      file=dest)
+    return 1 if bad else 0
+
+
 def launch_options(exe, name, wrapper, processes=()):
     """How Steam should run this tile.
 
@@ -344,7 +459,12 @@ def main():
                     help="launch the program directly, without the helper that "
                          "frees its single-instance lock and quits it when its "
                          "window closes")
+    ap.add_argument("--check-tiles", action="store_true",
+                    help="report whether Discord and Spotify tiles are wrapped "
+                         "and listed in AUDIO_NEVER_MUTE")
     args = ap.parse_args()
+    if args.check_tiles:
+        return report_tiles()
 
     if args.color and artwork is not None:
         try:

@@ -1,0 +1,7 @@
+// Written by install.sh for the user who installed console mode, so hiding
+// other controllers during a session does not ask for a password every time.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.cachyconsole.usb" && subject.user == "__USER__") {
+        return polkit.Result.YES;
+    }
+});

@@ -228,6 +228,15 @@ check("set keeps the other keys", again["RESOLUTION"], "1920x1080")
 check("set updates DISPLAY", again["DISPLAY"], "DP-2")
 check("saved_connector follows the file", cd.saved_connector(), "DP-2")
 
+# setup used to rewrite the whole file and drop the Discord appid that keeps
+# voice chat audible. It now patches the same way settings does.
+cd.update_config({"AUDIO_NEVER_MUTE": "Discord,3214031495,Spotify"})
+cd.update_config({"DISPLAY": "HDMI-A-1", "VRR": "on", "HDR": "off"})
+check("a setup-style patch leaves AUDIO_NEVER_MUTE alone",
+      cd.read_config()["AUDIO_NEVER_MUTE"], "Discord,3214031495,Spotify")
+check("and still writes the display it was asked for",
+      cd.read_config()["DISPLAY"], "HDMI-A-1")
+
 cd.CONFIG_PATH = "/nonexistent/config"
 check("a missing config is not an error", cd.read_config(), {})
 check("missing config means no saved display", cd.saved_connector(), None)

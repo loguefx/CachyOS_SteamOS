@@ -275,6 +275,33 @@ check("the appid still comes from the exe and name alone",
       ies.shortcut_appid('"/usr/bin/spotify-launcher"', "Spotify"))
 
 print()
+print("couch tiles status can see:")
+discord = ies.build_entry(DISCORD, "Discord", "", WRAPPER)
+spotify = ies.build_entry("/usr/bin/spotify-launcher", "Spotify", "", WRAPPER,
+                          ["spotify"])
+library = [discord, spotify]
+check("a wrapped pair with AUDIO_NEVER_MUTE is fine",
+      ies.check_couch_tiles(library, "Discord, Spotify"),
+      [("Discord", True, "present, wrapped, never muted"),
+       ("Spotify", True, "present, wrapped, never muted")])
+check("the Discord appid counts as never muted too",
+      ies.check_couch_tiles([discord], "3214031495,Spotify")[0][1], True)
+check("a tile without the wrapper is called out",
+      ies.check_couch_tiles([ies.build_entry(DISCORD, "Discord")],
+                            "Discord, Spotify")[0],
+      ("Discord", False, "not wrapped"))
+check("and so is one that would be muted like a game",
+      ies.check_couch_tiles([discord], "Spotify")[0],
+      ("Discord", False, "muted"))
+check("a missing tile is missing, not guessed",
+      ies.check_couch_tiles([], "Discord, Spotify"),
+      [("Discord", False, "missing"), ("Spotify", False, "missing")])
+bare = ies.build_entry(DISCORD, "Discord")
+check("both problems are named when they happen together",
+      ies.check_couch_tiles([bare], "")[0],
+      ("Discord", False, "not wrapped, muted"))
+
+print()
 if FAILURES:
     print(f"{len(FAILURES)} failure(s): " + ", ".join(FAILURES))
     sys.exit(1)

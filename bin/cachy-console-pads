@@ -13,15 +13,19 @@ Reordering only reaches controllers that go through Steam Input: a DualSense
 the game reads directly is outside Steam's slots, and in a Proton game it takes
 player one whatever Steam's order says. So while this runs, PlayStation
 controllers are put through Steam Input in every game, and the setting the
-user had is put back when the session ends.
+user had is put back when the session ends. With --only, every other physical
+controller is switched off at USB for as long as player one is connected.
 """
 
 import argparse
 import base64
+import glob
 import json
 import os
+import signal
 import socket
 import struct
+import subprocess
 import sys
 import time
 import urllib.request
@@ -33,6 +37,14 @@ GAMESCOPE_NAMES = tuple(os.environ.get("CACHY_CONSOLE_GAMESCOPE_COMM",
 STATE = os.path.join(os.environ.get("XDG_STATE_HOME")
                      or os.path.expanduser("~/.local/state"), "cachy-console")
 PS_SAVED = os.path.join(STATE, "ps-support-saved")
+HIDDEN = os.path.join(STATE, "hidden-controllers")
+USB_DEVICES = os.environ.get("CACHY_CONSOLE_USB_DEVICES", "/sys/bus/usb/devices")
+USB_HELPER = os.environ.get("CACHY_CONSOLE_USB_HELPER",
+                            "/usr/local/libexec/cachy-console-usb")
+PKEXEC = os.environ.get("CACHY_CONSOLE_PKEXEC", "pkexec")
+# A Steam Controller drops out of Steam's list for a moment as it wakes and
+# reconnects; the others only come back once player one has really gone.
+ABSENT_GRACE = float(os.environ.get("CACHY_CONSOLE_PADS_ABSENT_GRACE", "5"))
 
 # CMsgClientSettings.controller_ps_support: 0 off, 1 in games without
 # PlayStation support, 2 always.
@@ -278,7 +290,170 @@ def force_ps_support(page):
     say("PlayStation controllers go through Steam Input for this session")
 
 
-def cmd_watch(kind, wait, interval):
+# ---- only player one ------------------------------------------------------
+#
+# Hiding the others from Steam alone is not enough: Steam hides a physical
+# controller from games only while it is managing that controller itself, so
+# one Steam ignores is handed straight to Proton. They are switched off at the
+# USB level instead, which takes them away from Big Picture and every game
+# alike, and only while player one is actually connected -- the moment it goes,
+# the rest come back, so there is never no controller at all.
+
+VENDOR_KINDS = {"28de": "steam", "054c": "playstation", "057e": "switch"}
+XBOX_SUBCLASSES = ("5d", "47")
+
+
+def _attr(path):
+    try:
+        with open(path) as fh:
+            return fh.read().strip().lower()
+    except OSError:
+        return ""
+
+
+def usb_controllers():
+    """[{"kind", "targets"}] for every physical controller on USB.
+
+    targets are the bus names to switch off: the whole device, or for a
+    keyboard with a gamepad mode only its Xbox-protocol interface, since the
+    device is also what types. A device of Valve's, Sony's or Nintendo's is a
+    controller by vendor alone -- a Steam Controller's receiver shows the kernel
+    nothing but a keyboard and a mouse -- and anything else by an Xbox
+    interface or a joystick node. Hubs, and the virtual pads Steam Input makes,
+    are never on the bus list at all."""
+    found = []
+    for dev in sorted(glob.glob(os.path.join(USB_DEVICES, "*"))):
+        name = os.path.basename(dev)
+        if ":" in name or name.startswith("usb"):
+            continue
+        vendor = _attr(os.path.join(dev, "idVendor"))
+        if not vendor or _attr(os.path.join(dev, "bDeviceClass")) == "09":
+            continue
+        ifaces = sorted(glob.glob(os.path.join(USB_DEVICES, name + ":*")))
+        xbox = [os.path.basename(i) for i in ifaces
+                if _attr(os.path.join(i, "bInterfaceClass")) == "ff"
+                and _attr(os.path.join(i, "bInterfaceSubClass")) in XBOX_SUBCLASSES]
+        types = any(_attr(os.path.join(i, "bInterfaceClass")) == "03"
+                    and _attr(os.path.join(i, "bInterfaceProtocol")) in ("01", "02")
+                    for i in ifaces)
+        joystick = bool(glob.glob(os.path.join(dev, "*", "input", "input*", "js*")))
+        if vendor in VENDOR_KINDS:
+            found.append({"kind": VENDOR_KINDS[vendor], "targets": [name]})
+        elif xbox or joystick:
+            kind = "xbox" if xbox or vendor == "045e" else "other"
+            if not types:
+                found.append({"kind": kind, "targets": [name]})
+            elif xbox:
+                found.append({"kind": kind, "targets": xbox})
+    return found
+
+
+def read_hidden():
+    try:
+        with open(HIDDEN) as fh:
+            return {line.strip() for line in fh if line.strip()}
+    except OSError:
+        return set()
+
+
+def write_hidden(names):
+    if not names:
+        try:
+            os.unlink(HIDDEN)
+        except FileNotFoundError:
+            pass
+        return
+    os.makedirs(STATE, exist_ok=True)
+    tmp = HIDDEN + ".new"
+    with open(tmp, "w") as fh:
+        fh.write("".join(f"{n}\n" for n in sorted(names)))
+    os.replace(tmp, HIDDEN)
+
+
+def plan(kind, present, hidden):
+    """(switch off, switch back on) for the controllers on the bus now.
+
+    Only what this switched off is ever switched back on: an interface that is
+    off already -- hide-controllers' udev rule does that to a keyboard's
+    gamepad for good -- was never ours to restore."""
+    here = {n for n in hidden if os.path.exists(os.path.join(USB_DEVICES, n))}
+    if not present:
+        return [], sorted(here)
+    want = set()
+    for c in usb_controllers():
+        if c["kind"] != kind:
+            want.update(c["targets"])
+    off = sorted(n for n in want - here
+                 if _attr(os.path.join(USB_DEVICES, n, "authorized")) == "1")
+    return off, sorted(here - want)
+
+
+class Hider:
+    """Keeps every controller but player one switched off while it is here."""
+
+    def __init__(self, kind):
+        self.kind = kind
+        self.hidden = read_hidden()
+        self.absent_since = None
+        self.working = True
+
+    def _helper(self, value, names):
+        if not names or not self.working:
+            return False
+        argv = ([PKEXEC] if PKEXEC else []) + [USB_HELPER, value, *names]
+        try:
+            ok = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True,
+                                timeout=30).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            ok = False
+        if not ok:
+            self.working = False
+            say("could not switch controllers off or on; the USB helper is "
+                "not installed (run ./install.sh and grant it)")
+        return ok
+
+    def tick(self, pads):
+        now = time.monotonic()
+        if any(is_kind(c, self.kind) for c in pads):
+            self.absent_since = None
+            present = True
+        else:
+            self.absent_since = self.absent_since or now
+            present = now - self.absent_since < ABSENT_GRACE and bool(self.hidden)
+        off, on = plan(self.kind, present, self.hidden)
+        if self._helper("0", off):
+            self.hidden.update(off)
+            say(f"hid {', '.join(off)}, so only the {dict(CHOICES)[self.kind]} "
+                "is a controller")
+        if on and self._helper("1", on):
+            self.hidden.difference_update(on)
+            say(f"{dict(CHOICES)[self.kind]} is gone; {', '.join(on)} back on")
+        self.hidden &= {n for n in self.hidden
+                        if os.path.exists(os.path.join(USB_DEVICES, n))}
+        write_hidden(self.hidden)
+
+    def restore(self):
+        self.working = True
+        here = sorted(n for n in self.hidden
+                      if os.path.exists(os.path.join(USB_DEVICES, n)))
+        if not here or self._helper("1", here):
+            self.hidden = set()
+            write_hidden(self.hidden)
+            if here:
+                say(f"switched {', '.join(here)} back on")
+
+
+def cmd_watch(kind, wait, interval, hide_others=False):
+    hider = Hider(kind) if hide_others else None
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        return _watch(kind, wait, interval, hider)
+    finally:
+        if hider:
+            hider.restore()
+
+
+def _watch(kind, wait, interval, hider):
     page = connect(wait)
     if page is None:
         say("the Steam client's DevTools port never answered; "
@@ -290,6 +465,8 @@ def cmd_watch(kind, wait, interval):
             force_ps_support(page)
             while True:
                 pads = controllers(page)
+                if hider:
+                    hider.tick(pads)
                 key = layout_key(pads)
                 # Only when the set of controllers changes: a reorder made by
                 # hand in the Quick Access menu afterwards is the user's.
@@ -331,7 +508,11 @@ def cmd_restore(wait):
     """Put the user's PlayStation setting back into a desktop client.
 
     Called while the session's client may still be going down, so it keeps
-    trying until a client that is not the session's takes the setting."""
+    trying until a client that is not the session's takes the setting.
+    Controllers a watcher that never got to clean up left switched off come
+    back first, since they matter more than a setting."""
+    if read_hidden() and not console_running():
+        Hider(DEFAULT).restore()
     try:
         with open(PS_SAVED) as fh:
             saved = int(fh.read().strip())
@@ -369,6 +550,8 @@ def main():
     sub.add_parser("list")
     w = sub.add_parser("watch")
     w.add_argument("--primary", default=DEFAULT)
+    w.add_argument("--only", action="store_true",
+                   help="hide every other physical controller while player one is connected")
     w.add_argument("--wait", type=float, default=180)
     w.add_argument("--interval", type=float, default=1)
     r = sub.add_parser("restore")
@@ -383,7 +566,7 @@ def main():
             return 2
         if kind == "off":
             return 0
-        return cmd_watch(kind, args.wait, args.interval)
+        return cmd_watch(kind, args.wait, args.interval, hide_others=args.only)
     if args.cmd == "restore":
         return cmd_restore(args.wait)
 

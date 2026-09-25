@@ -6,6 +6,11 @@ running* Steam client into Big Picture, so there is no command to wrap. And
 gamescope cannot adopt a window belonging to another compositor, so an
 already-open Big Picture can never be moved into one.
 
+Steam only does that flip in the window that has focus. A browser that is
+clicked into swallows the presses, Big Picture never appears, and this used
+to do nothing. The Steam button is also read from the controller itself, so
+a double press starts console mode even when Steam is in the tray.
+
 Relaunching Steam under gamescope is therefore the only way in. This watches for
 Big Picture appearing on the desktop and does exactly that, by running
 `cachy-console`. When the session ends it brings the ordinary desktop Steam
@@ -32,6 +37,7 @@ import os
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import time
@@ -512,6 +518,199 @@ def classify(win, bpm_re):
     return "other"
 
 
+# Steam's own virtual pad (28de:11ff) and the dongle (28de:1102/1142/1304).
+VALVE_VENDOR = "28de"
+# linux/input-event-codes.h
+EV_KEY = 1
+BTN_MODE = 0x13C
+EVENT_FORMAT = "llHHI"
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+# hid-steam: Steam logo is byte 9 bit 5 on the Deck/puck report, byte 4 bit 0
+# on the 2015 controller report.
+HID_STEAM_BITS = ((9, 5), (4, 0))
+
+
+class DoublePress:
+    """Two edges inside `window` seconds, ignoring the same press seen twice."""
+
+    def __init__(self, window=0.55, debounce=0.04):
+        self.window = window
+        self.debounce = debounce
+        self.times = []
+
+    def feed(self, now):
+        if self.times and now - self.times[-1] < self.debounce:
+            return False
+        self.times = [t for t in self.times if now - t <= self.window]
+        self.times.append(now)
+        if len(self.times) >= 2:
+            self.times.clear()
+            return True
+        return False
+
+
+class GuideButtons:
+    """The Steam button on a Valve pad, whether or not Steam has focus.
+
+    Steam's client only opens Big Picture when its own window is focused, so
+    a double press over Firefox used to do nothing. The virtual pad and the
+    dongle still see the button; this watches those and does not grab them.
+    """
+
+    def __init__(self, evdev_root="/dev/input", hidraw_root="/dev",
+                 sys_input="/sys/class/input", sys_hidraw="/sys/class/hidraw"):
+        self.evdev_root = evdev_root
+        self.hidraw_root = hidraw_root
+        self.sys_input = sys_input
+        self.sys_hidraw = sys_hidraw
+        self._fds = {}
+        self._hid_down = {}
+        self._presses = DoublePress()
+        self._next_scan = 0.0
+        self._said = False
+        self._scan()
+
+    def close(self):
+        for fd in self._fds.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._fds.clear()
+
+    def _vendor(self, sysdir, name):
+        try:
+            with open(os.path.join(sysdir, name, "device", "id", "vendor")) as fh:
+                return fh.read().strip().lower()
+        except OSError:
+            try:
+                with open(os.path.join(sysdir, name, "device", "uevent")) as fh:
+                    for line in fh:
+                        if line.startswith("HID_ID="):
+                            parts = line.split("=")[1].strip().split(":")
+                            return parts[1].lstrip("0").lower() or "0"
+            except OSError:
+                return ""
+        return ""
+
+    def _scan(self):
+        wanted = {}
+        try:
+            nodes = os.listdir(self.sys_input)
+        except OSError:
+            nodes = []
+        for name in nodes:
+            if not name.startswith("event"):
+                continue
+            if self._vendor(self.sys_input, name) != VALVE_VENDOR:
+                continue
+            path = os.path.join(self.evdev_root, name)
+            wanted[path] = "evdev"
+        try:
+            nodes = os.listdir(self.sys_hidraw)
+        except OSError:
+            nodes = []
+        for name in nodes:
+            if not name.startswith("hidraw"):
+                continue
+            if self._vendor(self.sys_hidraw, name) != VALVE_VENDOR:
+                continue
+            path = os.path.join(self.hidraw_root, name)
+            wanted[path] = "hidraw"
+        for path in list(self._fds):
+            if path not in wanted:
+                try:
+                    os.close(self._fds.pop(path))
+                except OSError:
+                    self._fds.pop(path, None)
+                self._hid_down.pop(path, None)
+        for path, kind in wanted.items():
+            if path in self._fds:
+                continue
+            try:
+                self._fds[path] = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError:
+                continue
+            if kind == "hidraw":
+                self._hid_down[path] = False
+        if not self._said:
+            self._said = True
+            if self._fds:
+                log("listening for the Steam button on "
+                    + ", ".join(os.path.basename(p) for p in sorted(self._fds)))
+            else:
+                log("could not read a Valve controller; the Steam button still "
+                    "needs Steam focused")
+
+    def _evdev_pressed(self, fd):
+        hit = False
+        while True:
+            try:
+                raw = os.read(fd, EVENT_SIZE * 8)
+            except BlockingIOError:
+                break
+            except OSError:
+                return None
+            if not raw:
+                break
+            for off in range(0, len(raw) - EVENT_SIZE + 1, EVENT_SIZE):
+                _sec, _usec, typ, code, value = struct.unpack_from(
+                    EVENT_FORMAT, raw, off)
+                if typ == EV_KEY and code == BTN_MODE and value == 1:
+                    hit = True
+        return hit
+
+    def _hid_pressed(self, fd, path):
+        hit = False
+        while True:
+            try:
+                raw = os.read(fd, 64)
+            except BlockingIOError:
+                break
+            except OSError:
+                return None
+            if not raw:
+                break
+            down = any(len(raw) > byte and (raw[byte] & (1 << bit))
+                       for byte, bit in HID_STEAM_BITS)
+            if down and not self._hid_down.get(path):
+                hit = True
+            self._hid_down[path] = down
+        return hit
+
+    def double_pressed(self, now):
+        if now >= self._next_scan:
+            self._scan()
+            self._next_scan = now + 2.0
+        dead = []
+        hit = False
+        for path, fd in self._fds.items():
+            if path.startswith(self.hidraw_root) and "hidraw" in os.path.basename(path):
+                got = self._hid_pressed(fd, path)
+            else:
+                got = self._evdev_pressed(fd)
+            if got is None:
+                dead.append(path)
+            elif got:
+                hit = True
+        for path in dead:
+            try:
+                os.close(self._fds.pop(path))
+            except OSError:
+                self._fds.pop(path, None)
+            self._hid_down.pop(path, None)
+            self._next_scan = now
+        return self._presses.feed(now) if hit else False
+
+
+class NullGuide:
+    def double_pressed(self, now):
+        return False
+
+    def close(self):
+        pass
+
+
 def present_kinds(xprop, bpm_re):
     """What kinds of window currently exist.
 
@@ -659,7 +858,11 @@ def main():
             "(open Console Mode Settings)"
             + (" (dry run)" if args.dry_run else ""))
 
-    run_loop(xprop, session, bpm_re, args, stopping, time.sleep)
+    guide = GuideButtons()
+    try:
+        run_loop(xprop, session, bpm_re, args, stopping, time.sleep, guide=guide)
+    finally:
+        guide.close()
     log("stopped.")
     return 0
 
@@ -668,7 +871,7 @@ IDLE, STARTING, GAME = "idle", "starting", "game"
 
 
 def run_loop(xprop, session, bpm_re, args, stopping, sleep,
-             now=time.monotonic, announce=notify):
+             now=time.monotonic, announce=notify, guide=None):
     """The state machine, kept separate so it can be driven by fakes in tests."""
     state = IDLE
     engage_streak = 0
@@ -688,6 +891,7 @@ def run_loop(xprop, session, bpm_re, args, stopping, sleep,
     # followed from STARTING, so the scan only finds sessions nothing is waiting
     # on, and at five polls a second it was the watcher's largest cost.
     next_scan = 0.0
+    guide = guide or NullGuide()
 
     def stand_down(reason, message, headline=None):
         nonlocal last_standdown
@@ -743,6 +947,7 @@ def run_loop(xprop, session, bpm_re, args, stopping, sleep,
                 state = GAME
             else:
                 kinds = present_kinds(xprop, bpm_re)
+                guide_hit = guide.double_pressed(now())
                 if awaiting_bpm_clear:
                     if "bigpicture" in kinds:
                         stand_down("awaiting-clear",
@@ -763,7 +968,8 @@ def run_loop(xprop, session, bpm_re, args, stopping, sleep,
                     # explain itself again.
                     last_standdown = None
 
-                if engage_streak >= args.engage_polls:
+                guide_ready = guide_hit and "game" not in kinds
+                if engage_streak >= args.engage_polls or guide_ready:
                     engage_streak = 0
 
                     if hasattr(session, "refresh_target"):
@@ -805,7 +1011,10 @@ def run_loop(xprop, session, bpm_re, args, stopping, sleep,
                         continue
 
                     last_standdown = None
-                    log("Big Picture opened -> switching to console mode"
+                    why = ("Steam button twice" if guide_ready
+                           and "bigpicture" not in kinds
+                           else "Big Picture opened")
+                    log(f"{why} -> switching to console mode"
                         f" on {session.display}.")
                     starts.append(now())
                     if session.start():

@@ -80,6 +80,19 @@ def save_primary(kind):
     ccd.update_config({"PRIMARY_CONTROLLER": kind})
 
 
+def _is_on(value):
+    return (value or "").strip().lower() in ("on", "yes", "1", "true")
+
+
+def saved_primary_only():
+    raw = ccd.read_config().get("PRIMARY_ONLY")
+    return True if raw is None or raw == "" else _is_on(raw)
+
+
+def save_primary_only(on):
+    ccd.update_config({"PRIMARY_ONLY": "on" if on else "off"})
+
+
 def primary_label(kind):
     return dict(pads.CHOICES).get(kind, kind)
 
@@ -167,6 +180,13 @@ PRIMARY_HINT = (
     "can be ordered. A change takes effect the next time console mode starts."
 )
 
+ONLY_HINT = (
+    "Hide every other controller while that one is connected, so Big Picture "
+    "and games only see player one. Turn this off for local multiplayer. "
+    "Needs the USB helper from ./install.sh. A change takes effect the next "
+    "time console mode starts."
+)
+
 
 def run_gtk():
     import gi
@@ -250,6 +270,14 @@ def run_gtk():
 
             self.primary_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
             box.pack_start(self.primary_box, True, True, 0)
+
+            self.only_check = Gtk.CheckButton(label="Hide other controllers")
+            box.pack_start(self.only_check, False, False, 0)
+            only_hint = Gtk.Label(label=ONLY_HINT)
+            only_hint.set_line_wrap(True)
+            only_hint.set_xalign(0)
+            only_hint.set_max_width_chars(56)
+            box.pack_start(only_hint, False, False, 0)
 
             self.status = Gtk.Label()
             self.status.set_line_wrap(True)
@@ -345,6 +373,7 @@ def run_gtk():
                 radio.primary = kind
                 radio.set_active(kind == saved_kind)
                 self.primary_box.pack_start(radio, False, False, 0)
+            self.only_check.set_active(saved_primary_only())
 
             if saved:
                 extra = " Console mode is running on the previous display." if console_running() else ""
@@ -397,12 +426,16 @@ def run_gtk():
             # Written even when empty: that is how the session default is chosen.
             save_audio_input(mic)
             save_primary(primary)
+            only = self.only_check.get_active()
+            save_primary_only(only)
             applied = False
             if audio and console_running():
                 applied = apply_audio_now()
             self.reload()
+            hidden = " others hidden." if only else " others left visible."
             self.status.set_text(apply_message(self.choice, audio, applied, mic)
-                                 + f" Player one: {primary_label(primary)}.")
+                                 + f" Player one: {primary_label(primary)}."
+                                 + hidden)
 
     class App(Gtk.Application):
         def __init__(self):
@@ -473,9 +506,15 @@ def run_tk():
     for kind, label in pads.CHOICES:
         ttk.Radiobutton(primary_radios, text=label, value=kind,
                         variable=primary_var).pack(anchor="w", pady=2)
+    only_var = tk.BooleanVar()
+    ttk.Checkbutton(frame, text="Hide other controllers",
+                    variable=only_var).pack(anchor="w", pady=(8, 0))
+    ttk.Label(frame, text=ONLY_HINT, wraplength=460, justify="left").pack(
+        anchor="w", pady=(4, 8))
 
     def reload():
         primary_var.set(saved_primary())
+        only_var.set(saved_primary_only())
         for child in radios.winfo_children():
             child.destroy()
         for child in audio_radios.winfo_children():
@@ -541,10 +580,13 @@ def run_tk():
         save_audio_input(mic)
         primary = pads.normalize(primary_var.get()) or pads.DEFAULT
         save_primary(primary)
+        only = bool(only_var.get())
+        save_primary_only(only)
         applied = bool(audio and console_running() and apply_audio_now())
         reload()
+        hidden = " others hidden." if only else " others left visible."
         status.set(apply_message(connector, audio, applied, mic)
-                   + f" Player one: {primary_label(primary)}.")
+                   + f" Player one: {primary_label(primary)}." + hidden)
 
     ttk.Label(frame, textvariable=status, wraplength=460, justify="left").pack(
         anchor="w", pady=(8, 8))

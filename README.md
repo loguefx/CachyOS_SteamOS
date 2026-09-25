@@ -340,14 +340,13 @@ from memory when it exits. They name a non-Steam shortcut by its lowercased name
 (`discord`), not its appid; an appid entry is ignored and the fallback template
 applies anyway.
 
-The other two are `TRACKPAD_FIX` and `GRAB_CURSOR`, which is why they are on:
+The other two are `TRACKPAD_FIX` and `GRAB_CURSOR`:
 
-- **`TRACKPAD_FIX=on`** because XTEST *motion*, unlike XTEST keys, moves nothing
-  any client can see. Walked across Discord's window, the pointer the X server
-  reports follows exactly and Discord does not react at all, frame for frame
-  identical. extest turns those calls into a real device on the seat instead, and
-  then it does: the same motion moves the pointer inside the session, rows
-  highlight under it and clicks land on what they are over.
+- **`TRACKPAD_FIX=off`** because this gamescope already turns Steam's trackpad
+  XTEST into its own cursor, so Discord and Spotify follow that pointer and the
+  desk mouse stays put. `on` preloads extest, which makes the trackpad a real
+  mouse on the desktop seat — the two cursors become the same pointer. Only
+  needed if gamescope was built without libeis.
 - **`GRAB_CURSOR=on`** because a gamescope nested on a desktop does not draw a
   cursor of its own. It hands the image to whatever is hosting its window and
   lets that draw one, which KWin does — at the *desktop's* pointer, and only
@@ -374,7 +373,8 @@ where picking the television as the source captures console mode along with it.
 ## Configuration
 
 `~/.config/cachy-console/config`, written by `cachy-console settings` and safe to
-edit by hand:
+edit by hand. `cachy-console setup` and `./install.sh` only update the display,
+VRR and HDR; they leave `AUDIO_NEVER_MUTE` and the rest as you set them.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
@@ -383,7 +383,7 @@ edit by hand:
 | `REFRESH` | `auto` | Follow the display's current setting, or force e.g. `120` |
 | `VRR` | `on` | FreeSync / G-Sync inside console mode |
 | `HDR` | `off` | Only worth enabling if display and games support it |
-| `TRACKPAD_FIX` | `on` | Preload libextest, so Steam's trackpad emulation becomes a real device instead of XTEST calls no client reacts to. Off means the Steam keyboard still types and the trackpad does nothing |
+| `TRACKPAD_FIX` | `off` | Preload libextest so the trackpad is also a mouse on the desk. Off (the default) keeps the session cursor and the desktop cursor as two pointers. On only for a gamescope built without libeis |
 | `MOUSE_LAYOUT_APPS` | `Discord, Spotify` | Non-Steam shortcuts, by name or appid, that get a trackpad mouse layout on the Steam Controller unless you picked one. Empty turns it off |
 | `GRAB_CURSOR` | `on` | Hold gamescope in relative mouse mode, which is what makes a nested gamescope draw its own cursor and keeps the pointer in the session. Off hands the cursor back to the desktop, which draws one only while the desktop's pointer is over the session's window |
 | `STEAM_BUTTON` | `on` | Let the Steam button open console mode |
@@ -395,6 +395,7 @@ edit by hand:
 | `AUDIO_INPUT_DEVICE` | *(session default)* | Microphone for console mode, e.g. `HyperX Cloud III S Wireless`. Empty leaves input alone |
 | `IGNORE_CONTROLLERS` | empty | Devices console mode should not treat as gamepads, as `0x31e3/0x1400`, comma separated. List them with `cachy-console controllers`. Hides them from Steam only; `cachy-console hide-controllers` hides them from games too |
 | `PRIMARY_CONTROLLER` | `steam` | Which controller is player one when several are connected: `steam`, `playstation`, `xbox`, `switch`, or `off` for Steam's own order. Also in Cachy Console |
+| `PRIMARY_ONLY` | `on` | Hide every other controller while that one is connected, so Big Picture and games only see player one. Off for local multiplayer. Needs the USB helper `./install.sh` can grant |
 | `STEAM_PAD_AS_XBOX` | `on` | Show games Steam's controller as an Xbox 360 pad (`045e:028e`) instead of Steam's own virtual pad (`28de:11ff`), which older games that only accept pads they know refuse — Dead Rising 2 among them. Off only for a game that needs to see the real Steam pad |
 | `EXTRA_GAMESCOPE_ARGS` | empty | Passed straight through, e.g. `--mangoapp` |
 
@@ -467,10 +468,12 @@ fill those in from the sockets your session already created, on both desktops.
 
 **The Steam button.** Pressing it twice does not launch anything — it flips the
 *already running* Steam client into Big Picture, so there is no command to
-intercept. gamescope also cannot adopt a window owned by another compositor, so
-an open Big Picture cannot be moved into it. `cachy-console-watch` therefore
-watches for the Big Picture window appearing and relaunches Steam inside
-gamescope.
+intercept. Steam only does that flip when its own window is focused, so a
+double press over a browser used to do nothing. The watcher also reads the
+Steam button from the controller itself and starts console mode from that,
+whether Steam is focused or sitting in the tray. gamescope still cannot adopt
+a window owned by another compositor, so an already-open Big Picture is
+relaunched inside gamescope the same way.
 
 **Getting a Steam button back.** The same fact runs the other way when you
 leave: the button needs a client to talk to, and leaving console mode kills
@@ -572,25 +575,32 @@ connects, but a reorder you make by hand in the Quick Access menu afterwards is
 left alone. Your PlayStation setting is written down first and put back once
 the desktop client is up again.
 
+`PRIMARY_ONLY` (default `on`, the *Hide other controllers* box in Cachy Console)
+then switches every other physical pad off at USB, so Big Picture and Proton
+games cannot see them either. Steam's own ignore list never reaches a game
+Steam starts, which is why a DualSense still stole player one in Dead Rising 2
+after the reorder alone. The others come back when player one disconnects, when
+the session ends, or when the box is off (local multiplayer). A keyboard that
+is also a pad is only switched off at its gamepad interface, so it still types.
+This needs the USB helper `./install.sh` grants once.
+
 Steam only offers that reorder through its UI, so the helper reaches it over the
 client's DevTools port. That port is turned on by
 `~/.local/share/Steam/.cef-enable-remote-debugging`, the same file Decky Loader
 uses, and listens on `127.0.0.1` only. `PRIMARY_CONTROLLER=off` never creates
 it, but it doesn't remove one that is already there.
 
-**The trackpad, and why `TRACKPAD_FIX` is on.** Steam moves the trackpad cursor by
-making XTEST calls against whatever X server it is on — its client carries
-`XTestFakeMotionEvent` and friends, and uses `/dev/uinput` only for the virtual
-gamepad. Against gamescope's XWayland those calls are not enough. The X pointer
-moves, and only the X pointer: gamescope draws its cursor at the position its own
-input pipeline tracks, which an XTEST call never touches, and no client in the
-session sees a thing. Checked against Discord, motion changed nothing at all
-while keys from the same source arrived normally.
+**The trackpad, and why `TRACKPAD_FIX` is off.** Steam moves the trackpad cursor
+by making XTEST calls against whatever X server it is on. This gamescope hosts
+an emulated-input socket and turns those calls into its own pointer, so Discord
+and Spotify follow the session cursor and the desk mouse stays where you left
+it. `TRACKPAD_FIX=on` intercepts the same calls with extest and writes them to
+`/dev/uinput` on the desktop seat instead — one pointer, shared. That is the
+fallback for a gamescope built without libeis, not the usual path.
 
-extest replaces those calls with writes to `/dev/uinput`, which makes them a real
-device on the seat, and from there they reach the session the way a mouse would.
-That is also why the grab matters: extest's relative motion is what a grabbed
-gamescope wants, while its absolute warps are ignored.
+The grab still matters: gamescope draws its cursor only in relative mouse mode.
+An absolute pad (touch a corner, the cursor goes to that corner) will not move
+anything. The default relative behaviour is what works.
 
 Note where the preload is set: on the `env` that gamescope
 execs, never exported. gamescope carries `CAP_SYS_NICE` for realtime scheduling,
@@ -766,6 +776,23 @@ cachy-console-pads list     # each controller's player slot (0 is player one)
 grep cachy-console-pads "$XDG_RUNTIME_DIR/cachy-console-session.log"
 ```
 
+**A DLC, store, or overlay page shrinks to a postage stamp in the corner.**
+That window is a few hundred pixels across, and without a nested size gamescope
+shows it at 1:1 on the television. Console mode sets the nested size to the
+display and `--force-windows-fullscreen`, so those windows fill the screen.
+
+**Switching from Discord back to a game leaves the game tiny in the corner.**
+Discord and the game used to share one Xwayland. Opening Discord is an X11
+focus loss; Proton drops exclusive fullscreen and comes back presenting a
+small image in a black 1920×1080 window. `--force-windows-fullscreen` cannot
+fix that: it resizes the window, not the game's swapchain. Console mode
+gives Steam two Xwaylands (the SteamOS layout): the game stays fullscreen on
+`STEAM_GAME_DISPLAY_0` (the second), Discord and Big Picture live on Steam's
+own `DISPLAY` (the first), and the switch is only a compositor change. The
+library wrapper puts Discord on that first display even when Steam launched
+the tile as a game on the second. Needs a new session if this one started
+before two Xwaylands were the default.
+
 **An older game ignores the controller that works in Big Picture.** Some games
 only accept gamepads whose USB id they know, and Steam's virtual pad (`28de:11ff`)
 is not one of them; Dead Rising 2 is one ("Unsupported gamepad"), with its own
@@ -802,17 +829,17 @@ cachy-console controllers   # says when a dongle has nothing connected to it
 cachy-console status        # the "trackpad" section checks the rest
 ```
 
-Press the controller's Steam button to wake it. If it is awake, the two settings
-above both have to be on — `TRACKPAD_FIX` for the motion to reach the session at
-all, `GRAB_CURSOR` for a cursor to be drawn in it — and `status` warns for either
-one being off. A third cause is a preload that was refused: `cannot be preloaded`
-in the startup output means `sudo ldconfig`, or that `/dev/uinput` is not writable,
-which Steam's own udev rules normally handle.
+Press the controller's Steam button to wake it. If it is awake, `GRAB_CURSOR`
+has to be on so gamescope draws a cursor of its own, and `TRACKPAD_FIX` should
+stay off so that cursor is not the desktop's. `status` warns for either one
+being the wrong way around. A third cause is a leftover extest preload: if
+`TRACKPAD_FIX` is on and you see `cannot be preloaded` in the startup output,
+run `sudo ldconfig`, or check that `/dev/uinput` is writable.
 
 | | `TRACKPAD_FIX=off` | `TRACKPAD_FIX=on` |
 | --- | --- | --- |
-| `GRAB_CURSOR=off` | nothing moves | moves, cursor only while the desktop's pointer is over the window |
-| `GRAB_CURSOR=on` | nothing moves | works |
+| `GRAB_CURSOR=off` | gamescope cursor, drawn only while the desktop pointer is over the window | one pointer: the desktop's |
+| `GRAB_CURSOR=on` | two pointers: trackpad in the session, mouse on the desk | one pointer: the trackpad moves the desk mouse |
 
 ## Not supported
 

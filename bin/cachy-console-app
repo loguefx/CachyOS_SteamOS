@@ -108,8 +108,29 @@ def strip_overlay(environ):
     return dropped
 
 
-def log(msg):
-    print(f"[{TAG}] {msg}", flush=True)
+SESSION_LOG_NAME = "cachy-console-session.log"
+
+
+def session_log_path():
+    return os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), SESSION_LOG_NAME)
+
+
+def log(msg, stream=None, log_path=None):
+    """Print a line and append it to the session log Steam does not capture.
+
+    Steam launches this as a game. Its stdout is Steam's, not the session
+    log the watcher writes, which is why Discord dying after 15s left no
+    wrapper lines there — only Steam's console_log showed the gap."""
+    line = f"[{TAG}] {msg}"
+    print(line, file=stream or sys.stdout, flush=True)
+    path = session_log_path() if log_path is None else log_path
+    if not path:
+        return
+    try:
+        with open(path, "a") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
 
 
 # ---- reading X11 properties ---------------------------------------------
@@ -178,18 +199,34 @@ class Windows:
         return run([self.xprop, "-display", self.display, *args])
 
     def listed(self):
-        """Window ids on the display, or None if the X server is unreachable."""
-        candidates = (self.atom,) if self.atom else (GAMESCOPE_WINDOW_LIST,
-                                                     DESKTOP_WINDOW_LIST)
-        for atom in candidates:
-            out = self._prop(["-root", atom])
+        """Window ids on the display, or None if the X server is unreachable.
+
+        A live Xwayland with neither window-list atom is an empty screen, not
+        a gone display. The game server (:2) is that case: it has no
+        GAMESCOPE_FOCUSABLE_WINDOWS. Treating that as 'display went away'
+        is what quit Discord 15 seconds after Steam launched it.
+        """
+        if self.atom:
+            out = self._prop(["-root", self.atom])
             if out is None:
                 return None
+            if prop_exists(out):
+                return list(dict.fromkeys(numbers(out)))
+            return []
+        # xprop -root with no property dumps the tree; success means the
+        # server answered. A missing atom on a live server must not look
+        # like this, which is why the atoms are read only after it.
+        if self._prop(["-root"]) is None:
+            return None
+        for atom in (GAMESCOPE_WINDOW_LIST, DESKTOP_WINDOW_LIST):
+            out = self._prop(["-root", atom])
+            if out is None:
+                continue
             if prop_exists(out):
                 self.atom = atom
                 # gamescope repeats ids in its list; count each window once.
                 return list(dict.fromkeys(numbers(out)))
-        return None
+        return []
 
     def owner(self, window):
         """(pid, classes) for a window, cached: neither ever changes."""
@@ -514,6 +551,34 @@ def parse_args(mine):
     return ap.parse_args(mine)
 
 
+def display_has_ui(display, xprop="xprop"):
+    """True if this Xwayland is Steam's, the one that publishes a window list."""
+    out = run([xprop, "-display", display, "-root", GAMESCOPE_WINDOW_LIST])
+    return bool(out and prop_exists(out))
+
+
+def ui_display(env, probe=None):
+    """The Xwayland Steam's UI lives on, not the one that runs the game.
+
+    STEAM_GAME_DISPLAY_0 is the *game* server (:2). Putting Discord there
+    made the wrapper watch a display with no GAMESCOPE_FOCUSABLE_WINDOWS, so
+    it decided the display had gone away and quit Discord after quit-grace
+    (15s) — Steam's log is that exact gap. Steam itself stays on DISPLAY=:1,
+    which is the server that has the window list. A child launched as a
+    "game" already has DISPLAY=:2; then the UI is the other Xwayland."""
+    current = (env.get("DISPLAY") or "").strip()
+    game = (env.get("STEAM_GAME_DISPLAY_0") or "").strip()
+    if not current:
+        return ""
+    if current != game:
+        return current
+    check = probe if probe is not None else display_has_ui
+    for candidate in dict.fromkeys([current, ":1", ":2", ":3"]):
+        if candidate and check(candidate):
+            return candidate
+    return current
+
+
 def main():
     mine, command = split_command(sys.argv[1:])
     if any(arg in ("-h", "--help") for arg in mine + command):
@@ -553,6 +618,10 @@ def main():
                     f"shutdown next time")
 
     env = dict(os.environ)
+    ui = ui_display(env)
+    if ui and env.get("DISPLAY") != ui:
+        log(f"moving {name} onto Steam's display {ui} so the game keeps fullscreen")
+        env["DISPLAY"] = ui
     # Electron picks its display server from the environment, and console mode
     # unsetting WAYLAND_DISPLAY is not the safeguard it reads as: a Wayland client
     # with no WAYLAND_DISPLAY does not give up and settle for X11, it connects to
@@ -580,7 +649,7 @@ def main():
     except OSError as exc:
         print(f"{TAG}: cannot run {program}: {exc}", file=sys.stderr)
         return 127
-    log(f"started {name} (pid {proc.pid}) in {cwd}")
+    log(f"started {name} (pid {proc.pid}) on {env.get('DISPLAY') or 'no display'} in {cwd}")
 
     stopping = {"now": False}
 
@@ -593,7 +662,7 @@ def main():
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, on_signal)
 
-    display = os.environ.get("DISPLAY", "")
+    display = env.get("DISPLAY", "")
     windows = Windows(display) if display and not args.keep_running else None
     if display and args.keep_running:
         log("not watching windows; this tile stays running until Steam stops it")

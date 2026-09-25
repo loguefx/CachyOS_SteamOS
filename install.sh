@@ -167,6 +167,37 @@ if (( WITH_SERVICES )); then
     say "           are looking at is audible."
 fi
 
+# Hiding other controllers during a session writes USB `authorized`, which
+# needs root. One grant here, then polkit lets that user do it without a
+# password so a session start does not stop for one.
+USB_HELPER=/usr/local/libexec/cachy-console-usb
+USB_ACTION=/usr/share/polkit-1/actions/org.cachyconsole.usb.policy
+USB_RULE=/etc/polkit-1/rules.d/50-cachy-console-usb.rules
+if [[ ! -x "$USB_HELPER" ]] || ! grep -q "subject.user == \"$USER\"" "$USB_RULE" 2>/dev/null; then
+    say
+    say "== hide other controllers =="
+    say "  Console mode can switch every pad but player one off, so Big Picture"
+    say "  and games only see the one you picked. That writes a USB sysfs file"
+    say "  and needs root once."
+    read -rp "  Install the USB helper with sudo? [Y/n] " reply
+    if [[ "${reply,,}" != n* ]]; then
+        tmp_rule="$(mktemp)"
+        sed "s/__USER__/$USER/" "$SRC/share/root/50-cachy-console-usb.rules" >"$tmp_rule"
+        if sudo install -D -m755 "$SRC/share/root/cachy-console-usb" "$USB_HELPER" \
+                && sudo install -D -m644 "$SRC/share/root/org.cachyconsole.usb.policy" \
+                    "$USB_ACTION" \
+                && sudo install -D -m644 "$tmp_rule" "$USB_RULE"; then
+            say "  installed. Other controllers stay hidden only while console mode runs."
+        else
+            warn "could not install the USB helper; other controllers will stay visible."
+        fi
+        rm -f "$tmp_rule"
+    else
+        say "  skipped. Player one is still reordered; the others stay connected."
+        say "  Install later by running ./install.sh again."
+    fi
+fi
+
 # gamescope's --rt flag is silently ignored without this capability, and the
 # difference shows up as stutter under load rather than as an error.
 if have gamescope && ! getcap "$(command -v gamescope)" 2>/dev/null | grep -q cap_sys_nice; then
