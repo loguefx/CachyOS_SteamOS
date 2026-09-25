@@ -1,6 +1,6 @@
 pkgbase = cachy-console-git
 	pkgdesc = Steam Big Picture in gamescope on one display, from the Steam button
-	pkgver = 0
+	pkgver = r38.ec67e69
 	pkgrel = 1
 	url = https://github.com/loguefx/CachyOS_SteamOS
 	install = cachy-console-git.install
