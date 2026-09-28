@@ -8,8 +8,9 @@ already-open Big Picture can never be moved into one.
 
 Steam only does that flip in the window that has focus. A browser that is
 clicked into swallows the presses, Big Picture never appears, and this used
-to do nothing. The Steam button is also read from the controller itself, so
-a double press starts console mode even when Steam is in the tray.
+to do nothing. The guide button is also read from the controller itself — Steam logo,
+PlayStation, Xbox, Switch Home — so a double press starts console mode
+even when Steam is in the tray.
 
 Relaunching Steam under gamescope is therefore the only way in. This watches for
 Big Picture appearing on the desktop and does exactly that, by running
@@ -538,16 +539,47 @@ def classify(win, bpm_re):
     return "other"
 
 
-# Steam's own virtual pad (28de:11ff) and the dongle (28de:1102/1142/1304).
-VALVE_VENDOR = "28de"
 # linux/input-event-codes.h
 EV_KEY = 1
 BTN_MODE = 0x13C
 EVENT_FORMAT = "llHHI"
 EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
 # hid-steam: Steam logo is byte 9 bit 5 on the Deck/puck report, byte 4 bit 0
-# on the 2015 controller report.
+# on the 2015 controller report. Only Valve hidraw uses these; a DualSense
+# report would look like random presses if we applied them there.
 HID_STEAM_BITS = ((9, 5), (4, 0))
+# sysfs id/vendor is four hex digits; HID_ID strips leading zeros.
+GUIDE_VENDORS = {
+    "28de": "steam",          # Steam Controller, Deck, dongle, virtual pad
+    "54c": "playstation",     # DualShock 3/4, DualSense
+    "45e": "xbox",            # Xbox 360 / One / Series
+    "57e": "switch",          # Switch Pro, Joy-Con
+    "2dc8": "xbox",           # 8BitDo, usually XInput
+}
+
+
+def norm_vendor(value):
+    return (value or "").strip().lower().lstrip("0") or "0"
+
+
+def keycap_has_bit(text, bit):
+    """Whether a sysfs capabilities/key bitmap contains `bit`.
+
+    The file is space-separated hex longs, highest-numbered word first, the
+    same form the kernel prints. Word width is 64 bits on this machine.
+    """
+    words = []
+    for part in text.split():
+        try:
+            words.append(int(part, 16))
+        except ValueError:
+            return False
+    if not words:
+        return False
+    idx, off = divmod(bit, 64)
+    if idx >= len(words):
+        return False
+    return bool(words[-(idx + 1)] & (1 << off))
 
 
 class DoublePress:
@@ -570,11 +602,12 @@ class DoublePress:
 
 
 class GuideButtons:
-    """The Steam button on a Valve pad, whether or not Steam has focus.
+    """The logo / guide / PS / Home button, whether or not Steam has focus.
 
     Steam's client only opens Big Picture when its own window is focused, so
-    a double press over Firefox used to do nothing. The virtual pad and the
-    dongle still see the button; this watches those and does not grab them.
+    a double press over Firefox used to do nothing. Every pad that exposes
+    BTN_MODE still sees that button; this watches those and does not grab them.
+    Valve hidraw is the extra path for a Steam Controller Steam has grabbed.
     """
 
     def __init__(self, evdev_root="/dev/input", hidraw_root="/dev",
@@ -601,17 +634,27 @@ class GuideButtons:
     def _vendor(self, sysdir, name):
         try:
             with open(os.path.join(sysdir, name, "device", "id", "vendor")) as fh:
-                return fh.read().strip().lower()
+                return norm_vendor(fh.read())
         except OSError:
             try:
                 with open(os.path.join(sysdir, name, "device", "uevent")) as fh:
                     for line in fh:
                         if line.startswith("HID_ID="):
                             parts = line.split("=")[1].strip().split(":")
-                            return parts[1].lstrip("0").lower() or "0"
+                            return norm_vendor(parts[1] if len(parts) > 1 else "")
             except OSError:
                 return ""
         return ""
+
+    def _has_guide(self, sysdir, name):
+        cap = os.path.join(sysdir, name, "device", "capabilities", "key")
+        try:
+            with open(cap) as fh:
+                if keycap_has_bit(fh.read(), BTN_MODE):
+                    return True
+        except OSError:
+            pass
+        return self._vendor(sysdir, name) in GUIDE_VENDORS
 
     def _scan(self):
         wanted = {}
@@ -622,7 +665,7 @@ class GuideButtons:
         for name in nodes:
             if not name.startswith("event"):
                 continue
-            if self._vendor(self.sys_input, name) != VALVE_VENDOR:
+            if not self._has_guide(self.sys_input, name):
                 continue
             path = os.path.join(self.evdev_root, name)
             wanted[path] = "evdev"
@@ -633,7 +676,9 @@ class GuideButtons:
         for name in nodes:
             if not name.startswith("hidraw"):
                 continue
-            if self._vendor(self.sys_hidraw, name) != VALVE_VENDOR:
+            # hid-steam report bits are Valve-only. Opening a DualSense hidraw
+            # with those masks would invent Steam-logo presses from its gyros.
+            if self._vendor(self.sys_hidraw, name) != "28de":
                 continue
             path = os.path.join(self.hidraw_root, name)
             wanted[path] = "hidraw"
@@ -656,11 +701,11 @@ class GuideButtons:
         if not self._said:
             self._said = True
             if self._fds:
-                log("listening for the Steam button on "
+                log("listening for the guide button on "
                     + ", ".join(os.path.basename(p) for p in sorted(self._fds)))
             else:
-                log("could not read a Valve controller; the Steam button still "
-                    "needs Steam focused")
+                log("could not read a controller guide button; the Steam "
+                    "button still needs Steam focused")
 
     def _evdev_pressed(self, fd):
         hit = False

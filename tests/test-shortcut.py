@@ -340,6 +340,29 @@ check("and the tile is in the library",
       ies.load(lib)["shortcuts"]["0"]["AppName"], "Exit Console Mode")
 
 print()
+print("the old exit tile is retired:")
+check("default couch tiles are Discord and Spotify, not Exit",
+      [spec["name"] for spec in ies.default_couch_tiles()],
+      ["Discord", "Spotify"])
+exit_libdir = tempfile.mkdtemp()
+exit_account = os.path.join(exit_libdir, "userdata", "1", "config")
+os.makedirs(exit_account)
+exit_lib = os.path.join(exit_account, "shortcuts.vdf")
+with open(exit_lib, "wb") as fh:
+    fh.write(ies.dumps({"shortcuts": {"0": ies.build_entry(
+        "/tmp/cachy-console-exit", "Exit Console Mode")}}))
+exit_q = os.path.join(tempfile.mkdtemp(), "pending-shortcuts.json")
+check("a library that still has the tile is noticed",
+      ies.library_has_exit_tile(paths=[exit_lib]), True)
+ies.retire_exit_tile(path=exit_q, steam=lambda: True, paths=[exit_lib])
+check("Steam running queues the removal rather than writing now",
+      ies.load_queue(exit_q)[0].get("revert"), True)
+check("flush then drops the tile once Steam is gone",
+      ies.flush_queue(path=exit_q, steam=lambda: False, paths=[exit_lib]), 0)
+check("and the library no longer has it",
+      ies.load(exit_lib)["shortcuts"], {})
+
+print()
 if FAILURES:
     print(f"{len(FAILURES)} failure(s): " + ", ".join(FAILURES))
     sys.exit(1)

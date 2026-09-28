@@ -4,7 +4,7 @@
 A shortcut added to the library has no capsule, no hero and no logo, so Big
 Picture falls back to a grey tile with the name printed across it. That is
 legible at a desk and close to useless from a sofa, where the tile is the only
-thing distinguishing Discord from the exit entry next to it.
+thing distinguishing Discord from Spotify next to it.
 
 Steam serves custom art for an app out of userdata/<user>/config/grid. The
 client exposes that directory to its own UI as the "customimages" route and

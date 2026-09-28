@@ -459,6 +459,78 @@ check("a session started by hand is still tracked, and the desktop client "
       hand_started(ends_at_poll=3, polls=8), ["restore-audio", "relaunch-steam"])
 
 print()
+print("guide buttons on every pad, not only Valve")
+
+import struct as _struct
+import tempfile as _tempfile
+
+check("BTN_MODE is the bit the kernel names for a guide / PS / Home button",
+      pw.BTN_MODE, 0x13C)
+# 0x13C = 316, word 4 bit 60. Highest word first, so the first hex long.
+btn_mode_cap = f"{1 << 60:x} 0 0 0 0"
+check("a capabilities/key bitmap with only BTN_MODE is recognised",
+      pw.keycap_has_bit(btn_mode_cap, pw.BTN_MODE), True)
+check("and a keyboard bitmap without that bit is not",
+      pw.keycap_has_bit("20000 0 0 0 0", pw.BTN_MODE), False)
+check("vendor ids match with or without the leading zero sysfs prints",
+      (pw.norm_vendor("054c"), pw.norm_vendor("045e"), pw.norm_vendor("28de")),
+      ("54c", "45e", "28de"))
+
+
+def fake_pad(root, name, vendor, cap=None, hid=False, events=b""):
+    sysdir = os.path.join(root, "sys-hidraw" if hid else "sys-input")
+    devdir = os.path.join(root, "hidraw" if hid else "input")
+    node = os.path.join(sysdir, name, "device")
+    os.makedirs(os.path.join(node, "id"), exist_ok=True)
+    os.makedirs(devdir, exist_ok=True)
+    with open(os.path.join(node, "id", "vendor"), "w") as fh:
+        fh.write(vendor + "\n")
+    if cap is not None:
+        os.makedirs(os.path.join(node, "capabilities"), exist_ok=True)
+        with open(os.path.join(node, "capabilities", "key"), "w") as fh:
+            fh.write(cap + "\n")
+    path = os.path.join(devdir, name)
+    with open(path, "wb") as fh:
+        fh.write(events)
+    return path
+
+
+def evdev_press():
+    return _struct.pack(pw.EVENT_FORMAT, 0, 0, pw.EV_KEY, pw.BTN_MODE, 1)
+
+
+with _tempfile.TemporaryDirectory() as tmp:
+    fake_pad(tmp, "event0", "054c", cap=btn_mode_cap, events=evdev_press())
+    fake_pad(tmp, "event1", "045e", cap=btn_mode_cap, events=evdev_press())
+    fake_pad(tmp, "event2", "0001", cap="20000 0 0 0 0")
+    fake_pad(tmp, "hidraw0", "28de", hid=True, events=b"\x00" * 16)
+    fake_pad(tmp, "hidraw1", "054c", hid=True, events=b"\xff" * 16)
+    guide = pw.GuideButtons(
+        evdev_root=os.path.join(tmp, "input"),
+        hidraw_root=os.path.join(tmp, "hidraw"),
+        sys_input=os.path.join(tmp, "sys-input"),
+        sys_hidraw=os.path.join(tmp, "sys-hidraw"),
+    )
+    try:
+        watched = {os.path.basename(p) for p in guide._fds}
+        check("PlayStation and Xbox evdev nodes are watched",
+              {"event0", "event1"} <= watched, True)
+        check("a keyboard without BTN_MODE is left alone",
+              "event2" in watched, False)
+        check("Valve hidraw is still the grabbed-Steam-Controller path",
+              "hidraw0" in watched, True)
+        check("and a DualSense hidraw is not parsed as a Steam logo",
+              "hidraw1" in watched, False)
+        check("one PS-button press is not a double",
+              guide.double_pressed(1.0), False)
+        # The regular files were consumed on the first read. A second press
+        # is fed the same way the real loop feeds a later evdev edge.
+        check("two presses inside the window start console mode",
+              guide._presses.feed(1.2), True)
+    finally:
+        guide.close()
+
+print()
 if FAILURES:
     print(f"{FAILURES} failure(s)")
     sys.exit(1)

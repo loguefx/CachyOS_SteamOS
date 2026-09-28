@@ -14,7 +14,7 @@
 #   cachy-console displays     list displays, their modes and gamescope indices
 #   cachy-console controllers  list gamepads and the ones console mode hides
 #   cachy-console hide-controllers  hide those from games too (asks for your password)
-#   cachy-console shortcut     add "Exit Console Mode" to your Steam library
+#   cachy-console shortcut     add Discord / Spotify (or another couch tile)
 #   cachy-console first-run    enable services, pick a display, queue couch tiles
 #   cachy-console restart-steam  bring the desktop Steam client back
 #   cachy-console help
@@ -24,11 +24,11 @@
 #   --dry-run         print the command instead of running it
 #
 # Leaving console mode:
-#   Steam hides its own "Exit Steam" while it detects gamescope, and Big
-#   Picture's "Switch to Desktop" is a SteamOS-only call that does nothing on a
-#   normal Linux install, so the way out is `cachy-console exit`, or the
-#   "Exit Console Mode" entry that `cachy-console shortcut` puts in your
-#   library, which can be clicked with a controller.
+#   Steam hides "Exit Steam" and "Exit Big Picture" while it detects gamescope.
+#   Started with -steamos3, Power → Switch to Desktop calls
+#   steamos-session-select, which is the same leave path as `cachy-console
+#   exit`. An older "Exit Console Mode" library tile is removed on the next
+#   shortcut flush.
 #
 # Config: ~/.config/cachy-console/config
 
@@ -635,15 +635,32 @@ steam_in_session() {
     # ours to change in this gap between the two clients.
     "$HELPER_DISPLAY" pad-layouts || warn "could not set the trackpad mouse layouts"
     route_audio
+    # -steamos3 is what makes Power → Switch to Desktop appear and call
+    # steamos-session-select. That name is only put at the front of PATH for
+    # this client, so a CachyOS gamescope login session keeps its own helper.
+    local select_dir="" dir
+    for dir in \
+        "${CACHY_CONSOLE_LIB:-$HOME/.local/lib/cachy-console}" \
+        /usr/lib/cachy-console \
+        "$(dirname -- "$SELF")"; do
+        if [[ -x "$dir/steamos-session-select" ]]; then
+            select_dir="$dir"
+            break
+        fi
+    done
+    if [[ -n "$select_dir" ]]; then
+        PATH="$select_dir:$PATH"
+        export PATH
+    fi
     local pads_pid=""
     pads_pid="$(start_player_one)"
     local status=0
     if [[ -n "${CACHY_CONSOLE_PRELOAD:-}" ]]; then
         env -u CACHY_CONSOLE_PRELOAD \
             "LD_PRELOAD=${CACHY_CONSOLE_PRELOAD}${LD_PRELOAD:+:$LD_PRELOAD}" \
-            steam -gamepadui || status=$?
+            steam -steamos3 -gamepadui || status=$?
     else
-        steam -gamepadui || status=$?
+        steam -steamos3 -gamepadui || status=$?
     fi
     [[ -n "$pads_pid" ]] && kill "$pads_pid" 2>/dev/null
     close_leftovers "$status"

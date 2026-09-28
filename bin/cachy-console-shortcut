@@ -1,42 +1,31 @@
 #!/usr/bin/env python3
-"""Add an "Exit Console Mode" entry to Steam's library as a non-Steam shortcut.
+"""Add couch tiles to Steam's library as non-Steam shortcuts.
 
-Big Picture offers no usable way out of a gamescope session it did not start
-itself: Steam hides "Exit Steam", "Exit Big Picture Mode" and "Minimize" while
-it detects gamescope, and "Switch to Desktop" calls a SteamOS-only method that
-the ordinary Linux client answers with "not implemented". A library entry is
-reachable with a controller and owes nothing to Steam's menus, so it is an exit
-that no client update can take away.
-
-The entry runs `cachy-console-exit`, which stops gamescope; Steam is its child,
-so the desktop comes back and cachy-console-watch restarts the desktop client.
+Power → Switch to Desktop is the way out of console mode. An older
+"Exit Console Mode" tile is removed the next time Steam is not holding
+shortcuts.vdf. This tool is for Discord, Spotify and anything else you
+want to reach from the couch.
 
 Steam rewrites shortcuts.vdf from memory when it shuts down, so it must not be
 running while we edit the file, or our entry is silently discarded.
 
-The same machinery adds any other program you want to reach from the couch,
-which is how Discord gets into console mode -- gamescope cannot adopt a window
-owned by your desktop, so it has to be started inside the session:
+A desktop application dropped into a Steam library needs two things Steam will
+not do for it: the copy already running on the desktop has to be quit, or the
+new one hands its window to that copy and exits as a secondary instance, and
+the application has to be quit for real once its window closes, since a
+session with no tray cannot bring back something that merely hid itself. That
+goes in the tile's launch options rather than replacing its Exe, so the appid
+Steam derives from the path does not move and anything keyed to it -- an
+AUDIO_NEVER_MUTE entry, a controller layout, the artwork below -- keeps
+matching.
 
     cachy-console shortcut --name Discord --exe /usr/bin/discord
     cachy-console shortcut --name Spotify --exe /usr/bin/spotify-launcher \
         --process spotify --color 121212
 
-Such an entry is launched through cachy-console-app rather than directly,
-because a desktop application dropped into a Steam library needs two things
-Steam will not do for it: the copy already running on the desktop has to be
-quit, or the new one hands its window to that copy and exits as a secondary
-instance, and the application has to be quit for real once its window closes,
-since a session with no tray cannot bring back something that merely hid
-itself. That goes in the tile's launch options rather than replacing its Exe,
-so the appid Steam derives from the path does not move and anything keyed to it
--- an AUDIO_NEVER_MUTE entry, a controller layout, the artwork below -- keeps
-matching. The exit tile is never wrapped: it opens no window and is meant to
-return immediately.
-
 Usage:
     cachy-console shortcut [--dry-run] [--revert] [--force] [--no-wrap]
-                           [--name NAME] [--exe PATH]
+                           --name NAME --exe PATH
                            [--icon PATH] [--color HEX] [--process NAME]
                            [--no-art]
     cachy-console shortcut --queue-defaults
@@ -57,7 +46,7 @@ import zlib
 
 # Library artwork lives in its own helper because it is the only part of this
 # tool that wants an imaging library, and a machine without Pillow must still
-# be able to add the exit tile.
+# be able to add a tile.
 try:
     _ART = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "cachy-console-art")
@@ -302,13 +291,62 @@ def queue_path(path=None):
 
 
 def default_couch_tiles():
-    """Exit, Discord and Spotify — the tiles a first install should have."""
+    """Discord and Spotify — the tiles a first install should have."""
     return [
-        {"name": DEFAULT_NAME, "exe": default_exe()},
         {"name": "Discord", "exe": "/usr/bin/discord"},
         {"name": "Spotify", "exe": "/usr/bin/spotify-launcher",
          "process": ["spotify"], "color": "121212"},
     ]
+
+
+def exit_tile_spec():
+    return {"name": DEFAULT_NAME, "exe": default_exe(), "revert": True,
+            "art": True}
+
+
+def is_exit_tile(entry):
+    app = entry.get("AppName") or ""
+    stored = str(entry.get("Exe", ""))
+    return app in LEGACY_NAMES or any(m in stored for m in LEGACY_EXE_MARKERS)
+
+
+def library_has_exit_tile(paths=None):
+    return any(is_exit_tile(entry) for entry in collect_shortcuts(paths))
+
+
+def is_exit_spec(spec):
+    name = spec_key(spec)
+    exe = str(spec.get("exe") or "")
+    return name in {n.lower() for n in LEGACY_NAMES} or any(
+        m in exe for m in LEGACY_EXE_MARKERS)
+
+
+def queue_has_exit_tile(path=None):
+    return any(is_exit_spec(item) for item in load_queue(path))
+
+
+def drop_exit_from_queue(path=None):
+    items = [item for item in load_queue(path) if not is_exit_spec(item)]
+    if items:
+        save_queue(items, path)
+    else:
+        clear_queue(path)
+    return items
+
+
+def retire_exit_tile(path=None, dry_run=False, steam=None, paths=None):
+    """Drop the old library exit tile. Switch to Desktop is the way out."""
+    if not (library_has_exit_tile(paths) or queue_has_exit_tile(path)):
+        print("no Exit Console Mode tile to remove")
+        return 0
+    drop_exit_from_queue(path)
+    spec = exit_tile_spec()
+    if not dry_run and (steam or steam_running)():
+        enqueue(spec, path)
+        print("Steam is running, so Exit Console Mode is queued for removal "
+              "when it next quits.")
+        return 0
+    return apply_spec(spec, dry_run=dry_run, paths=paths)
 
 
 def load_queue(path=None):
@@ -570,25 +608,28 @@ def flush_queue(path=None, dry_run=False, steam=None, paths=None):
     return status
 
 
-def queue_defaults(path=None, steam=None):
-    """Queue Exit, Discord and Spotify; write them now if Steam is closed."""
+def queue_defaults(path=None, steam=None, paths=None):
+    """Queue Discord and Spotify; drop the old exit tile if it is still there."""
+    retire_exit_tile(path=path, steam=steam, paths=paths)
     queued = []
     for spec in default_couch_tiles():
         exe = spec.get("exe") or default_exe()
-        if spec.get("name") != DEFAULT_NAME and not os.access(exe, os.X_OK):
+        if not os.access(exe, os.X_OK):
             print(f"skipping {spec['name']}: {exe} is not installed")
             continue
         enqueue(spec, path)
         queued.append(spec["name"])
-    if not queued:
+    if not queued and not queue_has_exit_tile(path):
         print("nothing to queue")
         return 0
     if (steam or steam_running)():
-        print("Steam is running, so these are queued and will be written "
-              f"when it next quits: {', '.join(queued)}")
+        extra = ", ".join(queued)
+        if extra:
+            print("Steam is running, so these are queued and will be written "
+                  f"when it next quits: {extra}")
         return 0
     print("Steam is closed; writing queued tiles now.")
-    return flush_queue(path=path, steam=steam)
+    return flush_queue(path=path, steam=steam, paths=paths)
 
 
 def launch_options(exe, name, wrapper, processes=()):
@@ -640,8 +681,8 @@ def main():
                     help="remove the shortcut instead of adding it")
     ap.add_argument("--force", action="store_true",
                     help="edit even while Steam is running (it will be lost)")
-    ap.add_argument("--name", default=DEFAULT_NAME, help="library entry name")
-    ap.add_argument("--exe", default=default_exe(),
+    ap.add_argument("--name", default=None, help="library entry name")
+    ap.add_argument("--exe", default=None,
                     help="program the entry runs")
     ap.add_argument("--icon", help="image to build the library artwork from "
                                    "(default: the program's installed icon)")
@@ -662,8 +703,8 @@ def main():
                     help="report whether Discord and Spotify tiles are wrapped "
                          "and listed in AUDIO_NEVER_MUTE")
     ap.add_argument("--queue-defaults", action="store_true",
-                    help="queue Exit, Discord and Spotify; write them when "
-                         "Steam next quits")
+                    help="queue Discord and Spotify, and remove the old "
+                         "Exit Console Mode tile, when Steam next quits")
     ap.add_argument("--flush", action="store_true",
                     help="write queued tiles now (no-op while Steam is running)")
     args = ap.parse_args()
@@ -673,6 +714,16 @@ def main():
         return flush_queue(dry_run=args.dry_run)
     if args.queue_defaults:
         return queue_defaults()
+    if args.name is None and args.exe is None:
+        return retire_exit_tile(dry_run=args.dry_run)
+    if args.exe is None:
+        if args.revert:
+            args.exe = default_exe()
+        else:
+            print("cachy-console shortcut: --exe is required with --name",
+                  file=sys.stderr)
+            return 2
+    args.name = args.name or os.path.basename(args.exe)
 
     if args.color and artwork is not None:
         try:

@@ -1,17 +1,10 @@
 #!/usr/bin/env bash
 # cachy-console-exit — leave console mode and go back to the desktop.
 #
-# Steam will not let you out on its own. It hides "Exit Steam", "Exit Big
-# Picture Mode" and "Minimize" whenever it detects gamescope, because SteamOS
-# expects a session manager to handle that, and Big Picture's "Switch to
-# Desktop" calls a SteamOS-only method that a normal Linux client answers with
-# "not implemented". So this is the way out.
-#
-# Three ways to run it:
-#   cachy-console exit                 from a terminal
-#   the "Exit Console Mode" entry      from inside Big Picture, with a
-#   in your Steam library              controller
-#   a keyboard shortcut                bound to this command
+# The leave path for console mode. Steam hides "Exit Steam" and "Exit Big
+# Picture" while it detects gamescope; Power → Switch to Desktop is the
+# SteamOS button, and with -steamos3 it runs steamos-session-select, which
+# execs this script. `cachy-console exit` calls it from a terminal too.
 #
 # It ends console mode by asking Steam to shut down. Steam is gamescope's primary
 # child, so gamescope follows it out on its own, and Steam gets to save what it

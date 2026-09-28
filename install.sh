@@ -109,6 +109,12 @@ for arch in lib:-m64 lib32:-m32; do
     fi
     mv -f "$dir/libcachy-extest-init.so.new" "$dir/libcachy-extest-init.so"
 done
+# Steam looks up this exact name for Power → Switch to Desktop. Kept off the
+# ordinary PATH so it cannot steal a real gamescope-session login.
+install -m755 "$SRC/bin/steamos-session-select" \
+    "$EXTEST_INIT_DIR/steamos-session-select"
+printf '  %s -> %s\n' "steamos-session-select" "$EXTEST_INIT_DIR"
+
 if (( extest_built )); then
     printf '  %s -> %s\n' "extest guard" "$EXTEST_INIT_DIR"
 else
@@ -235,4 +241,4 @@ say "Installed. Useful commands:"
     say "  cachy-console settings    open Cachy Console (pick or change the display)"
 say "  cachy-console status     check everything"
 say "  cachy-console exit       back to the desktop"
-say "  cachy-console shortcut --queue-defaults   Exit, Discord, Spotify tiles"
+say "  cachy-console shortcut --queue-defaults   Discord and Spotify tiles"

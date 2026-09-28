@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """The way out of console mode, which has to work the first time.
 
-Steam hides its own exits whenever it sees gamescope, so this tile is the only
-way back to the desktop from the couch. It used to signal gamescope and wait:
+The leave path used by Switch to Desktop, `cachy-console exit`, and the library
+tile. It used to signal gamescope and wait:
 gamescope ignored SIGTERM, sat there for the whole grace period and then had to
 be killed, so the screen did not change for ten seconds and Steam came back up
 convinced it had crashed. Now Steam is asked to close itself first -- it is
@@ -111,7 +111,7 @@ class World:
         argv = ["gamescope", "-W", "1920", "-H", "1080", "--backend", "sdl"]
         # Console mode is the gamescope that launched Big Picture. Without that,
         # it is somebody else's gamescope and none of our business.
-        argv += ["--steam", "--", "env", "steam", "-gamepadui"] if console \
+        argv += ["--steam", "--", "env", "steam", "-steamos3", "-gamepadui"] if console \
             else ["--", "env", "vkcube"]
         with open(os.path.join(d, "cmdline"), "wb") as fh:
             fh.write(b"\0".join(a.encode() for a in argv) + b"\0")

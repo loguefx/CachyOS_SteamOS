@@ -42,6 +42,8 @@ install -Dm644 "$SRC/share/applications/cachy-console-settings.desktop" \
 install -Dm644 "$SRC/share/autostart/cachy-console-session-env.desktop" \
     "$DESTDIR/etc/xdg/autostart/cachy-console-session-env.desktop"
 
+install -Dm755 "$SRC/bin/steamos-session-select" \
+    "$ROOT/lib/cachy-console/steamos-session-select"
 install -Dm755 "$SRC/share/root/cachy-console-usb" \
     "$ROOT/lib/cachy-console/cachy-console-usb"
 install -Dm644 "$SRC/share/root/org.cachyconsole.usb.policy" \

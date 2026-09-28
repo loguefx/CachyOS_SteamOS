@@ -188,7 +188,8 @@ ONLY_HINT = (
 )
 
 TILES_HINT = (
-    "Adds Exit Console Mode, Discord and Spotify to your Steam library. "
+    "Adds Discord and Spotify to your Steam library. "
+    "An older Exit Console Mode tile is removed. "
     "If Steam is running they are queued and written when it next quits."
 )
 

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Steam's Power → Switch to Desktop, when the client was started with -steamos3.
+#
+# SteamOS uses this name to change the login session. Console mode is nested
+# on a desktop that is still there, so the same button means leave gamescope,
+# which is what cachy-console-exit already does. This file is not put on the
+# ordinary PATH: only the Steam we start sees it, so a real gamescope login
+# session keeps its own Switch to Desktop.
+set -euo pipefail
+
+here="$(cd -- "$(dirname -- "$(readlink -f -- "$0" || echo "$0")")" && pwd)"
+for candidate in \
+    "$here/cachy-console-exit" \
+    "$here/../bin/cachy-console-exit" \
+    "$(command -v cachy-console-exit 2>/dev/null || true)"; do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+        exec "$candidate" "$@"
+    fi
+done
+# Last resort if the exit helper is missing: Steam is gamescope's child, so
+# asking it to quit still takes the session down.
+exec steam -shutdown

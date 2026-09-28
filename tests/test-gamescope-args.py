@@ -24,6 +24,7 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WRAPPER = os.path.join(HERE, "..", "bin", "cachy-console")
+SESSION_SELECT = os.path.join(HERE, "..", "bin", "steamos-session-select")
 
 FAILURES = []
 
@@ -116,7 +117,7 @@ state="$CACHY_TEST_STATE"
 echo "steam $*" >> "$state/sequence"
 case "$1" in
   -shutdown)  rm -f "$state/desktop-steam" ;;
-  -gamepadui) env | grep -E '^(PULSE_SINK|PULSE_SOURCE|LD_PRELOAD|CACHY_CONSOLE_PRELOAD)=' \
+  -steamos3|-gamepadui) env | grep -E '^(PULSE_SINK|PULSE_SOURCE|LD_PRELOAD|CACHY_CONSOLE_PRELOAD|PATH)=' \
                   | sort > "$state/steam-env" ;;
 esac
 exit 0
@@ -146,6 +147,10 @@ class World:
         self.dir = tempfile.mkdtemp(prefix="cachy-args-")
         self.bin = os.path.join(self.dir, "bin")
         os.makedirs(self.bin)
+        self.lib = os.path.join(self.dir, "lib")
+        os.makedirs(self.lib)
+        shutil.copy(SESSION_SELECT, os.path.join(self.lib, "steamos-session-select"))
+        os.chmod(os.path.join(self.lib, "steamos-session-select"), 0o755)
         self.state = os.path.join(self.dir, "state")
         self.run = os.path.join(self.dir, "run")
         os.makedirs(self.state)
@@ -204,6 +209,7 @@ class World:
         env["CACHY_CONSOLE_EXTEST_INIT"] = self.guard
         env["WAYLAND_DISPLAY"] = "wayland-desk"
         env["CACHY_CONSOLE_STEAM_ROOT"] = self.steam_root
+        env["CACHY_CONSOLE_LIB"] = self.lib
         return env
 
     def read(self, name):
@@ -414,12 +420,12 @@ check("gamescope is started before the desktop client is asked to quit",
       (at("gamescope") is not None and at("steam -shutdown") is not None
        and at("gamescope") < at("steam -shutdown")), True)
 check("and Big Picture only once the desktop client has gone",
-      (at("steam -gamepadui") is not None
-       and at("steam -shutdown") < at("steam -gamepadui")), True)
+      (at("steam -steamos3 -gamepadui") is not None
+       and at("steam -shutdown") < at("steam -steamos3 -gamepadui")), True)
 check("the trackpad mouse layouts are written between the two clients, the "
       "only time Steam will not write over them",
       (at("pad-layouts") is not None
-       and at("steam -shutdown") < at("pad-layouts") < at("steam -gamepadui")),
+       and at("steam -shutdown") < at("pad-layouts") < at("steam -steamos3 -gamepadui")),
       True)
 got = w.read("steam-env")
 check("Steam in the session still plays and listens where the settings say",
@@ -427,6 +433,9 @@ check("Steam in the session still plays and listens where the settings say",
       ["PULSE_SINK=alsa_output.fake", "PULSE_SOURCE=alsa_input.fake"])
 check("and does not turn the trackpad into a desktop mouse",
       [e for e in got if "PRELOAD" in e], [])
+path = next((e[5:] for e in got if e.startswith("PATH=")), "")
+check("Switch to Desktop reaches our helper, not a login-session one",
+      path.split(":")[0] if path else "", w.lib)
 w.clean()
 
 print()
@@ -484,7 +493,7 @@ w.clean()
 w = World("DISPLAY=HDMI-A-1\n")
 w.started()
 check("with no desktop client running, Big Picture starts straight away",
-      "steam -gamepadui" in w.read("sequence"), True)
+      "steam -steamos3 -gamepadui" in w.read("sequence"), True)
 w.clean()
 
 print()
@@ -534,7 +543,7 @@ w.clean()
 w = World("DISPLAY=HDMI-A-1\n")
 w.started()
 check("with no helper beside it, a session still starts, and nothing on PATH "
-      "is borrowed", "steam -gamepadui" in w.read("sequence"), True)
+      "is borrowed", "steam -steamos3 -gamepadui" in w.read("sequence"), True)
 w.clean()
 
 print()

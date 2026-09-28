@@ -5,7 +5,7 @@ post_install() {
     echo "    cachy-console first-run"
     echo
     echo "  That enables the Steam-button and audio services, picks a display"
-    echo "  if you have not already, and queues Exit / Discord / Spotify tiles"
+    echo "  if you have not already, and queues Discord / Spotify tiles"
     echo "  so they are written the next time Steam is not running."
     echo "  If you used ./install.sh before, first-run removes those home"
     echo "  copies so /usr is what runs."
@@ -24,6 +24,6 @@ post_upgrade() {
 post_remove() {
     echo
     echo "  Config is left in ~/.config/cachy-console. Remove it if you want."
-    echo "  Steam library tiles (Exit, Discord, Spotify) are yours to delete."
+    echo "  Steam library tiles (Discord, Spotify) are yours to delete."
     echo
 }

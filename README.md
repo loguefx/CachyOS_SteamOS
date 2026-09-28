@@ -22,8 +22,10 @@ normal desktop changes.
   screen is set to is what console mode runs at. 1080p60, 1440p165, 4K120: no
   configuration, and nothing to update when you change it
 - **Any display you like**, chosen once, including one that is not your primary
-- **The Steam button opens it**, the same double-press that already opens Big
-  Picture
+- **The Steam / PS / Xbox / Home button opens it**, the same double-press that
+  already opens Big Picture
+- **Switch to Desktop leaves it**, the same Power menu item SteamOS uses, wired
+  to close the session instead of a login you never started
 - **One game's audio at a time** — with two games running, you only hear the one
   you switched to, while voice chat stays audible through all of it
 - **Discord on the couch**, launched from your library and using the same
@@ -58,7 +60,19 @@ then press the Steam button twice to open gamescope on the new display.
 
 ## Install
 
-On CachyOS or Arch, the package is the path that updates with the system:
+On CachyOS or Arch, the package is the path that updates with the system
+once it is on the AUR. **AUR registration is closed right now**, so
+`paru -S cachy-console-git` will not find it yet. Until then, build it
+from this repo:
+
+```bash
+git clone https://github.com/loguefx/CachyOS_SteamOS.git
+cd CachyOS_SteamOS/aur/cachy-console-git
+makepkg -si
+cachy-console first-run
+```
+
+When the AUR accepts new accounts again:
 
 ```bash
 paru -S cachy-console-git
@@ -66,7 +80,7 @@ cachy-console first-run
 ```
 
 `first-run` enables the Steam-button and audio services, picks a display, and
-queues Exit / Discord / Spotify library tiles. Steam rewrites its shortcut file
+queues Discord / Spotify library tiles. Steam rewrites its shortcut file
 from memory when it quits, so those tiles are written the next time Steam is
 not running — you do not have to close it first.
 
@@ -117,27 +131,24 @@ cachy-console settings   # pick the display (saved until you change it)
 cachy-console setup      # same, from a terminal
 ```
 
-Or press the Steam button twice on a controller, which is the point.
+Or press the Steam, PlayStation, Xbox or Home button twice on a controller,
+which is the point.
 
 ### Getting out again
 
-**Steam gives you no working exit here, and that is not a bug in this project.**
-Steam hides "Exit Steam", "Exit Big Picture Mode" and "Minimize" whenever it
-detects gamescope, because SteamOS expects a session manager to handle leaving.
-Big Picture's "Switch to Desktop" calls a SteamOS-only method that a normal
-Linux client answers with `Method SwitchToDesktop() not implemented`, so
-clicking it does nothing at all.
+From the Power menu, pick **Switch to Desktop**. Console mode starts Steam as a
+SteamOS client (`-steamos3`), so that button runs our `steamos-session-select`
+and closes the session the same way the old exit tile did. Steam still hides
+**Exit Steam** and **Exit Big Picture** whenever it sees gamescope — those items
+are meant for a desktop client, not a session compositor — which is why the
+working item is Switch to Desktop.
 
-So there are two ways out:
+The helper is kept off your ordinary `PATH`. Only the Steam we start sees it, so
+a real CachyOS gamescope login session keeps its own Switch to Desktop.
 
-```bash
-cachy-console exit          # from a terminal or a keyboard shortcut
-cachy-console shortcut      # adds "Exit Console Mode" to your Steam library
-```
-
-The library entry is the one you want on a couch: it appears among your games,
-so you can launch it with the controller and end up back at your desktop.
-Favourite it, or pin it to your home shelf, and it becomes a one-click exit.
+From a terminal the same leave path is `cachy-console exit`. An older
+"Exit Console Mode" library tile is removed the next time Steam is not
+holding `shortcuts.vdf`.
 
 Leaving asks Steam to close itself rather than signalling gamescope. Steam is
 gamescope's primary child, so the session follows it out, which takes a couple of
@@ -150,8 +161,8 @@ If there is no session to leave, it closes Big Picture instead. That happens whe
 Big Picture is open on the desktop rather than in gamescope — the Steam button
 does not launch anything, it asks the client that is already running to switch to
 Big Picture, so with the watcher stopped you get Big Picture on whichever screen
-the desktop client chose. The tile is in the same library either way, and
-answering "console mode is not running" left you in Big Picture with no way out.
+the desktop client chose. Answering "console mode is not running" used to leave
+you in Big Picture with no way out.
 
 Either way you get your ordinary Steam back with it, minimised to the tray, so
 the next double press on the Steam button opens console mode again without your
@@ -160,10 +171,8 @@ having to go and start Steam first. Turn that off with `RESTART_STEAM=off`.
 If Steam is running, `cachy-console shortcut` queues the entry and writes it
 the next time Steam is not — the watcher flushes that queue, and so does
 leaving console mode. You can still pass `--force` to write immediately, which
-Steam will discard when it exits. An older "Exit Game Mode" tile that still
-pointed at `projector-exit` is updated to `cachy-console-exit` by that same
-command. `cachy-console shortcut --queue-defaults` queues Exit, Discord and
-Spotify together.
+Steam will discard when it exits. `cachy-console shortcut --queue-defaults`
+queues Discord and Spotify, and removes an older Exit Console Mode tile.
 
 ### Voice chat
 
@@ -486,10 +495,11 @@ fill those in from the sockets your session already created, on both desktops.
 *already running* Steam client into Big Picture, so there is no command to
 intercept. Steam only does that flip when its own window is focused, so a
 double press over a browser used to do nothing. The watcher also reads the
-Steam button from the controller itself and starts console mode from that,
-whether Steam is focused or sitting in the tray. gamescope still cannot adopt
-a window owned by another compositor, so an already-open Big Picture is
-relaunched inside gamescope the same way.
+guide button from the controller itself — Steam logo, PlayStation, Xbox,
+Switch Home — and starts console mode from that, whether Steam is focused or
+sitting in the tray. gamescope still cannot adopt a window owned by another
+compositor, so an already-open Big Picture is relaunched inside gamescope the
+same way.
 
 **Getting a Steam button back.** The same fact runs the other way when you
 leave: the button needs a client to talk to, and leaving console mode kills
