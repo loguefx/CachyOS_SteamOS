@@ -521,14 +521,19 @@ it. Steam's second instance hands its arguments to the client that already holds
 the IPC socket and exits, so the relaunch waits for gamescope's Steam to finish
 dying before starting one, and tries again if what it started never appeared.
 
-**HDMI audio.** GPU HDMI/DP audio exposes one stereo device at a time, and
-PipeWire names it after the graphics card (`Navi 31 HDMI/DP Audio`) even when
-that port is the TV. Settings save an `AUDIO_DEVICE` (the projector, a headset,
-or another HDMI monitor). Console mode switches the GPU profile to that output,
-moves already-playing streams onto it, renames the sink to the monitor's ELD
-(e.g. Optoma UHD), and points Steam at it with `PULSE_SINK`. The choice is
-kept until you pick a different one. Headset and other USB devices stay in the
-list. The desktop HDMI device comes back when you leave.
+**HDMI audio.** GPU HDMI/DP audio's stereo profiles open one screen at a time,
+so Steam's output list would only ever hold one of them, named after the
+graphics card (`Navi 31 HDMI/DP Audio`). Console mode switches the card to its
+pro-audio profile instead, which opens every port at once, and a WirePlumber
+rule (`52-cachy-console-hdmi-outputs.conf`) names each one after its screen's
+ELD (Optoma UHD, Odyssey G93SC, …) in stereo. WirePlumber only reads rules when
+it starts, so it is restarted the first time a set of screens is seen. Settings
+save an `AUDIO_DEVICE` (the projector, a headset, or another HDMI monitor);
+console mode makes that the default, moves already-playing streams onto it,
+and points Steam at it with `PULSE_SINK`, and the others stay in Steam's list
+to pick from. Headset and other USB devices stay in the list too. The
+desktop HDMI device comes back when you leave. A card with no pro-audio
+profile falls back to switching its one stereo profile to the saved screen.
 
 **Per-game audio.** gamescope publishes which app it has focused; PipeWire can
 mute one stream. A stream is treated as a game's only when its process, or one

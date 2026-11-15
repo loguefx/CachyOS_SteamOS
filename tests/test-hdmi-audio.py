@@ -376,6 +376,115 @@ check("and an ELD that matches nothing stays unresolved",
       cd.sink_for({"kind": "hdmi", "eld": "No Such Display"}), None)
 
 print()
+print("every screen at once (pro-audio):")
+
+# The stereo profiles open one port at a time, so Steam's list only ever held
+# the screen console mode had switched to: with the Odyssey saved, the projector
+# could not be picked from the couch. Pro-audio opens all of them.
+real_glob, real_open = cd.glob.glob, open
+PCM_INFO = {
+    "/proc/asound/card0/pcm3p/info": "device: 3\nname: HDMI 0\n",
+    "/proc/asound/card0/pcm7p/info": "device: 7\nname: HDMI 1\n",
+    "/proc/asound/card0/pcm8p/info": "device: 8\nname: HDMI 2\n",
+    "/proc/asound/card0/pcm9p/info": "device: 9\nname: HDMI 3\n",
+}
+cd.glob.glob = lambda pattern: sorted(PCM_INFO) if "asound" in pattern else real_glob(pattern)
+cd.open = lambda path, *a, **kw: (
+    __import__("io").StringIO(PCM_INFO[path]) if path in PCM_INFO
+    else real_open(path, *a, **kw))
+check("HDMI N is mapped to its PCM device, not to N",
+      cd._hdmi_pcms("0"), {0: 3, 1: 7, 2: 8, 3: 9})
+
+# Earlier sections replaced hdmi_ports and friends; this needs the real ones.
+fresh = importlib.util.module_from_spec(spec)
+loader.exec_module(fresh)
+fresh.glob.glob, fresh.open = cd.glob.glob, cd.open
+fresh._pactl_json = lambda what: [{
+    "name": HDMI_CARD, "active_profile": "output:hdmi-stereo",
+    "properties": {"alsa.card": "0"},
+    "profiles": {"output:hdmi-stereo": {}, "pro-audio": {}},
+    "ports": {
+        "hdmi-output-0": {"type": "HDMI", "availability": "available",
+                          "properties": {"device.product.name": "Odyssey G93SC"},
+                          "profiles": ["output:hdmi-stereo"]},
+        "hdmi-output-2": {"type": "HDMI", "availability": "not available",
+                          "properties": {},
+                          "profiles": ["output:hdmi-stereo-extra2"]},
+        "hdmi-output-3": {"type": "HDMI", "availability": "available",
+                          "properties": {"device.product.name": "Optoma UHD"},
+                          "profiles": ["output:hdmi-stereo-extra3"]},
+    },
+}] if what == "cards" else []
+check("each port names its pro-audio sink by PCM device",
+      [p["pro_sink"] for p in fresh.hdmi_ports()],
+      ["alsa_output.pci-0000_0c_00.1.pro-output-3",
+       "alsa_output.pci-0000_0c_00.1.pro-output-8",
+       "alsa_output.pci-0000_0c_00.1.pro-output-9"])
+
+rule = fresh._pro_rule_body(fresh.hdmi_ports())
+check("the rule names each connected screen after its ELD, in stereo",
+      ('node.description = "Optoma UHD"' in rule,
+       'node.description = "Odyssey G93SC"' in rule,
+       rule.count("audio.position = [ FL FR ]")),
+      (True, True, 2))
+check("a port with no screen is switched off rather than listed",
+      rule.count("node.disabled = true"), 1)
+
+fresh.PRO_RULE = os.path.join(tmpdir, "52-cachy-console-hdmi-outputs.conf")
+fresh.AUDIO_STATE = os.path.join(tmpdir, "pro-route.json")
+fresh.time.sleep = lambda _s: None
+fresh._default_sink = lambda: "alsa_output.pci-0000_0c_00.1.hdmi-stereo"
+pro_commands = []
+profile = {"now": "output:hdmi-stereo"}
+
+
+def pro_pactl(*args):
+    pro_commands.append(list(args))
+    if args[:1] == ("set-card-profile",):
+        profile["now"] = args[2]
+    return ""
+
+
+fresh._pactl = pro_pactl
+fresh._pw_run = lambda args, timeout=8: pro_commands.append(list(args)) or ""
+fresh._card_profile = lambda card: profile["now"]
+fresh._sinks = lambda: ([{"name": "alsa_output.pci-0000_0c_00.1.pro-output-3"},
+                         {"name": "alsa_output.pci-0000_0c_00.1.pro-output-9"}]
+                        if profile["now"] == "pro-audio" else [])
+fresh.read_config = lambda: {"AUDIO_DEVICE": "Optoma UHD"}
+real_ports = fresh.hdmi_ports
+fresh.hdmi_ports = lambda: [{**p, "card_profile": profile["now"]} for p in real_ports()]
+
+check("routing opens every screen and defaults to the saved one",
+      fresh.cmd_audio_route(types.SimpleNamespace(dry_run=False)), 0)
+check("WirePlumber is restarted for a new rule, then the card switched",
+      [c for c in pro_commands if c[0] in ("systemctl", "set-card-profile")],
+      [["systemctl", "--user", "restart", "wireplumber"],
+       ["set-card-profile", HDMI_CARD, "pro-audio"]])
+check("the projector's own pro-output is the default",
+      ["set-default-sink", "alsa_output.pci-0000_0c_00.1.pro-output-9"]
+      in pro_commands, True)
+check("voice chat pins to the same sink",
+      fresh.sink_for(fresh.match_audio()),
+      "alsa_output.pci-0000_0c_00.1.pro-output-9")
+
+pro_commands.clear()
+fresh.read_config = lambda: {"AUDIO_DEVICE": "Odyssey G93SC"}
+fresh.cmd_audio_route(types.SimpleNamespace(dry_run=False))
+check("a second route with the same screens neither restarts nor switches",
+      [c for c in pro_commands if c[0] in ("systemctl", "set-card-profile")], [])
+check("but does move the default to the newly saved screen",
+      ["set-default-sink", "alsa_output.pci-0000_0c_00.1.pro-output-3"]
+      in pro_commands, True)
+
+pro_commands.clear()
+fresh.cmd_audio_restore(types.SimpleNamespace(dry_run=False))
+check("leaving puts the desktop's stereo profile back",
+      pro_commands[0], ["set-card-profile", HDMI_CARD, "output:hdmi-stereo"])
+check("the naming rule stays, so the next session needs no restart",
+      os.path.exists(fresh.PRO_RULE), True)
+
+print()
 if FAILURES:
     print(f"{len(FAILURES)} failure(s): " + ", ".join(FAILURES))
     sys.exit(1)
