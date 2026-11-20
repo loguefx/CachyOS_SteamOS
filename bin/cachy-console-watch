@@ -331,6 +331,22 @@ def proc_state(pid):
     return None
 
 
+def is_gamescope_binary(pid):
+    """Whether the process really is gamescope, not just named like it.
+
+    A script called `gamescope` -- the test suite's stand-in, for one -- runs
+    with that name as its comm, and taking it for a session made this watcher
+    "end" it a second later and restart the desktop Steam client. A script's
+    executable is its interpreter, so the binary settles it. Where the link
+    cannot be read the name alone is trusted, as it always was.
+    """
+    try:
+        exe = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return True
+    return os.path.basename(exe.removesuffix(" (deleted)")).startswith("gamescope")
+
+
 def gamescope_pids():
     """PIDs of the gamescope compositors currently running.
 
@@ -355,6 +371,8 @@ def gamescope_pids():
         if comm not in GAMESCOPE_COMMS:
             continue
         if proc_state(entry) == "Z":
+            continue
+        if not is_gamescope_binary(entry):
             continue
         pids.append(int(entry))
     return pids

@@ -277,7 +277,8 @@ workspace.windowList().forEach(function (w) {
 if (!win) {
     report({ok: false, why: "window"});
 } else {
-    if (!target) target = workspace.activeScreen.geometry;
+    var found = target !== null;
+    if (!found) target = workspace.activeScreen.geometry;
     win.noBorder = true;
     win.onAllDesktops = true;
     win.skipTaskbar = true;
@@ -288,9 +289,12 @@ if (!win) {
     win.frameGeometry = {x: target.x, y: target.y,
                          width: target.width, height: target.height};
     workspace.activeWindow = win;
-    var c = win.clientGeometry;
-    report({ok: true, found: target !== null,
-            x: c.x, y: c.y, w: c.width, h: c.height,
+    // Report where the window is going, not win.clientGeometry: a Wayland
+    // window keeps its old geometry until it acks the resize, so reading it
+    // back here gives wherever KWin first opened it -- the screen the pointer
+    // happened to be on.
+    report({ok: true, found: found,
+            x: target.x, y: target.y, w: target.width, h: target.height,
             box: [box.x, box.y, box.r - box.x, box.b - box.y]});
 }
 """
@@ -456,10 +460,17 @@ def gamescope_running():
             continue
         try:
             with open(f"/proc/{entry}/comm") as fh:
-                if fh.read().strip() in GAMESCOPE_COMMS and alive(int(entry)):
-                    return True
+                if fh.read().strip() not in GAMESCOPE_COMMS or not alive(int(entry)):
+                    continue
         except OSError:
             continue
+        # A script merely named gamescope (the test suite has some) is not one.
+        try:
+            exe = os.readlink(f"/proc/{entry}/exe")
+            if os.path.basename(exe.removesuffix(" (deleted)")).startswith("gamescope"):
+                return True
+        except OSError:
+            return True
     return False
 
 
@@ -768,9 +779,27 @@ def main():
             log(f"{args.output} is not connected; shown on the active screen.")
         if pointer is None or state["phase"] != "ask":
             return False
-        # The window is resized to the screen by that script, so the button
-        # has moved since; wait for GTK to lay the new size out first.
+        # The window is being resized to that screen; the button's offset
+        # inside it is only right once GTK has laid the new size out.
+        # GTK takes the window's new size a frame before it lays the children
+        # out again, so the size matching is not enough: wait until the card
+        # has been re-centred in it as well.
+        waits = {"n": 0}
+
+        def settled(size):
+            if abs(size[0] - info["w"]) > 1 or abs(size[1] - info["h"]) > 1:
+                return False
+            card_alloc = card.get_allocation()
+            return abs(card_alloc.x * 2 + card_alloc.width - size[0]) <= 2
+
         def aim():
+            size = (win.get_allocated_width(), win.get_allocated_height())
+            if not settled(size) and waits["n"] < 40:
+                waits["n"] += 1
+                return True
+            if waits["n"] >= 40:
+                log(f"window is {size[0]}x{size[1]}, not the screen's "
+                    f"{info['w']}x{info['h']}; aiming anyway")
             alloc = btn_a.get_allocation()
             bx, by = btn_a.translate_coordinates(win, 0, 0) or (0, 0)
             px = info["x"] + bx + alloc.width / 2
@@ -781,7 +810,7 @@ def main():
             except OSError as exc:
                 log(f"could not move the pointer: {exc}")
             return False
-        GLib.timeout_add(250, aim)
+        GLib.timeout_add(50, aim)
         return False
 
     def mapped(*_):

@@ -567,6 +567,22 @@ with _tempfile.TemporaryDirectory() as tmp:
         guide.close()
 
 print()
+print("only a real gamescope counts as a session:")
+_fake_dir = _tempfile.mkdtemp()
+_fake = os.path.join(_fake_dir, "gamescope")
+with open(_fake, "w") as _fh:
+    _fh.write("#!/bin/bash\nsleep 5\n")
+os.chmod(_fake, 0o755)
+import subprocess as _sp
+_p = _sp.Popen([_fake])
+import time as _time
+_time.sleep(0.3)
+check("a script named gamescope is not taken for a session",
+      _p.pid in pw.gamescope_pids(), False)
+_p.kill()
+_p.wait()
+
+print()
 if FAILURES:
     print(f"{FAILURES} failure(s)")
     sys.exit(1)
