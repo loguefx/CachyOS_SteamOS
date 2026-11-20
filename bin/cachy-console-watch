@@ -27,7 +27,9 @@ State machine:
   GAME     -> IDLE      gamescope exited; the desktop Steam client is restarted
 
 A game launched straight from the desktop never triggers anything, because Big
-Picture was never opened.
+Picture was never opened. A double press while such a game is open asks first,
+on the console display (`cachy-console-prompt`): A closes every game and starts
+console mode, B goes back to the game.
 
 Steam can be configured to start *itself* in Big Picture, which would otherwise
 ping-pong between desktop and console mode forever, so starts are rate limited.
@@ -372,6 +374,7 @@ class Session:
         self.log_path = log_path or os.path.join(
             os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "cachy-console-session.log")
         self._proc = None
+        self._prompt = None
 
     def connected(self):
         """Whether the saved display is actually plugged in and on.
@@ -461,6 +464,41 @@ class Session:
         else:
             self.display = raw
         return self.display
+
+    def pad_family(self, pressed=None):
+        """See pad_family(): the saved primary controller, read fresh so a
+        change in Cachy Console applies to the very next press."""
+        return pad_family(pressed)
+
+    def ask_close_games(self, games, family="steam"):
+        """Offer to close the running games and open console mode from there.
+
+        A double press with a game open used to do nothing at all: starting
+        console mode restarts Steam, which takes the game with it, so it must
+        not happen unasked. `cachy-console-prompt` asks on the console display
+        itself and, on A, closes the games and starts console mode. Only one is
+        ever open; a press while it is up is the same question again.
+        """
+        if self._prompt is not None and self._prompt.poll() is None:
+            return True
+        if self.dry_run:
+            log("[dry-run] would offer to close " +
+                ", ".join(name for _, name in games))
+            return True
+        try:
+            prompt = _sibling_or_path("cachy-console-prompt")
+        except SystemExit:
+            return False
+        argv = [prompt, "--output", self.display, "--pad", family]
+        for appid, name in games:
+            argv += ["--game", f"{appid}={name}"]
+        try:
+            self._prompt = subprocess.Popen(
+                argv, stdin=subprocess.DEVNULL, start_new_session=True)
+        except OSError as exc:
+            log(f"could not run {prompt}: {exc}")
+            return False
+        return True
 
     def relaunch_desktop_steam(self):
         """Bring back the desktop client, so the Steam button works again.
@@ -618,6 +656,10 @@ class GuideButtons:
         self.sys_hidraw = sys_hidraw
         self._fds = {}
         self._hid_down = {}
+        # Which kind of pad each node is (steam, playstation, xbox, switch),
+        # and which kind the last double press came from.
+        self._family = {}
+        self.last_family = None
         self._presses = DoublePress()
         self._next_scan = 0.0
         self._said = False
@@ -669,6 +711,8 @@ class GuideButtons:
                 continue
             path = os.path.join(self.evdev_root, name)
             wanted[path] = "evdev"
+            self._family[path] = GUIDE_VENDORS.get(
+                self._vendor(self.sys_input, name))
         try:
             nodes = os.listdir(self.sys_hidraw)
         except OSError:
@@ -682,6 +726,7 @@ class GuideButtons:
                 continue
             path = os.path.join(self.hidraw_root, name)
             wanted[path] = "hidraw"
+            self._family[path] = "steam"
         for path in list(self._fds):
             if path not in wanted:
                 try:
@@ -758,6 +803,7 @@ class GuideButtons:
                 dead.append(path)
             elif got:
                 hit = True
+                self._pressed_family = self._family.get(path)
         for path in dead:
             try:
                 os.close(self._fds.pop(path))
@@ -765,10 +811,15 @@ class GuideButtons:
                 self._fds.pop(path, None)
             self._hid_down.pop(path, None)
             self._next_scan = now
-        return self._presses.feed(now) if hit else False
+        if hit and self._presses.feed(now):
+            self.last_family = getattr(self, "_pressed_family", None)
+            return True
+        return False
 
 
 class NullGuide:
+    last_family = None
+
     def double_pressed(self, now):
         return False
 
@@ -791,6 +842,44 @@ def present_kinds(xprop, bpm_re):
         if win is not None:
             kinds.add(classify(win, bpm_re))
     return kinds
+
+
+PAD_FAMILIES = ("steam", "playstation", "xbox", "switch")
+GUIDE_NAMES = {"steam": "Steam button", "playstation": "PS button",
+               "xbox": "Xbox button", "switch": "Home button"}
+
+
+def pad_family(pressed=None, config=None):
+    """Which controller's buttons to show: the primary controller picked in
+    Cachy Console, else the kind of pad that was pressed, else Steam's.
+
+    The setting wins over the device on purpose. With STEAM_PAD_AS_XBOX a
+    Steam Controller's presses can arrive through Steam's virtual Xbox pad,
+    which would otherwise put Xbox letters in front of someone holding a
+    Steam Controller.
+    """
+    config = read_config() if config is None else config
+    primary = (config.get("PRIMARY_CONTROLLER") or "").strip().lower()
+    if primary in PAD_FAMILIES:
+        return primary
+    if pressed in PAD_FAMILIES:
+        return pressed
+    return "steam"
+
+
+def running_games(xprop):
+    """(appid, title) of every Steam game window, one per appid."""
+    games = {}
+    for wid in xprop.client_list():
+        win = xprop.window(wid)
+        if win is None:
+            continue
+        for cls in win["classes"]:
+            if GAME_CLASS_RE.match(cls):
+                appid = cls.rsplit("_", 1)[1]
+                if appid not in games or (not games[appid] and win["name"]):
+                    games[appid] = win["name"]
+    return [(appid, name or f"App {appid}") for appid, name in games.items()]
 
 
 def discover(xprop, bpm_re, interval):
@@ -1036,6 +1125,34 @@ def run_loop(xprop, session, bpm_re, args, stopping, sleep,
                     # Big Picture went away, so the next attempt is allowed to
                     # explain itself again.
                     last_standdown = None
+
+                # A game is open, so console mode cannot just start: it would
+                # take the game down unasked. Ask on the console display instead
+                # -- a press that did nothing looked like a broken button.
+                if (guide_hit and "game" in kinds
+                        and hasattr(session, "ask_close_games")):
+                    if hasattr(session, "refresh_target"):
+                        session.refresh_target()
+                    pressed = getattr(guide, "last_family", None)
+                    family = (session.pad_family(pressed)
+                              if hasattr(session, "pad_family")
+                              else pad_family(pressed, config={}))
+                    button = GUIDE_NAMES[family]
+                    games = running_games(xprop)
+                    names = ", ".join(name for _, name in games) or "A game"
+                    if session.display and session.connected():
+                        log(f"{button} twice while {names} is running "
+                            f"-> asking on {session.display}.")
+                        if not session.ask_close_games(games, family):
+                            announce("Close your game first",
+                                     f"{names} is running. Close it, then press "
+                                     f"the {button} twice.")
+                    else:
+                        log(f"{button} twice while {names} is running; "
+                            f"the console display is not available to ask on.")
+                        announce("Close your game first",
+                                 f"{names} is running. Close it, then press the "
+                                 f"{button} twice to open console mode.")
 
                 guide_ready = guide_hit and "game" not in kinds
                 if engage_streak >= args.engage_polls or guide_ready:

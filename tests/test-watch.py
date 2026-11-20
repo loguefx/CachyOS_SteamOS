@@ -105,6 +105,12 @@ class FakeSession:
     def restore_audio(self):
         self.actions.append("restore-audio")
 
+    def ask_close_games(self, games, family="steam"):
+        self.actions.append("ask-close")
+        self.asked = games
+        self.asked_family = family
+        return True
+
     def relaunch_desktop_steam(self):
         self.actions.append("relaunch-steam")
         self._started_at = None
@@ -185,8 +191,38 @@ print()
 print("Steam button without Big Picture:")
 check("two presses start a session even when Steam is not focused",
       run([DESKTOP] * 8, guide=FakeGuide({2})), ["start"])
-check("and a desktop game is left alone",
-      run([GAME] * 8, guide=FakeGuide({2})), [])
+check("a desktop game is never closed unasked: the press asks instead",
+      run([GAME] * 8, guide=FakeGuide({2})), ["ask-close"])
+s = run_session([[GAME, DESKTOP]] * 8, guide=FakeGuide({2}))
+check("and it is told which game, by appid and title",
+      s.asked, [("1623730", "Pal")])
+check("with the console display off it only says so, never asks",
+      run_session([GAME] * 8, guide=FakeGuide({2}), connected=False).announced[:1],
+      [("Close your game first",
+        "Pal is running. Close it, then press the Steam button twice to "
+        "open console mode.")])
+
+class FamilyGuide(FakeGuide):
+    def __init__(self, ticks, family):
+        super().__init__(ticks)
+        self.last_family = family
+
+
+s = run_session([GAME] * 8, guide=FamilyGuide({2}, "playstation"))
+check("the prompt shows the buttons of the pad that was pressed",
+      s.asked_family, "playstation")
+s = run_session([GAME] * 8, guide=FamilyGuide({2}, "xbox"), connected=False)
+check("and the fallback names its guide button",
+      s.announced[0][1].endswith("press the Xbox button twice to open console mode."),
+      True)
+check("the primary controller from Cachy Console wins over the device",
+      pw.pad_family("xbox", {"PRIMARY_CONTROLLER": "steam"}), "steam")
+check("PRIMARY_CONTROLLER=off falls back to the device",
+      pw.pad_family("switch", {"PRIMARY_CONTROLLER": "off"}), "switch")
+check("and with neither, Steam's own",
+      pw.pad_family(None, {}), "steam")
+check("no presses, no question",
+      run([GAME] * 8), [])
 
 print()
 print("double-press timing:")

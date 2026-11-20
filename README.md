@@ -501,6 +501,18 @@ sitting in the tray. gamescope still cannot adopt a window owned by another
 compositor, so an already-open Big Picture is relaunched inside gamescope the
 same way.
 
+**A game already open on the desktop.** Console mode restarts Steam, which
+would take the game down with it, so a double press while a game is running
+never starts it unasked. Instead a console-style prompt covers the console
+display — *Close all games?* — with the pointer already on the confirm button.
+Confirm (A on Steam and Xbox pads, ✕ on PlayStation, A on the right of a Switch
+pad) closes every game, politely first and then the way Steam's Stop button
+does, then shows *Starting up Steam Big Picture…* and opens console mode. Back
+(B / ○) returns to the game. The buttons shown follow the primary controller
+picked in Cachy Console; with that set to *off*, they follow the pad whose
+guide button was pressed. If the console display is off, a desktop
+notification says to close the game first instead.
+
 **Getting a Steam button back.** The same fact runs the other way when you
 leave: the button needs a client to talk to, and leaving console mode kills
 gamescope, which takes the Steam inside it down too. `RESTART_STEAM` starts the

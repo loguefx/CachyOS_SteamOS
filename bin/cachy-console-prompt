@@ -1,0 +1,951 @@
+#!/usr/bin/env python3
+"""Close every running game and open console mode, from the controller.
+
+cachy-console-watch starts this when the guide button -- Steam, Xbox, PS or
+Home -- is pressed twice while a game is open on the desktop. Console mode restarts Steam inside gamescope,
+which takes every game down with it, so the watcher will not do that on its
+own -- and a press that silently does nothing looks exactly like a broken
+button. This asks instead, the way a console's system overlay would:
+
+    Close all games?            (A) Close all games    (B) Keep playing
+
+in the buttons of the controller in hand: the primary controller picked in
+Cachy Console (--pad, passed on by the watcher), so a DualSense shows a cross
+and a circle and a Switch pad takes A on the right.
+
+A desktop notification cannot do the job. Plasma puts every popup on the screen
+of its own panel, never on the one the person holding the controller is looking
+at, so this is a window of its own, laid over the whole saved console display
+by a KWin script and kept above a fullscreen game. The pointer is put on the
+(A) button too, so a trackpad click answers it as well as the A button does.
+
+The A and B buttons arrive two ways. With the window focused, Steam drives its
+own controllers with the desktop layout, which types Return for A and Escape
+for B. A pad Steam is not handling shows up as a plain evdev gamepad, read here
+directly as BTN_SOUTH / BTN_EAST.
+
+  ask      -> closing    A
+  ask      -> (exit)     B, or nobody answers
+  closing  -> starting   every game's processes are gone
+  starting -> (exit)     gamescope is up; console mode takes the screen over
+  closing  -> failed     a game is still running after the last resort
+
+Games are closed politely first (their windows are asked to close, as clicking
+the X would), then the processes Steam started them under get SIGTERM and,
+last of all, SIGKILL -- what Steam's own Stop button comes down to.
+
+usage: cachy-console-prompt --output HDMI-A-1 --game 1422450=Deadlock [...]
+"""
+
+import argparse
+import fcntl
+import json
+import os
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+BUS_NAME = "io.cachyos.CachyConsole.Prompt"
+OBJ_PATH = "/io/cachyos/CachyConsole/Prompt"
+IFACE = "io.cachyos.CachyConsole.Prompt"
+INTROSPECTION = f"""
+<node>
+  <interface name="{IFACE}">
+    <method name="Placed"><arg type="s" name="report" direction="in"/></method>
+  </interface>
+</node>
+"""
+
+# Seconds given to each way of closing the games before trying the next.
+POLITE_WAIT = 8.0
+TERM_WAIT = 6.0
+KILL_WAIT = 4.0
+# How long "Starting up Steam Big Picture" may take before giving up on it.
+START_WAIT = 90.0
+
+# gamescope's own process name is gamescope-wl.
+GAMESCOPE_COMMS = frozenset(("gamescope", "gamescope-wl"))
+
+# linux/input-event-codes.h
+EV_KEY = 1
+BTN_SOUTH, BTN_EAST = 0x130, 0x131
+EVENT_FORMAT = "llHHi"
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+
+
+def log(msg):
+    print(f"[cachy-console-prompt] {msg}", flush=True)
+
+
+# --------------------------------------------------------------------------
+# Which processes are the game.
+
+def _cmdline(pid, proc_root="/proc"):
+    try:
+        with open(os.path.join(proc_root, str(pid), "cmdline"), "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return []
+    return [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+
+
+def _ppid(pid, proc_root="/proc"):
+    try:
+        with open(os.path.join(proc_root, str(pid), "stat")) as fh:
+            stat = fh.read()
+    except OSError:
+        return None
+    # comm can contain spaces and parentheses; the fields after the last ')'
+    # are fixed: state, then ppid.
+    rest = stat.rsplit(")", 1)[-1].split()
+    try:
+        return int(rest[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def _pids(proc_root="/proc"):
+    try:
+        return [int(e) for e in os.listdir(proc_root) if e.isdigit()]
+    except OSError:
+        return []
+
+
+def reapers(appid=None, proc_root="/proc"):
+    """PIDs of the `reaper SteamLaunch AppId=N` Steam started games under; every
+    game's when appid is None.
+
+    Every Steam launch -- Proton, native and non-Steam shortcuts alike -- runs
+    under one, and it is a subreaper, so everything the game spawns (wineserver
+    included) stays below it in the tree however it daemonizes.
+    """
+    want = None if appid is None else f"AppId={appid}"
+    found = []
+    for pid in _pids(proc_root):
+        argv = _cmdline(pid, proc_root)
+        if not argv or os.path.basename(argv[0]) != "reaper":
+            continue
+        # Only reaper's own arguments, not the game's after the "--".
+        own = argv[1:argv.index("--")] if "--" in argv else argv[1:]
+        if "SteamLaunch" not in own:
+            continue
+        if want is None or want in own:
+            found.append(pid)
+    return sorted(found)
+
+
+def tree(roots, proc_root="/proc"):
+    """Every PID at or below `roots`, deepest first so children go before
+    the parents that would otherwise restart or report them."""
+    children = {}
+    for pid in _pids(proc_root):
+        parent = _ppid(pid, proc_root)
+        if parent is not None:
+            children.setdefault(parent, []).append(pid)
+    order, depth = [], {}
+    stack = [(r, 0) for r in roots]
+    while stack:
+        pid, d = stack.pop()
+        if pid in depth:
+            continue
+        depth[pid] = d
+        order.append(pid)
+        stack.extend((c, d + 1) for c in children.get(pid, ()))
+    return sorted(order, key=lambda p: -depth[p])
+
+
+def alive(pid):
+    try:
+        with open(f"/proc/{pid}/status") as fh:
+            for line in fh:
+                if line.startswith("State:"):
+                    return "Z" not in line.split(None, 1)[1][:1]
+    except OSError:
+        return False
+    return False
+
+
+def signal_all(pids, sig):
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+# --------------------------------------------------------------------------
+# Putting the pointer on the button. KWin maps an absolute pointer device across
+# the bounding box of every output, so a point in desktop coordinates is that
+# point's fraction of the box -- measured here to land on the exact pixel.
+
+def abs_value(coord, origin, extent, maximum=65535):
+    if extent <= 0:
+        return 0
+    frac = (coord - origin) / extent
+    return max(0, min(maximum, round(frac * maximum)))
+
+
+class AbsPointer:
+    """A uinput absolute pointer, created early because libinput takes a
+    moment to pick a new device up and the first event would be lost."""
+
+    # linux/uinput.h, x86_64
+    UI_SET_EVBIT = 0x40045564
+    UI_SET_KEYBIT = 0x40045565
+    UI_SET_ABSBIT = 0x40045567
+    UI_DEV_SETUP = 0x405C5503
+    UI_ABS_SETUP = 0x401C5504
+    UI_DEV_CREATE = 0x5501
+    UI_DEV_DESTROY = 0x5502
+    EV_SYN, EV_KEY, EV_ABS = 0, 1, 3
+    BTN_LEFT = 0x110
+    ABS_X, ABS_Y = 0, 1
+    MAX = 65535
+
+    def __init__(self, path="/dev/uinput"):
+        self.fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            fcntl.ioctl(self.fd, self.UI_SET_EVBIT, self.EV_KEY)
+            fcntl.ioctl(self.fd, self.UI_SET_KEYBIT, self.BTN_LEFT)
+            fcntl.ioctl(self.fd, self.UI_SET_EVBIT, self.EV_ABS)
+            for axis in (self.ABS_X, self.ABS_Y):
+                fcntl.ioctl(self.fd, self.UI_SET_ABSBIT, axis)
+                # struct uinput_abs_setup: __u16 code, pad, struct input_absinfo
+                fcntl.ioctl(self.fd, self.UI_ABS_SETUP,
+                            struct.pack("H2x6i",
+                                        axis, 0, 0, self.MAX, 0, 0, 0))
+            name = b"cachy-console pointer"
+            # struct uinput_setup: struct input_id, char name[80], __u32 ff
+            fcntl.ioctl(self.fd, self.UI_DEV_SETUP,
+                        struct.pack("4H80sI", 0x06, 0x28DE, 0x1C0C, 1, name, 0))
+            fcntl.ioctl(self.fd, self.UI_DEV_CREATE)
+        except OSError:
+            os.close(self.fd)
+            raise
+        self.ready_at = time.monotonic() + 0.6
+
+    def _emit(self, typ, code, value):
+        os.write(self.fd, struct.pack("llHHi", 0, 0, typ, code, value))
+
+    def move(self, x, y, box):
+        """Put the pointer at desktop point (x, y); box is (x, y, w, h)."""
+        wait = self.ready_at - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        bx, by, bw, bh = box
+        self._emit(self.EV_ABS, self.ABS_X, abs_value(x, bx, bw, self.MAX))
+        self._emit(self.EV_ABS, self.ABS_Y, abs_value(y, by, bh, self.MAX))
+        self._emit(self.EV_SYN, 0, 0)
+
+    def close(self):
+        try:
+            # Give the last event time to be read before the device goes.
+            time.sleep(0.1)
+            fcntl.ioctl(self.fd, self.UI_DEV_DESTROY)
+        except OSError:
+            pass
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------
+# KWin scripts, loaded over D-Bus, run once and unloaded.
+
+PLACE_JS = """
+var P = %(params)s;
+function report(obj) {
+    callDBus(P.bus, P.path, P.iface, "Placed", JSON.stringify(obj));
+}
+var target = null, box = null;
+workspace.screens.forEach(function (s) {
+    var g = s.geometry;
+    if (s.name === P.output) target = g;
+    if (!box) box = {x: g.x, y: g.y, r: g.x + g.width, b: g.y + g.height};
+    box.x = Math.min(box.x, g.x); box.y = Math.min(box.y, g.y);
+    box.r = Math.max(box.r, g.x + g.width); box.b = Math.max(box.b, g.y + g.height);
+});
+var win = null;
+workspace.windowList().forEach(function (w) {
+    if (w.pid === P.pid && w.caption === P.caption) win = w;
+});
+if (!win) {
+    report({ok: false, why: "window"});
+} else {
+    if (!target) target = workspace.activeScreen.geometry;
+    win.noBorder = true;
+    win.onAllDesktops = true;
+    win.skipTaskbar = true;
+    win.skipPager = true;
+    win.keepAbove = true;
+    // The whole screen, like a console's system overlay; the card is centred
+    // inside it by the window itself.
+    win.frameGeometry = {x: target.x, y: target.y,
+                         width: target.width, height: target.height};
+    workspace.activeWindow = win;
+    var c = win.clientGeometry;
+    report({ok: true, found: target !== null,
+            x: c.x, y: c.y, w: c.width, h: c.height,
+            box: [box.x, box.y, box.r - box.x, box.b - box.y]});
+}
+"""
+
+# Every Steam game, whatever its appid: console mode takes them all down anyway.
+CLOSE_JS = """
+var only = %(only)s;
+workspace.windowList().forEach(function (w) {
+    var cls = String(w.resourceClass).toLowerCase();
+    if (/^steam_app_\\d+$/.test(cls) && (only === null || cls === "steam_app_" + only))
+        w.closeWindow();
+});
+"""
+
+FOCUS_JS = """
+workspace.windowList().forEach(function (w) {
+    if (/^steam_app_\\d+$/i.test(String(w.resourceClass))) workspace.activeWindow = w;
+});
+"""
+
+
+class KWin:
+    def __init__(self, bus):
+        self.bus = bus
+        self.n = 0
+
+    def run(self, source):
+        """Load, run and unload a script. False where KWin is not there."""
+        from gi.repository import GLib
+        self.n += 1
+        name = f"cachy-console-prompt-{os.getpid()}-{self.n}"
+        runtime = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+        path = os.path.join(runtime, name + ".js")
+        try:
+            with open(path, "w") as fh:
+                fh.write(source)
+            sid = self._call("/Scripting", "org.kde.kwin.Scripting", "loadScript",
+                             GLib.Variant("(ss)", (path, name)))
+            if sid is None:
+                return False
+            self._call(f"/Scripting/Script{sid[0]}", "org.kde.kwin.Script", "run",
+                       None)
+            # The script has run by the time run() returns; unloading straight
+            # away is fine, and leaves nothing behind in KWin.
+            self._call("/Scripting", "org.kde.kwin.Scripting", "unloadScript",
+                       GLib.Variant("(s)", (name,)))
+            return True
+        except OSError:
+            return False
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def _call(self, path, iface, method, params):
+        from gi.repository import Gio, GLib
+        try:
+            res = self.bus.call_sync("org.kde.KWin", path, iface, method, params,
+                                     None, Gio.DBusCallFlags.NONE, 3000, None)
+        except GLib.Error as exc:
+            log(f"KWin {method}: {exc.message}")
+            return None
+        return res.unpack() if res is not None else ()
+
+
+# --------------------------------------------------------------------------
+# A and B on pads Steam is not driving.
+
+def keycap_has_bit(text, bit):
+    words = []
+    for part in text.split():
+        try:
+            words.append(int(part, 16))
+        except ValueError:
+            return False
+    idx, off = divmod(bit, 64)
+    return idx < len(words) and bool(words[-(idx + 1)] & (1 << off))
+
+
+def gamepad_nodes(sys_input="/sys/class/input", dev_root="/dev/input"):
+    """evdev nodes that have a south face button, i.e. gamepads."""
+    nodes = []
+    try:
+        names = sorted(os.listdir(sys_input))
+    except OSError:
+        return nodes
+    for name in names:
+        if not name.startswith("event"):
+            continue
+        try:
+            with open(os.path.join(sys_input, name, "device", "capabilities",
+                                   "key")) as fh:
+                if keycap_has_bit(fh.read(), BTN_SOUTH):
+                    nodes.append(os.path.join(dev_root, name))
+        except OSError:
+            continue
+    return nodes
+
+
+# How each kind of controller says yes and no. The kernel names face buttons
+# by position, and Nintendo puts A on the right (east) where everyone else puts
+# their confirm button at the bottom (south). Steam's own desktop layout already
+# turns confirm/back into Return/Escape for the pads it drives.
+PADS = {
+    "steam": {"confirm": "A", "back": "B", "guide": "Steam button",
+              "confirm_bg": "#e6e9ef", "back_bg": "#e6e9ef", "fg": "#10131a",
+              "confirm_code": BTN_SOUTH, "back_code": BTN_EAST},
+    "xbox": {"confirm": "A", "back": "B", "guide": "Xbox button",
+             "confirm_bg": "#5bd36b", "back_bg": "#ef5a5a", "fg": "#10131a",
+             "confirm_code": BTN_SOUTH, "back_code": BTN_EAST},
+    "playstation": {"confirm": "\u2715", "back": "\u25cb", "guide": "PS button",
+                    "confirm_bg": "#6f8dff", "back_bg": "#ff6b86", "fg": "#ffffff",
+                    "confirm_code": BTN_SOUTH, "back_code": BTN_EAST},
+    "switch": {"confirm": "A", "back": "B", "guide": "Home button",
+               "confirm_bg": "#e6e9ef", "back_bg": "#e6e9ef", "fg": "#10131a",
+               "confirm_code": BTN_EAST, "back_code": BTN_SOUTH},
+}
+
+
+def read_primary():
+    """PRIMARY_CONTROLLER from the Cachy Console config, or ''."""
+    root = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    try:
+        with open(os.path.join(root, "cachy-console", "config")) as fh:
+            for line in fh:
+                key, sep, value = line.split("#", 1)[0].partition("=")
+                if sep and key.strip() == "PRIMARY_CONTROLLER":
+                    return value.strip().strip("'\"").lower()
+    except OSError:
+        pass
+    return ""
+
+
+def pick_pad(requested):
+    """--pad if it names a known pad, else the saved primary controller."""
+    for family in (requested, read_primary()):
+        if family in PADS:
+            return family
+    return "steam"
+
+
+def face_presses(raw, pad=PADS["xbox"]):
+    """'a' (confirm) / 'b' (back) for each press in a chunk of input_events."""
+    out = []
+    for off in range(0, len(raw) - EVENT_SIZE + 1, EVENT_SIZE):
+        _s, _u, typ, code, value = struct.unpack_from(EVENT_FORMAT, raw, off)
+        if typ == EV_KEY and value == 1:
+            if code == pad["confirm_code"]:
+                out.append("a")
+            elif code == pad["back_code"]:
+                out.append("b")
+    return out
+
+
+def gamescope_running():
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return False
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/comm") as fh:
+                if fh.read().strip() in GAMESCOPE_COMMS and alive(int(entry)):
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def find_console():
+    here = os.path.dirname(os.path.abspath(__file__))
+    local = os.path.join(here, "cachy-console")
+    if os.access(local, os.X_OK):
+        return local
+    return shutil.which("cachy-console")
+
+
+def start_console(log_path=None):
+    """Run `cachy-console`, which restarts Steam inside gamescope -- the same
+    thing the watcher does for a double press with no game open."""
+    console = find_console()
+    if not console:
+        log("cannot find cachy-console")
+        return False
+    log_path = log_path or os.path.join(
+        os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "cachy-console-session.log")
+    try:
+        with open(log_path, "w") as out:
+            subprocess.Popen([console], stdin=subprocess.DEVNULL, stdout=out,
+                             stderr=subprocess.STDOUT, start_new_session=True)
+    except OSError as exc:
+        log(f"could not run {console}: {exc}")
+        return False
+    log(f"console mode starting; output goes to {log_path}")
+    return True
+
+
+# --------------------------------------------------------------------------
+
+def parse_games(values):
+    games = []
+    for value in values:
+        appid, _, name = value.partition("=")
+        appid = appid.strip()
+        if appid.isdigit():
+            games.append((appid, name.strip() or f"App {appid}"))
+    return games
+
+
+def games_line(games):
+    names = [name for _, name in games]
+    if not names:
+        return "Your games will be closed."
+    if len(names) == 1:
+        return f"{names[0]} will be closed. Anything unsaved will be lost."
+    return (", ".join(names[:-1]) + f" and {names[-1]} will be closed. "
+            "Anything unsaved will be lost.")
+
+
+CSS = b"""
+window.cc-overlay { background-color: rgba(8, 10, 14, 0.82); }
+.cc-card { background-color: #171a21; border-radius: 22px;
+           border: 1px solid rgba(255,255,255,0.08);
+           box-shadow: 0 24px 60px rgba(0,0,0,0.6);
+           padding: 44px 56px; }
+.cc-kicker { color: #8b95a7; font-size: 12pt; font-weight: bold;
+             letter-spacing: 3px; }
+.cc-title { color: #ffffff; font-size: 30pt; font-weight: 800; }
+.cc-body  { color: #b8c0cc; font-size: 15pt; }
+.cc-choice { background-image: none; background-color: #232833; color: #ffffff;
+             border: 2px solid transparent; border-radius: 14px;
+             padding: 14px 26px; font-size: 16pt; font-weight: bold;
+             box-shadow: none; text-shadow: none; }
+.cc-choice:hover, .cc-choice:focus { border-color: #ffffff;
+                                     background-color: #2e3442; }
+"""
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--output", default="",
+                    help="connector to show this on, e.g. HDMI-A-1")
+    ap.add_argument("--game", action="append", default=[],
+                    help="APPID=Name of a running game; repeatable")
+    ap.add_argument("--pad", default="",
+                    help="steam, playstation, xbox or switch: whose buttons to "
+                         "show; defaults to PRIMARY_CONTROLLER in the config")
+    ap.add_argument("--timeout", type=float, default=45.0,
+                    help="seconds before an unanswered question goes away")
+    ap.add_argument("--no-start", action="store_true",
+                    help="close the games but do not start console mode (testing)")
+    ap.add_argument("--only-appid", default=None,
+                    help="close only this appid rather than every game (testing)")
+    args = ap.parse_args()
+
+    games = parse_games(args.game)
+    family = pick_pad(args.pad.strip().lower())
+    pad = PADS[family]
+    guide_name = pad["guide"]
+
+    # GTK reads its own options out of sys.argv when it loads, and --display
+    # is one of them (an X display name), so it must not see ours.
+    sys.argv[1:] = []
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("Gdk", "3.0")
+        gi.require_version("Pango", "1.0")
+        gi.require_version("PangoCairo", "1.0")
+        from gi.repository import Gdk, Gio, GLib, Gtk, Pango, PangoCairo
+    except (ImportError, ValueError) as exc:
+        # Without GTK there is no window to ask in; at least say why nothing
+        # happened, rather than leave a press that did nothing.
+        log(f"GTK 3 is not available ({exc}); install python-gobject and gtk3.")
+        if shutil.which("notify-send"):
+            subprocess.Popen(["notify-send", "--app-name=Console Mode",
+                              "--icon=input-gaming", "Close your game first",
+                              games_line(games).replace(" Anything unsaved will "
+                                                        "be lost.", "") +
+                              f" Then press the {guide_name} twice."])
+        return 1
+
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    kwin = KWin(bus)
+    caption = f"Console Mode {os.getpid()}"
+
+    try:
+        pointer = AbsPointer()
+    except OSError as exc:
+        log(f"cannot move the pointer ({exc}); the buttons still work.")
+        pointer = None
+
+    state = {"phase": "ask", "placed": False, "tries": 0, "timer": None}
+    loop = GLib.MainLoop()
+
+    def quit_(*_):
+        loop.quit()
+        return False
+
+    # One prompt at a time: a second double press must not stack another.
+    owner = {"ok": None}
+
+    def acquired(*_):
+        owner["ok"] = True
+
+    def lost(*_):
+        if owner["ok"] is None:
+            owner["ok"] = False
+            log("another prompt is already open.")
+            loop.quit()
+
+    node = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION)
+
+    def on_call(_conn, _sender, _path, _iface, method, params, invocation):
+        invocation.return_value(None)
+        if method == "Placed":
+            GLib.idle_add(placed, params.unpack()[0])
+
+    bus.register_object(OBJ_PATH, node.interfaces[0], on_call, None, None)
+    Gio.bus_own_name_on_connection(bus, BUS_NAME, Gio.BusNameOwnerFlags.NONE,
+                                   acquired, lost)
+
+    # -- window -------------------------------------------------------------
+    screen = Gdk.Screen.get_default()
+    provider = Gtk.CssProvider()
+    provider.load_from_data(CSS)
+    Gtk.StyleContext.add_provider_for_screen(
+        screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    win = Gtk.Window(title=caption)
+    win.get_style_context().add_class("cc-overlay")
+    visual = screen.get_rgba_visual()
+    if visual is not None:
+        win.set_visual(visual)
+    win.set_decorated(False)
+    win.set_keep_above(True)
+    win.set_skip_taskbar_hint(True)
+    win.set_icon_name("input-gaming")
+    win.set_default_size(1280, 720)
+    win.connect("destroy", quit_)
+
+    card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+    card.get_style_context().add_class("cc-card")
+    card.set_halign(Gtk.Align.CENTER)
+    card.set_valign(Gtk.Align.CENTER)
+    card.set_size_request(760, -1)
+    win.add(card)
+
+    kicker = Gtk.Label(label="CONSOLE MODE", xalign=0)
+    kicker.get_style_context().add_class("cc-kicker")
+    card.pack_start(kicker, False, False, 0)
+
+    head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=18)
+    spinner = Gtk.Spinner()
+    spinner.set_size_request(44, 44)
+    title = Gtk.Label(xalign=0)
+    title.get_style_context().add_class("cc-title")
+    title.set_line_wrap(True)
+    head.pack_start(spinner, False, False, 0)
+    head.pack_start(title, True, True, 0)
+    card.pack_start(head, False, False, 0)
+
+    body = Gtk.Label(xalign=0)
+    body.get_style_context().add_class("cc-body")
+    body.set_line_wrap(True)
+    body.set_max_width_chars(52)
+    card.pack_start(body, False, False, 0)
+
+    def rgb(hexcolor):
+        c = Gdk.RGBA()
+        c.parse(hexcolor)
+        return c.red, c.green, c.blue
+
+    def glyph_badge(glyph, bg, fg, size=36):
+        """A filled circle with the glyph centred on its ink, not its line box.
+
+        A label lays text out on a font baseline, and a cross or a ring has
+        different metrics from a letter, so CSS centring left them visibly off
+        centre. Measuring the drawn shape and centring that puts every glyph --
+        A, B, a cross, a circle -- in the middle of its badge.
+        """
+        area = Gtk.DrawingArea()
+        area.set_size_request(size, size)
+        area.set_valign(Gtk.Align.CENTER)
+
+        def draw(widget, cr):
+            w, h = widget.get_allocated_width(), widget.get_allocated_height()
+            r = min(w, h) / 2
+            cr.set_source_rgb(*rgb(bg))
+            cr.arc(w / 2, h / 2, r, 0, 2 * 3.141592653589793)
+            cr.fill()
+            layout = widget.create_pango_layout(glyph)
+            font = Pango.FontDescription.from_string("Sans Heavy")
+            font.set_absolute_size(r * 1.05 * Pango.SCALE)
+            layout.set_font_description(font)
+            ink, _logical = layout.get_pixel_extents()
+            cr.set_source_rgb(*rgb(fg))
+            cr.move_to(w / 2 - ink.x - ink.width / 2,
+                       h / 2 - ink.y - ink.height / 2)
+            PangoCairo.show_layout(cr, layout)
+            return False
+
+        area.connect("draw", draw)
+        return area
+
+    def choice(slot, text):
+        glyph = pad["confirm"] if slot == "a" else pad["back"]
+        btn = Gtk.Button()
+        btn.get_style_context().add_class("cc-choice")
+        btn.set_relief(Gtk.ReliefStyle.NONE)
+        inner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        bg = pad["confirm_bg"] if slot == "a" else pad["back_bg"]
+        inner.pack_start(glyph_badge(glyph, bg, pad["fg"]), False, False, 0)
+        inner.pack_start(Gtk.Label(label=text), False, False, 0)
+        btn.add(inner)
+        return btn
+
+    buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+    buttons.set_margin_top(18)
+    btn_a = choice("a", "Close all games")
+    btn_b = choice("b", "Keep playing")
+    btn_ok = choice("a", "OK")
+    for b in (btn_a, btn_b, btn_ok):
+        buttons.pack_start(b, False, False, 0)
+    card.pack_start(buttons, False, False, 0)
+
+    def show(phase, head_text, body_text, busy=False, choices=()):
+        state["phase"] = phase
+        title.set_text(head_text)
+        body.set_text(body_text)
+        body.set_visible(bool(body_text))
+        spinner.set_visible(busy)
+        spinner.start() if busy else spinner.stop()
+        for b in (btn_a, btn_b, btn_ok):
+            b.set_visible(b in choices)
+        buttons.set_visible(bool(choices))
+        if choices:
+            choices[0].grab_focus()
+
+    def arm_timeout(seconds):
+        if state["timer"]:
+            GLib.source_remove(state["timer"])
+        state["timer"] = GLib.timeout_add(int(seconds * 1000), quit_)
+
+    # -- placement and pointer ---------------------------------------------
+    def place():
+        if state["placed"]:
+            return False
+        state["tries"] += 1
+        if state["tries"] > 15:
+            log("KWin never reported the window; leaving it where it is.")
+            return False
+        params = json.dumps({"pid": os.getpid(), "caption": caption,
+                             "output": args.output, "bus": BUS_NAME,
+                             "path": OBJ_PATH, "iface": IFACE})
+        if not kwin.run(PLACE_JS % {"params": params}):
+            log("KWin is not available; the window stays where it opened.")
+            win.fullscreen()
+            return False
+        return True       # retried until placed() reports in
+
+    def placed(report):
+        try:
+            info = json.loads(report)
+        except ValueError:
+            return False
+        if not info.get("ok") or state["placed"]:
+            return False
+        state["placed"] = True
+        if not info.get("found"):
+            log(f"{args.output} is not connected; shown on the active screen.")
+        if pointer is None or state["phase"] != "ask":
+            return False
+        # The window is resized to the screen by that script, so the button
+        # has moved since; wait for GTK to lay the new size out first.
+        def aim():
+            alloc = btn_a.get_allocation()
+            bx, by = btn_a.translate_coordinates(win, 0, 0) or (0, 0)
+            px = info["x"] + bx + alloc.width / 2
+            py = info["y"] + by + alloc.height / 2
+            try:
+                pointer.move(px, py, info["box"])
+                log(f"pointer on 'Close all games' at {px:.0f},{py:.0f}")
+            except OSError as exc:
+                log(f"could not move the pointer: {exc}")
+            return False
+        GLib.timeout_add(250, aim)
+        return False
+
+    def mapped(*_):
+        GLib.timeout_add(150, place)
+        return False
+
+    win.connect("map-event", mapped)
+
+    # -- A and B ------------------------------------------------------------
+    pad_fds = []
+
+    def on_pad(fd, _cond):
+        try:
+            raw = os.read(fd, EVENT_SIZE * 16)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        for press in face_presses(raw, pad):
+            press_a() if press == "a" else press_b()
+        return True
+
+    for path in gamepad_nodes():
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError:
+            continue
+        pad_fds.append(fd)
+        GLib.io_add_watch(fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN, on_pad)
+
+    def press_a():
+        phase = state["phase"]
+        if phase == "ask":
+            close_all()
+        elif phase == "failed":
+            loop.quit()
+
+    def press_b():
+        phase = state["phase"]
+        if phase == "ask":
+            log("keeping the games running.")
+            kwin.run(FOCUS_JS)
+            loop.quit()
+        elif phase == "failed":
+            loop.quit()
+
+    btn_a.connect("clicked", lambda _b: press_a())
+    btn_b.connect("clicked", lambda _b: press_b())
+    btn_ok.connect("clicked", lambda _b: press_a())
+
+    def on_key(_w, event):
+        # Steam's desktop layout: A types Return, B types Escape.
+        if event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_ISO_Enter):
+            press_a()
+            return True
+        if event.keyval in (Gdk.KEY_Escape, Gdk.KEY_BackSpace):
+            press_b()
+            return True
+        return False
+
+    win.connect("key-press-event", on_key)
+
+    # -- closing, then console mode -----------------------------------------
+    def remaining():
+        return [p for p in reapers(args.only_appid) if alive(p)]
+
+    def close_windows():
+        kwin.run(CLOSE_JS % {"only": json.dumps(args.only_appid)})
+        return False
+
+    def closer():
+        def step(phase, wait, action):
+            action()
+            deadline = time.monotonic() + wait
+            while time.monotonic() < deadline:
+                if not remaining():
+                    return True
+                time.sleep(0.25)
+            log(f"games still running after {phase}")
+            return False
+
+        if not remaining():
+            log("no Steam game processes found; asking windows to close only.")
+        done = (step("asking them to close", POLITE_WAIT,
+                     lambda: GLib.idle_add(close_windows))
+                or step("SIGTERM", TERM_WAIT,
+                        lambda: signal_all(tree(remaining()), signal.SIGTERM))
+                or step("SIGKILL", KILL_WAIT,
+                        lambda: signal_all(tree(remaining()), signal.SIGKILL)))
+        GLib.idle_add(closed, done)
+
+    def close_all():
+        log("closing all games")
+        show("closing", "Closing games…", games_line(games), busy=True)
+        arm_timeout(POLITE_WAIT + TERM_WAIT + KILL_WAIT + 30)
+        threading.Thread(target=closer, daemon=True).start()
+
+    def closed(done):
+        if not done:
+            show("failed", "Couldn't close every game",
+                 "Something is still running. Stop it from Steam, then press "
+                 f"the {guide_name} twice.", choices=(btn_ok,))
+            arm_timeout(30)
+            return False
+        log("all games closed.")
+        show("closed", "Games closed", "")
+        GLib.timeout_add(900, starting)
+        return False
+
+    def starting():
+        show("starting", "Starting up Steam Big Picture…",
+             "Your TV switches over in a moment.", busy=True)
+        if args.no_start:
+            log("--no-start: not starting console mode.")
+            GLib.timeout_add(2500, quit_)
+            return False
+        if not start_console():
+            show("failed", "Couldn't start console mode",
+                 f"Press the {guide_name} twice to try again.", choices=(btn_ok,))
+            arm_timeout(30)
+            return False
+        deadline = time.monotonic() + START_WAIT
+
+        def wait_for_gamescope():
+            # This window sits above everything on that screen, so it has to go
+            # as soon as gamescope is there or it would cover Big Picture.
+            if gamescope_running():
+                log("gamescope is up.")
+                loop.quit()
+                return False
+            if time.monotonic() > deadline:
+                show("failed", "Console mode didn't start",
+                     "See cachy-console-session.log, or press the "
+                     f"{guide_name} twice to try again.", choices=(btn_ok,))
+                arm_timeout(30)
+                return False
+            return True
+
+        GLib.timeout_add(250, wait_for_gamescope)
+        arm_timeout(START_WAIT + 35)
+        return False
+
+    show("ask", "Close all games?",
+         "Steam Big Picture needs your games closed first. " + games_line(games),
+         choices=(btn_a, btn_b))
+    arm_timeout(args.timeout)
+    win.show_all()
+    show("ask", "Close all games?",
+         "Steam Big Picture needs your games closed first. " + games_line(games),
+         choices=(btn_a, btn_b))
+
+    try:
+        loop.run()
+    finally:
+        win.destroy()
+        for fd in pad_fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if pointer is not None:
+            pointer.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
