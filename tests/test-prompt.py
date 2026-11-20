@@ -71,13 +71,11 @@ with tempfile.TemporaryDirectory() as proc:
           order.index(202) < order.index(201) < order.index(200), True)
 
 print()
-print("pointer placement:")
-check("a point maps to its fraction of the desktop's bounding box",
-      pr.abs_value(7808, 0, 8576), round(7808 / 8576 * 65535))
-check("including a desktop that starts left of zero",
-      pr.abs_value(0, -1920, 3840), 32768)
-check("and never past the device's range",
-      (pr.abs_value(-5, 0, 100), pr.abs_value(500, 0, 100)), (0, 65535))
+print("hands off the mouse:")
+check("there is no pointer device to move it with",
+      any(hasattr(pr, n) for n in ("AbsPointer", "abs_value")), False)
+check("focus is given back to the window that had it",
+      "workspace.activeWindow = w" in pr.RESTORE_JS, True)
 
 print()
 print("A and B from a plain gamepad:")

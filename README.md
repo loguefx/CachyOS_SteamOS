@@ -504,7 +504,9 @@ same way.
 **A game already open on the desktop.** Console mode restarts Steam, which
 would take the game down with it, so a double press while a game is running
 never starts it unasked. Instead a console-style prompt covers the console
-display — *Close all games?* — with the pointer already on the confirm button.
+display — *Close all games?* — answered with the controller alone. The mouse
+pointer is never moved and keyboard focus goes back to the window that had it,
+so someone playing at the desk is not disturbed.
 Confirm (A on Steam and Xbox pads, ✕ on PlayStation, A on the right of a Switch
 pad) closes every game, politely first and then the way Steam's Stop button
 does, then shows *Starting up Steam Big Picture…* and opens console mode. Back

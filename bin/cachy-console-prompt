@@ -16,8 +16,10 @@ and a circle and a Switch pad takes A on the right.
 A desktop notification cannot do the job. Plasma puts every popup on the screen
 of its own panel, never on the one the person holding the controller is looking
 at, so this is a window of its own, laid over the whole saved console display
-by a KWin script and kept above a fullscreen game. The pointer is put on the
-(A) button too, so a trackpad click answers it as well as the A button does.
+by a KWin script and kept above a fullscreen game. It is answered with the
+controller's buttons only: the mouse pointer is never moved, so whoever is at
+the desk keeps theirs, and keyboard focus goes back to their window as soon
+as the prompt closes.
 
 The A and B buttons arrive two ways. With the window focused, Steam drives its
 own controllers with the desktop layout, which types Return for A and Escape
@@ -38,7 +40,6 @@ usage: cachy-console-prompt --output HDMI-A-1 --game 1422450=Deadlock [...]
 """
 
 import argparse
-import fcntl
 import json
 import os
 import shutil
@@ -178,83 +179,6 @@ def signal_all(pids, sig):
 
 
 # --------------------------------------------------------------------------
-# Putting the pointer on the button. KWin maps an absolute pointer device across
-# the bounding box of every output, so a point in desktop coordinates is that
-# point's fraction of the box -- measured here to land on the exact pixel.
-
-def abs_value(coord, origin, extent, maximum=65535):
-    if extent <= 0:
-        return 0
-    frac = (coord - origin) / extent
-    return max(0, min(maximum, round(frac * maximum)))
-
-
-class AbsPointer:
-    """A uinput absolute pointer, created early because libinput takes a
-    moment to pick a new device up and the first event would be lost."""
-
-    # linux/uinput.h, x86_64
-    UI_SET_EVBIT = 0x40045564
-    UI_SET_KEYBIT = 0x40045565
-    UI_SET_ABSBIT = 0x40045567
-    UI_DEV_SETUP = 0x405C5503
-    UI_ABS_SETUP = 0x401C5504
-    UI_DEV_CREATE = 0x5501
-    UI_DEV_DESTROY = 0x5502
-    EV_SYN, EV_KEY, EV_ABS = 0, 1, 3
-    BTN_LEFT = 0x110
-    ABS_X, ABS_Y = 0, 1
-    MAX = 65535
-
-    def __init__(self, path="/dev/uinput"):
-        self.fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
-        try:
-            fcntl.ioctl(self.fd, self.UI_SET_EVBIT, self.EV_KEY)
-            fcntl.ioctl(self.fd, self.UI_SET_KEYBIT, self.BTN_LEFT)
-            fcntl.ioctl(self.fd, self.UI_SET_EVBIT, self.EV_ABS)
-            for axis in (self.ABS_X, self.ABS_Y):
-                fcntl.ioctl(self.fd, self.UI_SET_ABSBIT, axis)
-                # struct uinput_abs_setup: __u16 code, pad, struct input_absinfo
-                fcntl.ioctl(self.fd, self.UI_ABS_SETUP,
-                            struct.pack("H2x6i",
-                                        axis, 0, 0, self.MAX, 0, 0, 0))
-            name = b"cachy-console pointer"
-            # struct uinput_setup: struct input_id, char name[80], __u32 ff
-            fcntl.ioctl(self.fd, self.UI_DEV_SETUP,
-                        struct.pack("4H80sI", 0x06, 0x28DE, 0x1C0C, 1, name, 0))
-            fcntl.ioctl(self.fd, self.UI_DEV_CREATE)
-        except OSError:
-            os.close(self.fd)
-            raise
-        self.ready_at = time.monotonic() + 0.6
-
-    def _emit(self, typ, code, value):
-        os.write(self.fd, struct.pack("llHHi", 0, 0, typ, code, value))
-
-    def move(self, x, y, box):
-        """Put the pointer at desktop point (x, y); box is (x, y, w, h)."""
-        wait = self.ready_at - time.monotonic()
-        if wait > 0:
-            time.sleep(wait)
-        bx, by, bw, bh = box
-        self._emit(self.EV_ABS, self.ABS_X, abs_value(x, bx, bw, self.MAX))
-        self._emit(self.EV_ABS, self.ABS_Y, abs_value(y, by, bh, self.MAX))
-        self._emit(self.EV_SYN, 0, 0)
-
-    def close(self):
-        try:
-            # Give the last event time to be read before the device goes.
-            time.sleep(0.1)
-            fcntl.ioctl(self.fd, self.UI_DEV_DESTROY)
-        except OSError:
-            pass
-        try:
-            os.close(self.fd)
-        except OSError:
-            pass
-
-
-# --------------------------------------------------------------------------
 # KWin scripts, loaded over D-Bus, run once and unloaded.
 
 PLACE_JS = """
@@ -262,13 +186,9 @@ var P = %(params)s;
 function report(obj) {
     callDBus(P.bus, P.path, P.iface, "Placed", JSON.stringify(obj));
 }
-var target = null, box = null;
+var target = null;
 workspace.screens.forEach(function (s) {
-    var g = s.geometry;
-    if (s.name === P.output) target = g;
-    if (!box) box = {x: g.x, y: g.y, r: g.x + g.width, b: g.y + g.height};
-    box.x = Math.min(box.x, g.x); box.y = Math.min(box.y, g.y);
-    box.r = Math.max(box.r, g.x + g.width); box.b = Math.max(box.b, g.y + g.height);
+    if (s.name === P.output) target = s.geometry;
 });
 var win = null;
 workspace.windowList().forEach(function (w) {
@@ -288,14 +208,11 @@ if (!win) {
     // inside it by the window itself.
     win.frameGeometry = {x: target.x, y: target.y,
                          width: target.width, height: target.height};
+    // Keyboard focus, because that is how a Steam-driven controller's A and B
+    // arrive (Return and Escape). The pointer is left alone: someone may be
+    // using the mouse at the desk. Focus goes back when this closes.
     workspace.activeWindow = win;
-    // Report where the window is going, not win.clientGeometry: a Wayland
-    // window keeps its old geometry until it acks the resize, so reading it
-    // back here gives wherever KWin first opened it -- the screen the pointer
-    // happened to be on.
-    report({ok: true, found: found,
-            x: target.x, y: target.y, w: target.width, h: target.height,
-            box: [box.x, box.y, box.r - box.x, box.b - box.y]});
+    report({ok: true, found: found});
 }
 """
 
@@ -309,9 +226,19 @@ workspace.windowList().forEach(function (w) {
 });
 """
 
-FOCUS_JS = """
+# Which window had focus before the prompt took it, so it can be given back:
+# the person at the desk keeps typing into their own game afterwards.
+REMEMBER_JS = """
+var P = %(params)s;
+var a = workspace.activeWindow;
+callDBus(P.bus, P.path, P.iface, "Placed",
+         JSON.stringify({prev: a && a.pid !== P.pid ? String(a.internalId) : ""}));
+"""
+
+RESTORE_JS = """
+var prev = %(prev)s;
 workspace.windowList().forEach(function (w) {
-    if (/^steam_app_\\d+$/i.test(String(w.resourceClass))) workspace.activeWindow = w;
+    if (String(w.internalId) === prev) workspace.activeWindow = w;
 });
 """
 
@@ -592,13 +519,8 @@ def main():
     kwin = KWin(bus)
     caption = f"Console Mode {os.getpid()}"
 
-    try:
-        pointer = AbsPointer()
-    except OSError as exc:
-        log(f"cannot move the pointer ({exc}); the buttons still work.")
-        pointer = None
-
-    state = {"phase": "ask", "placed": False, "tries": 0, "timer": None}
+    state = {"phase": "ask", "placed": False, "tries": 0, "timer": None,
+             "prev": ""}
     loop = GLib.MainLoop()
 
     def quit_(*_):
@@ -750,7 +672,12 @@ def main():
             GLib.source_remove(state["timer"])
         state["timer"] = GLib.timeout_add(int(seconds * 1000), quit_)
 
-    # -- placement and pointer ---------------------------------------------
+    # -- placement -----------------------------------------------------------
+    def bus_params():
+        return json.dumps({"pid": os.getpid(), "caption": caption,
+                           "output": args.output, "bus": BUS_NAME,
+                           "path": OBJ_PATH, "iface": IFACE})
+
     def place():
         if state["placed"]:
             return False
@@ -758,10 +685,7 @@ def main():
         if state["tries"] > 15:
             log("KWin never reported the window; leaving it where it is.")
             return False
-        params = json.dumps({"pid": os.getpid(), "caption": caption,
-                             "output": args.output, "bus": BUS_NAME,
-                             "path": OBJ_PATH, "iface": IFACE})
-        if not kwin.run(PLACE_JS % {"params": params}):
+        if not kwin.run(PLACE_JS % {"params": bus_params()}):
             log("KWin is not available; the window stays where it opened.")
             win.fullscreen()
             return False
@@ -772,45 +696,14 @@ def main():
             info = json.loads(report)
         except ValueError:
             return False
+        if "prev" in info:
+            state["prev"] = info["prev"]
+            return False
         if not info.get("ok") or state["placed"]:
             return False
         state["placed"] = True
         if not info.get("found"):
             log(f"{args.output} is not connected; shown on the active screen.")
-        if pointer is None or state["phase"] != "ask":
-            return False
-        # The window is being resized to that screen; the button's offset
-        # inside it is only right once GTK has laid the new size out.
-        # GTK takes the window's new size a frame before it lays the children
-        # out again, so the size matching is not enough: wait until the card
-        # has been re-centred in it as well.
-        waits = {"n": 0}
-
-        def settled(size):
-            if abs(size[0] - info["w"]) > 1 or abs(size[1] - info["h"]) > 1:
-                return False
-            card_alloc = card.get_allocation()
-            return abs(card_alloc.x * 2 + card_alloc.width - size[0]) <= 2
-
-        def aim():
-            size = (win.get_allocated_width(), win.get_allocated_height())
-            if not settled(size) and waits["n"] < 40:
-                waits["n"] += 1
-                return True
-            if waits["n"] >= 40:
-                log(f"window is {size[0]}x{size[1]}, not the screen's "
-                    f"{info['w']}x{info['h']}; aiming anyway")
-            alloc = btn_a.get_allocation()
-            bx, by = btn_a.translate_coordinates(win, 0, 0) or (0, 0)
-            px = info["x"] + bx + alloc.width / 2
-            py = info["y"] + by + alloc.height / 2
-            try:
-                pointer.move(px, py, info["box"])
-                log(f"pointer on 'Close all games' at {px:.0f},{py:.0f}")
-            except OSError as exc:
-                log(f"could not move the pointer: {exc}")
-            return False
-        GLib.timeout_add(50, aim)
         return False
 
     def mapped(*_):
@@ -852,7 +745,6 @@ def main():
         phase = state["phase"]
         if phase == "ask":
             log("keeping the games running.")
-            kwin.run(FOCUS_JS)
             loop.quit()
         elif phase == "failed":
             loop.quit()
@@ -957,6 +849,7 @@ def main():
          "Steam Big Picture needs your games closed first. " + games_line(games),
          choices=(btn_a, btn_b))
     arm_timeout(args.timeout)
+    kwin.run(REMEMBER_JS % {"params": bus_params()})
     win.show_all()
     show("ask", "Close all games?",
          "Steam Big Picture needs your games closed first. " + games_line(games),
@@ -971,8 +864,10 @@ def main():
                 os.close(fd)
             except OSError:
                 pass
-        if pointer is not None:
-            pointer.close()
+        # Hand focus back to whoever had it. A game that was just closed is
+        # gone, and then there is nothing to give it back to.
+        if state["prev"]:
+            kwin.run(RESTORE_JS % {"prev": json.dumps(state["prev"])})
     return 0
 
 
