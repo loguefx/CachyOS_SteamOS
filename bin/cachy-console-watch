@@ -689,7 +689,11 @@ class GuideButtons:
     """
 
     def __init__(self, evdev_root="/dev/input", hidraw_root="/dev",
-                 sys_input="/sys/class/input", sys_hidraw="/sys/class/hidraw"):
+                 sys_input="/sys/class/input", sys_hidraw="/sys/class/hidraw",
+                 families=None):
+        # Only these kinds of pad may start console mode; None is any. See
+        # trigger_families().
+        self.families = families
         self.evdev_root = evdev_root
         self.hidraw_root = hidraw_root
         self.sys_input = sys_input
@@ -842,8 +846,11 @@ class GuideButtons:
             if got is None:
                 dead.append(path)
             elif got:
+                family = self._family.get(path)
+                if self.families is not None and family not in self.families:
+                    continue
                 hit = True
-                self._pressed_family = self._family.get(path)
+                self._pressed_family = family
         for path in dead:
             try:
                 os.close(self._fds.pop(path))
@@ -905,6 +912,22 @@ def pad_family(pressed=None, config=None):
     if pressed in PAD_FAMILIES:
         return pressed
     return "steam"
+
+
+def trigger_families(config=None):
+    """Which kinds of pad may start console mode with a double press.
+
+    Two people at once: someone playing at the desk with their own gamepad
+    should not put console mode on the television by pressing its guide button.
+    So by default only the primary controller picked in Cachy Console counts.
+    GUIDE_PRIMARY_ONLY=off, or no primary controller, lets any pad do it.
+    """
+    config = read_config() if config is None else config
+    if (config.get("GUIDE_PRIMARY_ONLY") or "on").strip().lower() in (
+            "off", "no", "0", "false"):
+        return None
+    primary = (config.get("PRIMARY_CONTROLLER") or "").strip().lower()
+    return {primary} if primary in PAD_FAMILIES else None
 
 
 def running_games(xprop):
@@ -1052,7 +1075,12 @@ def main():
             "(open Console Mode Settings)"
             + (" (dry run)" if args.dry_run else ""))
 
-    guide = GuideButtons()
+    families = trigger_families(config)
+    if families:
+        log(f"only the {GUIDE_NAMES[next(iter(families))]} on a "
+            f"{next(iter(families))} controller starts console mode "
+            "(GUIDE_PRIMARY_ONLY)")
+    guide = GuideButtons(families=families)
     try:
         run_loop(xprop, session, bpm_re, args, stopping, time.sleep, guide=guide,
                  flush_shortcuts=maybe_flush_shortcuts)

@@ -783,7 +783,7 @@ def main():
     win.connect("map-event", mapped)
 
     # -- A and B ------------------------------------------------------------
-    pad_fds = []
+    pad_fds = {}          # path -> fd
 
     def on_pad(fd, _cond, path):
         try:
@@ -791,23 +791,37 @@ def main():
         except BlockingIOError:
             return True
         except OSError:
+            # Unplugged, or Steam took its virtual pad away: forget it, so a
+            # new one under the same name is opened by the next scan.
+            pad_fds.pop(path, None)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
             return False
         for press in face_presses(raw, pad):
             log(f"{press.upper()} from {path}")
             press_a() if press == "a" else press_b()
         return True
 
-    listening = pads_for(family)
-    for path in listening:
-        try:
-            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-        except OSError:
-            continue
-        pad_fds.append(fd)
-        GLib.io_add_watch(fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN, on_pad, path)
-    if not pad_fds:
-        log("no controller could be opened; the prompt can only time out "
-            "or be clicked.")
+    def listen():
+        """Open any pad not already open. Run again every second while the
+        prompt is up: Steam creates its virtual pad when it pleases, and a
+        controller can wake up after the prompt has opened."""
+        for path in pads_for(family):
+            if path in pad_fds:
+                continue
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError:
+                continue
+            pad_fds[path] = fd
+            log(f"listening to {path}")
+            GLib.io_add_watch(fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN, on_pad, path)
+        return True
+
+    listen()
+    GLib.timeout_add(1000, listen)
 
     def press_a():
         phase = state["phase"]
@@ -924,7 +938,7 @@ def main():
         if state["prev"]:
             kwin.run(RESTORE_JS % {"params": bus_params()})
         win.destroy()
-        for fd in pad_fds:
+        for fd in pad_fds.values():
             try:
                 os.close(fd)
             except OSError:

@@ -88,6 +88,8 @@ check("on closing, focus is only moved if the prompt somehow holds it",
       "a.pid === P.pid" in pr.RESTORE_JS, True)
 check("no keyboard key answers it, so Enter at the desk cannot close games",
       ("key-press-event" in SOURCE, "KEY_Return" in SOURCE), (False, False))
+check("controllers that appear after the prompt opens are picked up",
+      "GLib.timeout_add(1000, listen)" in SOURCE, True)
 check("and GTK is asked not to take focus",
       ("set_accept_focus(False)" in SOURCE, "set_focus_on_map(False)" in SOURCE),
       (True, True))

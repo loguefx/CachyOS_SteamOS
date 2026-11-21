@@ -424,6 +424,7 @@ VRR and HDR; they leave `AUDIO_NEVER_MUTE` and the rest as you set them.
 | `GRAB_CURSOR` | `on` | Hold gamescope in relative mouse mode, which is what makes a nested gamescope draw its own cursor and keeps the pointer in the session. Off hands the cursor back to the desktop, which draws one only while the desktop's pointer is over the session's window |
 | `SHARE_DESK` | `on` | Console mode's window never takes focus on the desktop, so someone at the desk keeps their mouse and keyboard while the controller drives the session. Off lets a desk keyboard and mouse into the session. KDE only |
 | `STEAM_BUTTON` | `on` | Let the Steam button open console mode |
+| `GUIDE_PRIMARY_ONLY` | `on` | Only the `PRIMARY_CONTROLLER` kind of pad starts console mode with a double guide press, so someone playing at the desk with their own gamepad cannot put it on the TV. Off lets any controller do it |
 | `RESTART_STEAM` | `on` | Start the desktop Steam client again when console mode ends, minimised to the tray, so the Steam button has a client to open Big Picture in next time |
 | `AUDIO_FOCUS` | `on` | Mute games you are not looking at |
 | `AUDIO_DEVICE` | *(follows display)* | HDMI monitor name (`Optoma UHD`) or device (`RODECaster Duo`). Kept until you change it in **Cachy Console** settings |
@@ -562,11 +563,13 @@ save an `AUDIO_DEVICE` (the projector, a headset, or another HDMI monitor);
 console mode points Steam at it with `PULSE_SINK`, which its games inherit,
 and moves the session's own streams onto it. The desktop's default output is
 left alone, so someone at the desk keeps their sound where it was: their game,
-browser and Discord are never moved to the television. Anything in the session
-that ignores `PULSE_SINK` and opens on the desk's default is moved to the TV by
-the audio service. The other screens stay in Steam's list to pick from, and
-headset and other USB devices stay in the list too. The desktop HDMI profile
-comes back when you leave. A card with no pro-audio
+browser and Discord are never moved to the television. **Console mode's output
+is chosen in Cachy Console**, and while a session runs the audio service keeps
+every stream in it there: one that ignores `PULSE_SINK`, or one moved by Big
+Picture's own output picker, is put back. Big Picture's picker also sets the
+desktop-wide default; if it makes the TV the default, the desk gets its own
+output back. A new output saved in Cachy Console mid-session takes effect at
+once. The desktop HDMI profile comes back when you leave. A card with no pro-audio
 profile falls back to switching its one stereo profile to the saved screen.
 
 **Per-game audio.** gamescope publishes which app it has focused; PipeWire can

@@ -129,7 +129,7 @@ load_config() {
         case "$key" in
             DISPLAY|DISPLAY_MODEL|RESOLUTION|REFRESH|HDR|VRR|TRACKPAD_FIX|GRAB_CURSOR|RESTART_STEAM|EXTRA_GAMESCOPE_ARGS|AUDIO_DEVICE|AUDIO_INPUT_DEVICE|IGNORE_CONTROLLERS|PRIMARY_CONTROLLER|PRIMARY_ONLY|STEAM_PAD_AS_XBOX|SHARE_DESK)
                 printf -v "CFG_$key" '%s' "$value" ;;
-            STEAM_BUTTON|AUDIO_FOCUS|AUDIO_NEVER_MUTE|AUDIO_PIN_VOICE|MOUSE_LAYOUT_APPS) ;;   # read by the services, not by us
+            STEAM_BUTTON|GUIDE_PRIMARY_ONLY|AUDIO_FOCUS|AUDIO_NEVER_MUTE|AUDIO_PIN_VOICE|MOUSE_LAYOUT_APPS) ;;   # read by the services, not by us
             "") ;;
             *) warn "ignoring unknown setting in $CONFIG_FILE: $key" ;;
         esac
@@ -1044,6 +1044,11 @@ RESTART_STEAM=$CFG_RESTART_STEAM
 # Open console mode when you press the Steam button twice on a controller.
 # Read by cachy-console-watch.service.
 STEAM_BUTTON=on
+
+# Only the PRIMARY_CONTROLLER kind of pad may do that, so someone playing at
+# the desk with their own gamepad cannot put console mode on the TV. Off lets
+# any controller's guide button start it. Read by cachy-console-watch.service.
+GUIDE_PRIMARY_ONLY=on
 
 # With two or more games running, mute every game except the one you are
 # looking at. Read by cachy-console-audio.service.

@@ -567,6 +567,46 @@ with _tempfile.TemporaryDirectory() as tmp:
         guide.close()
 
 print()
+print("only the primary controller starts console mode:")
+check("by default only the primary controller's kind counts",
+      pw.trigger_families({"PRIMARY_CONTROLLER": "steam"}), {"steam"})
+check("GUIDE_PRIMARY_ONLY=off lets any pad do it",
+      pw.trigger_families({"PRIMARY_CONTROLLER": "steam",
+                           "GUIDE_PRIMARY_ONLY": "off"}), None)
+check("with no primary controller picked, any pad does",
+      (pw.trigger_families({}), pw.trigger_families({"PRIMARY_CONTROLLER": "off"})),
+      (None, None))
+with _tempfile.TemporaryDirectory() as tmp:
+    fake_pad(tmp, "event0", "045e", cap=btn_mode_cap,
+             events=evdev_press() + evdev_press())
+    guide = pw.GuideButtons(
+        evdev_root=os.path.join(tmp, "input"),
+        hidraw_root=os.path.join(tmp, "hidraw"),
+        sys_input=os.path.join(tmp, "sys-input"),
+        sys_hidraw=os.path.join(tmp, "sys-hidraw"),
+        families={"steam"})
+    try:
+        guide.double_pressed(1.0)
+        check("an Xbox pad at the desk does not count toward a double press",
+              guide._presses.times, [])
+    finally:
+        guide.close()
+with _tempfile.TemporaryDirectory() as tmp:
+    fake_pad(tmp, "event0", "045e", cap=btn_mode_cap, events=evdev_press())
+    guide = pw.GuideButtons(
+        evdev_root=os.path.join(tmp, "input"),
+        hidraw_root=os.path.join(tmp, "hidraw"),
+        sys_input=os.path.join(tmp, "sys-input"),
+        sys_hidraw=os.path.join(tmp, "sys-hidraw"),
+        families={"xbox"})
+    try:
+        guide.double_pressed(1.0)
+        check("while the primary kind still does",
+              len(guide._presses.times), 1)
+    finally:
+        guide.close()
+
+print()
 print("console mode runs in a unit of its own:")
 _rt = _tempfile.mkdtemp()
 _saved = os.environ.get("XDG_RUNTIME_DIR")
