@@ -78,6 +78,21 @@ check("focus is given back to the window that had it",
       "workspace.activeWindow = w" in pr.RESTORE_JS, True)
 
 print()
+print("hands off the keyboard:")
+SOURCE = open(TARGET).read()
+check("the prompt is never made the active window",
+      "workspace.activeWindow = win" in pr.PLACE_JS, False)
+check("if KWin activated it on opening, focus goes straight back",
+      "workspace.activeWindow === win && P.prev" in pr.PLACE_JS, True)
+check("on closing, focus is only moved if the prompt somehow holds it",
+      "a.pid === P.pid" in pr.RESTORE_JS, True)
+check("no keyboard key answers it, so Enter at the desk cannot close games",
+      ("key-press-event" in SOURCE, "KEY_Return" in SOURCE), (False, False))
+check("and GTK is asked not to take focus",
+      ("set_accept_focus(False)" in SOURCE, "set_focus_on_map(False)" in SOURCE),
+      (True, True))
+
+print()
 print("A and B from a plain gamepad:")
 
 
@@ -106,6 +121,26 @@ with tempfile.TemporaryDirectory() as tmp:
             fh.write(cap + "\n")
     check("gamepads are found by BTN_SOUTH, keyboards are not",
           pr.gamepad_nodes(tmp, "/dev/input"), ["/dev/input/event0"])
+
+with tempfile.TemporaryDirectory() as tmp:
+    south = f"{1 << (pr.BTN_SOUTH - 256):x} 0 0 0 0"
+    for name, vendor in (("event3", "28de"),     # Steam's virtual pad
+                         ("event4", "045e"),     # an Xbox pad at the desk
+                         ("event5", "054c")):    # a DualSense
+        d = os.path.join(tmp, name, "device")
+        os.makedirs(os.path.join(d, "capabilities"))
+        os.makedirs(os.path.join(d, "id"))
+        with open(os.path.join(d, "capabilities", "key"), "w") as fh:
+            fh.write(south + "\n")
+        with open(os.path.join(d, "id", "vendor"), "w") as fh:
+            fh.write(vendor + "\n")
+    check("a Steam Controller prompt hears Steam's virtual pad, not the desk's "
+          "Xbox pad", pr.pads_for("steam", tmp, "/dev/input"), ["/dev/input/event3"])
+    check("a PlayStation prompt hears the DualSense and Steam's pad",
+          pr.pads_for("playstation", tmp, "/dev/input"),
+          ["/dev/input/event3", "/dev/input/event5"])
+    check("an unknown family still hears every pad rather than none",
+          pr.pads_for("nonsense", tmp, "/dev/input") != [], True)
 
 print()
 print("wording:")

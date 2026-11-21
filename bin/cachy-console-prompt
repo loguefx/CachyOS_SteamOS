@@ -21,10 +21,14 @@ controller's buttons only: the mouse pointer is never moved, so whoever is at
 the desk keeps theirs, and keyboard focus goes back to their window as soon
 as the prompt closes.
 
-The A and B buttons arrive two ways. With the window focused, Steam drives its
-own controllers with the desktop layout, which types Return for A and Escape
-for B. A pad Steam is not handling shows up as a plain evdev gamepad, read here
-directly as BTN_SOUTH / BTN_EAST.
+The window never takes keyboard focus, so someone typing at the desk keeps
+typing into their own window, and their Enter or Escape cannot answer it. A and
+B are read straight from the controllers instead, as BTN_SOUTH / BTN_EAST on
+their evdev nodes. This only ever shows while a game is running, and then Steam
+presents every controller it drives -- the Steam Controller included -- as its
+own virtual gamepad, which udev lets the logged-in user read. Only the family
+of controller that pressed the guide button (and Steam's virtual pad) is
+listened to, so a desk player's own gamepad cannot answer it either.
 
   ask      -> closing    A
   ask      -> (exit)     B, or nobody answers
@@ -208,10 +212,14 @@ if (!win) {
     // inside it by the window itself.
     win.frameGeometry = {x: target.x, y: target.y,
                          width: target.width, height: target.height};
-    // Keyboard focus, because that is how a Steam-driven controller's A and B
-    // arrive (Return and Escape). The pointer is left alone: someone may be
-    // using the mouse at the desk. Focus goes back when this closes.
-    workspace.activeWindow = win;
+    // No keyboard focus: A and B are read from the controllers, and the desk's
+    // keyboard stays with whoever is using it. KWin may have activated the
+    // window when it opened; if so, focus goes straight back.
+    if (workspace.activeWindow === win && P.prev) {
+        workspace.windowList().forEach(function (w) {
+            if (String(w.internalId) === P.prev) workspace.activeWindow = w;
+        });
+    }
     report({ok: true, found: found});
 }
 """
@@ -226,8 +234,8 @@ workspace.windowList().forEach(function (w) {
 });
 """
 
-# Which window had focus before the prompt took it, so it can be given back:
-# the person at the desk keeps typing into their own game afterwards.
+# Which window had focus before the prompt opened, so it can be given back if
+# KWin activated the prompt on the way in.
 REMEMBER_JS = """
 var P = %(params)s;
 var a = workspace.activeWindow;
@@ -235,11 +243,16 @@ callDBus(P.bus, P.path, P.iface, "Placed",
          JSON.stringify({prev: a && a.pid !== P.pid ? String(a.internalId) : ""}));
 """
 
+# Only if the prompt somehow ended up with focus: if the person at the desk has
+# moved on to another window since, that is where they are and focus stays.
 RESTORE_JS = """
-var prev = %(prev)s;
-workspace.windowList().forEach(function (w) {
-    if (String(w.internalId) === prev) workspace.activeWindow = w;
-});
+var P = %(params)s;
+var a = workspace.activeWindow;
+if (P.prev && a && a.pid === P.pid) {
+    workspace.windowList().forEach(function (w) {
+        if (String(w.internalId) === P.prev) workspace.activeWindow = w;
+    });
+}
 """
 
 
@@ -300,6 +313,38 @@ def keycap_has_bit(text, bit):
             return False
     idx, off = divmod(bit, 64)
     return idx < len(words) and bool(words[-(idx + 1)] & (1 << off))
+
+
+# USB vendor ids per family, as sysfs prints them. Steam's virtual pad is
+# Valve's whatever is behind it, so it is always listened to.
+FAMILY_VENDORS = {
+    "steam": {"28de"},
+    "xbox": {"045e", "2dc8"},
+    "playstation": {"054c"},
+    "switch": {"057e"},
+}
+STEAM_VENDOR = "28de"
+
+
+def node_vendor(sys_input, name):
+    try:
+        with open(os.path.join(sys_input, name, "device", "id", "vendor")) as fh:
+            return fh.read().strip().lower().zfill(4)
+    except OSError:
+        return ""
+
+
+def pads_for(family, sys_input="/sys/class/input", dev_root="/dev/input"):
+    """The gamepads to listen to: the family that asked, and Steam's own.
+
+    Falls back to every gamepad when none match, so an unrecognised controller
+    in hand can still answer rather than the prompt timing out.
+    """
+    every = gamepad_nodes(sys_input, dev_root)
+    wanted = FAMILY_VENDORS.get(family, set()) | {STEAM_VENDOR}
+    mine = [n for n in every
+            if node_vendor(sys_input, os.path.basename(n)) in wanted]
+    return mine or every
 
 
 def gamepad_nodes(sys_input="/sys/class/input", dev_root="/dev/input"):
@@ -586,6 +631,9 @@ def main():
     if visual is not None:
         win.set_visual(visual)
     win.set_decorated(False)
+    # Never the desk's keyboard: see the module docstring.
+    win.set_accept_focus(False)
+    win.set_focus_on_map(False)
     win.set_keep_above(True)
     win.set_skip_taskbar_hint(True)
     win.set_icon_name("input-gaming")
@@ -687,8 +735,6 @@ def main():
         for b in (btn_a, btn_b, btn_ok):
             b.set_visible(b in choices)
         buttons.set_visible(bool(choices))
-        if choices:
-            choices[0].grab_focus()
 
     def arm_timeout(seconds):
         if state["timer"]:
@@ -699,7 +745,8 @@ def main():
     def bus_params():
         return json.dumps({"pid": os.getpid(), "caption": caption,
                            "output": args.output, "bus": BUS_NAME,
-                           "path": OBJ_PATH, "iface": IFACE})
+                           "path": OBJ_PATH, "iface": IFACE,
+                           "prev": state["prev"]})
 
     def place():
         if state["placed"]:
@@ -738,7 +785,7 @@ def main():
     # -- A and B ------------------------------------------------------------
     pad_fds = []
 
-    def on_pad(fd, _cond):
+    def on_pad(fd, _cond, path):
         try:
             raw = os.read(fd, EVENT_SIZE * 16)
         except BlockingIOError:
@@ -746,16 +793,21 @@ def main():
         except OSError:
             return False
         for press in face_presses(raw, pad):
+            log(f"{press.upper()} from {path}")
             press_a() if press == "a" else press_b()
         return True
 
-    for path in gamepad_nodes():
+    listening = pads_for(family)
+    for path in listening:
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
         except OSError:
             continue
         pad_fds.append(fd)
-        GLib.io_add_watch(fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN, on_pad)
+        GLib.io_add_watch(fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN, on_pad, path)
+    if not pad_fds:
+        log("no controller could be opened; the prompt can only time out "
+            "or be clicked.")
 
     def press_a():
         phase = state["phase"]
@@ -775,18 +827,6 @@ def main():
     btn_a.connect("clicked", lambda _b: press_a())
     btn_b.connect("clicked", lambda _b: press_b())
     btn_ok.connect("clicked", lambda _b: press_a())
-
-    def on_key(_w, event):
-        # Steam's desktop layout: A types Return, B types Escape.
-        if event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_ISO_Enter):
-            press_a()
-            return True
-        if event.keyval in (Gdk.KEY_Escape, Gdk.KEY_BackSpace):
-            press_b()
-            return True
-        return False
-
-    win.connect("key-press-event", on_key)
 
     # -- closing, then console mode -----------------------------------------
     def remaining():
@@ -881,16 +921,14 @@ def main():
     try:
         loop.run()
     finally:
+        if state["prev"]:
+            kwin.run(RESTORE_JS % {"params": bus_params()})
         win.destroy()
         for fd in pad_fds:
             try:
                 os.close(fd)
             except OSError:
                 pass
-        # Hand focus back to whoever had it. A game that was just closed is
-        # gone, and then there is nothing to give it back to.
-        if state["prev"]:
-            kwin.run(RESTORE_JS % {"prev": json.dumps(state["prev"])})
     return 0
 
 

@@ -209,6 +209,29 @@ def parent_of(pid):
     return None
 
 
+def is_gamescope(pid):
+    try:
+        return os.path.basename(os.readlink(f"/proc/{pid}/exe")).startswith("gamescope")
+    except OSError:
+        return False
+
+
+def in_session(pid, limit=40):
+    """Whether a process runs inside a gamescope session: console mode's Steam,
+    its games and anything started from its library all descend from it."""
+    seen = 0
+    while pid and pid > 1 and seen < limit:
+        if is_gamescope(pid):
+            return True
+        pid = parent_of(pid)
+        seen += 1
+    return False
+
+
+def default_sink():
+    return (run(["pactl", "get-default-sink"]) or "").strip() or None
+
+
 def process_names(pid):
     """The command name and executable of a pid.
 
@@ -415,6 +438,7 @@ class AudioFocus:
         self.muted_appids = set()      # games we are holding muted
         self.appid_cache = {}          # pid -> appid, so we re-read /proc rarely
         self.exempt_cache = {}         # pid -> never-mute, for the same reason
+        self.session_cache = {}        # pid -> runs inside the gamescope session
         self.never_names, self.never_appids = never_mute()
         self.last_focus = None
         self.last_report = None
@@ -488,7 +512,7 @@ class AudioFocus:
 
     def prune(self, *stream_groups):
         live = {s.pid for group in stream_groups for s in group}
-        for cache in (self.appid_cache, self.exempt_cache):
+        for cache in (self.appid_cache, self.exempt_cache, self.session_cache):
             for pid in [p for p in cache if p not in live]:
                 del cache[pid]
 
@@ -562,6 +586,37 @@ class AudioFocus:
                         log(f"could not move {stream.name!r} to {target}")
                         self.complained.add((kind, target))
 
+    def in_session(self, pid):
+        if pid not in self.session_cache:
+            self.session_cache[pid] = in_session(pid)
+        return self.session_cache[pid]
+
+    def keep_off_the_desk(self, streams):
+        """Session sound that fell onto the desk's default goes to the TV.
+
+        Console mode leaves the desktop's default output to whoever is at the
+        desk, and points Steam at the television with PULSE_SINK instead. A
+        program in the session that ignores PULSE_SINK opens its stream on the
+        default -- the desk's speakers -- and that is moved. A stream on any
+        other device was put there on purpose (a headset picked in Big Picture)
+        and stays. Never-muted streams are pin_exempt's, which is stricter.
+        """
+        mine = [s for s in streams
+                if self.in_session(s.pid)
+                and not self.exempt(s, self.appid_for(s.pid))]
+        if not mine:
+            return
+        sink, _ = self.console_devices()
+        desk = default_sink()
+        if not sink or not desk or desk == sink:
+            return
+        names = device_names()
+        for stream in mine:
+            if names.get(("sinks", stream.device)) != desk:
+                continue
+            if move_stream("sinks", stream.index, sink, self.dry_run):
+                log(f"moved {stream.name!r} off the desk's output to {sink}")
+
     def poll(self):
         """One pass. Returns True if a session is active, for pacing."""
         streams = sink_inputs()
@@ -575,6 +630,7 @@ class AudioFocus:
         # so Discord at your desk is left wherever you put it.
         if displays:
             self.pin_exempt(streams, capture)
+            self.keep_off_the_desk(streams)
         by_app = self.games(streams)
 
         # One game, or none, cannot drown anything out.

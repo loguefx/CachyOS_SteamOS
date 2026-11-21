@@ -45,7 +45,7 @@ class World:
 
     def __init__(self, streams=(), owners=None, focus=None, session=True,
                  never=(), capture=(), devices=(None, None), names=None,
-                 pin=True):
+                 pin=True, desk_default=None, session_pids=()):
         self.streams = list(streams)
         self.owners = dict(owners or {})     # pid -> appid (None = not a game)
         self.focus = focus
@@ -65,6 +65,8 @@ class World:
         # what these tests are about: they are about what gets moved where.
         pa.AudioFocus.console_devices = lambda _self: self.devices
 
+        pa.default_sink = lambda: desk_default
+        pa.in_session = lambda pid: pid in session_pids
         pa.sink_inputs = lambda: list(self.streams)
         pa.steam_appid = lambda pid, limit=24: self.owners.get(pid)
         pa.gamescope_displays = lambda: [":2"] if self.session else []
@@ -377,6 +379,37 @@ check("pinning happens even though nothing is muted", world.moves,
       [("sinks", 10, TV)])
 check("and still nothing is muted", world.mute_calls, [])
 
+print()
+print("the desk keeps its own output:")
+# Console mode no longer makes the TV the desktop's default. Something in the
+# session that ignores PULSE_SINK lands on the desk's speakers; that is moved.
+world, focus = voice_world(
+    streams=[stream(1, 100, "GameA", device=2), stream(2, 900, "Firefox", device=2),
+             stream(3, 101, "Steam", device=1)],
+    capture=[], owners={100: GAME_A, 900: None, 101: None},
+    desk_default=DESK, session_pids={100, 101})
+focus.poll()
+check("a session game on the desk's default is moved to the TV, and only it",
+      world.moves, [("sinks", 1, TV)])
+world.moves.clear()
+focus.poll()
+check("and the next poll is quiet", world.moves, [])
+
+HEADSET = {("sinks", 3): "alsa_output.usb-HyperX.analog-stereo"}
+world, focus = voice_world(
+    streams=[stream(1, 100, "GameA", device=3)], capture=[],
+    owners={100: GAME_A}, names={**BOTH, **HEADSET},
+    desk_default=DESK, session_pids={100})
+focus.poll()
+check("a session stream on a device someone picked is left there", world.moves, [])
+
+world, focus = voice_world(
+    streams=[stream(1, 100, "GameA", device=2)], capture=[],
+    owners={100: GAME_A}, desk_default=DESK, session_pids={100}, session=False)
+focus.poll()
+check("with no session running nothing is moved", world.moves, [])
+
+print()
 world, focus = voice_world(pin=False)
 focus.poll()
 check("AUDIO_PIN_VOICE=off moves nothing", world.moves, [])

@@ -516,9 +516,13 @@ same way.
 **A game already open on the desktop.** Console mode restarts Steam, which
 would take the game down with it, so a double press while a game is running
 never starts it unasked. Instead a console-style prompt covers the console
-display — *Close all games?* — answered with the controller alone. The mouse
-pointer is never moved and keyboard focus goes back to the window that had it,
-so someone playing at the desk is not disturbed.
+display — *Close all games?* — answered with the controller alone. It never
+takes keyboard focus and never moves the mouse pointer, so someone at the desk
+keeps typing into their own window, and their Enter or Escape cannot answer it.
+A and B are read straight from the controller (while a game runs, Steam
+presents any controller it drives as its own virtual pad), and only from the
+kind of controller that pressed the guide button, so a desk player's own
+gamepad cannot answer it either.
 Confirm (A on Steam and Xbox pads, ✕ on PlayStation, A on the right of a Switch
 pad) closes every game, politely first and then the way Steam's Stop button
 does, then shows *Starting up Steam Big Picture…* and opens console mode. Back
@@ -555,10 +559,14 @@ rule (`52-cachy-console-hdmi-outputs.conf`) names each one after its screen's
 ELD (Optoma UHD, Odyssey G93SC, …) in stereo. WirePlumber only reads rules when
 it starts, so it is restarted the first time a set of screens is seen. Settings
 save an `AUDIO_DEVICE` (the projector, a headset, or another HDMI monitor);
-console mode makes that the default, moves already-playing streams onto it,
-and points Steam at it with `PULSE_SINK`, and the others stay in Steam's list
-to pick from. Headset and other USB devices stay in the list too. The
-desktop HDMI device comes back when you leave. A card with no pro-audio
+console mode points Steam at it with `PULSE_SINK`, which its games inherit,
+and moves the session's own streams onto it. The desktop's default output is
+left alone, so someone at the desk keeps their sound where it was: their game,
+browser and Discord are never moved to the television. Anything in the session
+that ignores `PULSE_SINK` and opens on the desk's default is moved to the TV by
+the audio service. The other screens stay in Steam's list to pick from, and
+headset and other USB devices stay in the list too. The desktop HDMI profile
+comes back when you leave. A card with no pro-audio
 profile falls back to switching its one stereo profile to the saved screen.
 
 **Per-game audio.** gamescope publishes which app it has focused; PipeWire can

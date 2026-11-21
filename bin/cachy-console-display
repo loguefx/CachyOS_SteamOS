@@ -976,31 +976,72 @@ def _sink_inputs():
     return _pactl_json("sink-inputs")
 
 
-def _move_sink_inputs(name):
-    """Existing streams stay on the old sink after a default change; move them."""
+def _parent_of(pid, proc_root="/proc"):
+    try:
+        with open(f"{proc_root}/{pid}/stat") as fh:
+            stat = fh.read()
+        return int(stat[stat.rindex(")") + 2:].split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _is_gamescope(pid, proc_root="/proc"):
+    try:
+        exe = os.readlink(f"{proc_root}/{pid}/exe")
+    except OSError:
+        return False
+    return os.path.basename(exe).startswith("gamescope")
+
+
+def in_session(pid, proc_root="/proc", limit=40):
+    """Whether this process runs inside a gamescope session.
+
+    Everything console mode starts -- its Steam, the games, Discord from the
+    library -- is a descendant of gamescope. Anything at the desk is not.
+    """
+    seen = 0
+    while pid and pid > 1 and seen < limit:
+        if _is_gamescope(pid, proc_root):
+            return True
+        pid = _parent_of(pid, proc_root)
+        seen += 1
+    return False
+
+
+def _move_session_streams(name):
+    """Put the session's own streams on `name`, and only those.
+
+    This used to make `name` the desktop's default output and move every stream
+    there, which took the sound of whoever was using the desk -- their game,
+    their browser, their Discord -- over to the television along with it.
+    Steam is told where to play with PULSE_SINK, and its games inherit that, so
+    the default output stays the desk's.
+    """
     if not name:
         return
     for inp in _sink_inputs():
         idx = inp.get("index")
-        if idx is None:
+        try:
+            pid = int((inp.get("properties") or {}).get("application.process.id"))
+        except (TypeError, ValueError):
+            continue
+        if idx is None or not in_session(pid):
             continue
         _pactl("move-sink-input", str(idx), name)
 
 
-def _set_configured_sink(name):
-    if not name:
-        return
-    payload = '{"name":"%s"}' % name.replace("\\", "").replace('"', "")
-    _pw_run(["pw-metadata", "-n", "settings", "0",
-             "default.configured.audio.sink", payload])
+def _note_console_sink(name):
+    state = _load_audio_state()
+    if state is not None and state.get("console_sink") != name:
+        state["console_sink"] = name
+        _save_audio_state(state)
 
 
 def _apply_named_sink(name, eld, rename=False):
     if not name:
         return None
-    _pactl("set-default-sink", name)
-    _move_sink_inputs(name)
-    _set_configured_sink(name)
+    _move_session_streams(name)
+    _note_console_sink(name)
     if rename and eld:
         _label_sink(name, eld)
     print(f"SINK {name}")
@@ -1009,16 +1050,19 @@ def _apply_named_sink(name, eld, rename=False):
 
 
 def _apply_console_sink(target):
-    """Make the saved display the default HDMI device and name it for Steam."""
+    """Play the session on the saved display and name its sink for Steam.
+
+    The desktop's default output is not changed: that belongs to whoever is at
+    the desk.
+    """
     for _ in range(10):
         for sink in _sinks():
             if not _sink_matches(sink, target):
                 continue
             name = sink.get("name") or ""
             eld = target.get("eld") or "Console display"
-            _pactl("set-default-sink", name)
-            _move_sink_inputs(name)
-            _set_configured_sink(name)
+            _move_session_streams(name)
+            _note_console_sink(name)
             _label_sink(name, eld)
             print(f"SINK {name}")
             print(f"HDMI audio -> {eld} ({name})")
@@ -1516,7 +1560,7 @@ def _route_sink(args, target):
     name = target.get("sink")
     eld = target.get("eld") or name
     if args.dry_run:
-        print(f"would set default sink to {name} ({eld})")
+        print(f"would play console mode through {name} ({eld})")
         return 0
     _remember_restore_state(target)
     if _apply_named_sink(name, eld, rename=False) is None:
@@ -1667,6 +1711,17 @@ def cmd_audio_route(args):
     return _route_hdmi(args, target)
 
 
+def _console_sink(state, name):
+    """Whether `name` is a sink console mode was playing on: the one it routed
+    to, or any output of the card it switched."""
+    if not name:
+        return False
+    if name == state.get("console_sink"):
+        return True
+    card = (state.get("card") or "").replace("alsa_card.", "alsa_output.", 1)
+    return bool(card) and name.startswith(card + ".")
+
+
 def cmd_audio_restore(args):
     state = _load_audio_state()
     if not state:
@@ -1677,12 +1732,19 @@ def cmd_audio_restore(args):
     if args.dry_run:
         print(f"would restore {state.get('card')} to {state.get('previous_profile')}")
         return 0
+    # Console mode no longer moves the desktop's default, so this is only for
+    # when something else did -- Steam's own output picker sets it -- or for a
+    # state file left by an older version that did. A default the person at
+    # the desk chose during the session is theirs and stays. Read before the
+    # profile changes, which takes the TV's sinks away.
+    sink = state.get("previous_sink")
+    now = _default_sink()
+    put_back = bool(sink) and now != sink and _console_sink(state, now)
     card = state.get("card")
     profile = state.get("previous_profile")
     if card and profile:
         _pactl("set-card-profile", card, profile)
-    sink = state.get("previous_sink")
-    if sink:
+    if put_back:
         _pactl("set-default-sink", sink)
     _drop_audio_state()
     _drop_wp_rule()
