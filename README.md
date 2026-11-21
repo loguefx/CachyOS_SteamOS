@@ -571,7 +571,9 @@ every stream in it there: one that ignores `PULSE_SINK`, or one moved by Big
 Picture's own output picker, is put back. Big Picture's picker also sets the
 desktop-wide default; if it makes the TV the default, the desk gets its own
 output back. A new output saved in Cachy Console mid-session takes effect at
-once. The desktop HDMI profile comes back when you leave. A card with no pro-audio
+once. When you leave, the desktop gets back the HDMI profile and the output
+it had before console mode started, whatever Big Picture's picker changed it to
+in between. A card with no pro-audio
 profile falls back to switching its one stereo profile to the saved screen.
 
 **Per-game audio.** gamescope publishes which app it has focused; PipeWire can
