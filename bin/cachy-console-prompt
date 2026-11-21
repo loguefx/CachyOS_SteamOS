@@ -409,6 +409,28 @@ def find_console():
     return shutil.which("cachy-console")
 
 
+def in_own_scope(argv):
+    """argv wrapped to run in a transient systemd scope of its own.
+
+    Started plainly, console mode -- gamescope, Steam and every game in it --
+    lands in the cgroup of whichever service started it: this one. Its memory
+    then reads as the watcher's (a 27.7G "peak" that was really a game), and
+    systemd-oomd, which watches app.slice, would take the watcher down along
+    with the session it picked. In a scope of its own the session is its own
+    unit. `systemd-run --scope` execs the command, so the PID is still the
+    session's. Without systemd-run or a reachable user manager it runs plainly,
+    as before.
+    """
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+    if not shutil.which("systemd-run") or not runtime or \
+            not os.path.exists(os.path.join(runtime, "systemd", "private")):
+        return list(argv)
+    unit = f"cachy-console-session-{os.getpid()}-{int(time.time())}"
+    return ["systemd-run", "--user", "--quiet", "--collect", "--scope",
+            f"--unit={unit}", "--description=Cachy Console session",
+            "--", *argv]
+
+
 def start_console(log_path=None):
     """Run `cachy-console`, which restarts Steam inside gamescope -- the same
     thing the watcher does for a double press with no game open."""
@@ -420,7 +442,8 @@ def start_console(log_path=None):
         os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "cachy-console-session.log")
     try:
         with open(log_path, "w") as out:
-            subprocess.Popen([console], stdin=subprocess.DEVNULL, stdout=out,
+            subprocess.Popen(in_own_scope([console]), stdin=subprocess.DEVNULL,
+                             stdout=out,
                              stderr=subprocess.STDOUT, start_new_session=True)
     except OSError as exc:
         log(f"could not run {console}: {exc}")

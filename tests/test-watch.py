@@ -567,6 +567,28 @@ with _tempfile.TemporaryDirectory() as tmp:
         guide.close()
 
 print()
+print("console mode runs in a unit of its own:")
+_rt = _tempfile.mkdtemp()
+_saved = os.environ.get("XDG_RUNTIME_DIR")
+os.environ["XDG_RUNTIME_DIR"] = _rt
+check("without a reachable user manager it runs plainly, as before",
+      pw.in_own_scope(["cachy-console"]), ["cachy-console"])
+os.makedirs(os.path.join(_rt, "systemd"))
+open(os.path.join(_rt, "systemd", "private"), "w").close()
+_argv = pw.in_own_scope(["cachy-console", "--display", "HDMI-A-1"])
+if pw.shutil.which("systemd-run"):
+    check("with one, it is a transient scope that execs the session",
+          (_argv[:5], _argv[-4:]),
+          (["systemd-run", "--user", "--quiet", "--collect", "--scope"],
+           ["--", "cachy-console", "--display", "HDMI-A-1"]))
+    check("named so it can be found",
+          any(a.startswith("--unit=cachy-console-session-") for a in _argv), True)
+if _saved is None:
+    del os.environ["XDG_RUNTIME_DIR"]
+else:
+    os.environ["XDG_RUNTIME_DIR"] = _saved
+
+print()
 print("only a real gamescope counts as a session:")
 _fake_dir = _tempfile.mkdtemp()
 _fake = os.path.join(_fake_dir, "gamescope")
