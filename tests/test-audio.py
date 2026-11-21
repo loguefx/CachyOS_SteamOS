@@ -417,9 +417,16 @@ world, focus = voice_world(
     streams=[stream(3, 101, "Steam", device=1), stream(2, 900, "Firefox", device=2)],
     capture=[], owners={101: None, 900: None},
     desk_default=DESK, session_pids={101})
+focus.default_every = 0          # read every poll here; live it is every 2 s
 focus.poll()
 check("the desk's output is remembered when the session starts",
       focus.desk_default, DESK)
+world.default = "alsa_output.desk-speakers"
+focus.poll()
+check("and follows the desk if they pick another output mid-session",
+      focus.desk_default, "alsa_output.desk-speakers")
+world.default = DESK
+focus.poll()
 world.default = TV
 world.moves.clear()
 focus.poll()
@@ -433,6 +440,7 @@ focus.poll()
 check("a default moved anywhere else is not second-guessed", world.default_sets, [])
 
 world, focus = voice_world(streams=[], capture=[], desk_default=TV, session_pids=set())
+focus.default_every = 0
 focus.poll()
 focus.poll()
 check("a default already on the TV when watching began is not taken for the desk's",
@@ -462,6 +470,15 @@ with _tf.TemporaryDirectory() as _d:
     os.utime(_fresh.CONFIG_PATH, ns=(1, 1))
     _f.console_devices()
     check("but is at once when Cachy Console saves a new one", len(_asked), 4)
+
+    _calls = []
+    _fresh.device_names = lambda: _calls.append(1) or {("sinks", 1): "tv"}
+    _f.device_name("sinks", 1)
+    _f.device_name("sinks", 1)
+    check("device names are cached between polls", len(_calls), 1)
+    _f.device_name("sinks", 9)
+    check("and re-read when a stream sits on a device not seen before",
+          len(_calls), 2)
 
 print()
 world, focus = voice_world(pin=False)

@@ -252,6 +252,12 @@ with tempfile.TemporaryDirectory() as proc:
           fresh_mod.in_session(23, proc_root=proc), True)
     check("Firefox at the desk is not",
           fresh_mod.in_session(30, proc_root=proc), False)
+    fake(50, 1, "/usr/bin/some-launcher")
+    with open(os.path.join(proc, "50", "environ"), "wb") as fh:
+        fh.write(b"HOME=/h\0GAMESCOPE_WAYLAND_DISPLAY=gamescope-0\0")
+    check("a session process re-parented away from gamescope is still found "
+          "by the environment gamescope gave it",
+          fresh_mod.in_session(50, proc_root=proc), True)
 
 print()
 print("sink matching:")

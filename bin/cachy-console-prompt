@@ -340,13 +340,17 @@ def pads_for(family, sys_input="/sys/class/input", dev_root="/dev/input"):
     """The gamepads to listen to: the family that asked, and Steam's own.
 
     Falls back to every gamepad when none match, so an unrecognised controller
-    in hand can still answer rather than the prompt timing out.
+    in hand can still answer rather than the prompt timing out -- except for a
+    Steam Controller, which is always heard through its own reports, so the
+    fallback would only let a gamepad at the desk answer for it.
     """
     every = gamepad_nodes(sys_input, dev_root)
     wanted = FAMILY_VENDORS.get(family, set()) | {STEAM_VENDOR}
     mine = [n for n in every
             if node_vendor(sys_input, os.path.basename(n)) in wanted]
-    return mine or every
+    if mine or family == "steam":
+        return mine
+    return every
 
 
 # A and B straight from a Steam Controller's own reports, for a game Steam is

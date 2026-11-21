@@ -218,7 +218,13 @@ def is_gamescope(pid):
 
 def in_session(pid, limit=40):
     """Whether a process runs inside a gamescope session: console mode's Steam,
-    its games and anything started from its library all descend from it."""
+    its games and anything started from its library all descend from it.
+
+    gamescope also puts GAMESCOPE_WAYLAND_DISPLAY in its children's environment,
+    which survives a process being re-parented (a launcher that forks and
+    exits), so that is checked first."""
+    if read_environ(pid).get("GAMESCOPE_WAYLAND_DISPLAY"):
+        return True
     seen = 0
     while pid and pid > 1 and seen < limit:
         if is_gamescope(pid):
@@ -447,6 +453,10 @@ class AudioFocus:
         self.session_cache = {}        # pid -> runs inside the gamescope session
         self.desk_default = None       # the desk's output when the session began
         self.config_stamp = None       # config mtime the targets were read at
+        self.default_checked = -1e9    # when the default output was last read
+        self.default_every = 2.0       # ...it is a subprocess, so not every poll
+        self.names = {}                # (kind, index) -> device name, cached
+        self.names_read = -1e9
         self.never_names, self.never_appids = never_mute()
         self.last_focus = None
         self.last_report = None
@@ -580,15 +590,12 @@ class AudioFocus:
             return
 
         sink, source = self.console_devices()
-        names = None
         for kind, target, group in (("sinks", sink, play),
                                     ("sources", source, talk)):
             if not target or not group:
                 continue
-            if names is None:
-                names = device_names()
             for stream in group:
-                current = names.get((kind, stream.device))
+                current = self.device_name(kind, stream.device)
                 if current == target:
                     continue
                 if move_stream(kind, stream.index, target, self.dry_run):
@@ -607,6 +614,16 @@ class AudioFocus:
             self.session_cache[pid] = in_session(pid)
         return self.session_cache[pid]
 
+    def device_name(self, kind, index):
+        """A device's name from its index. Cached, because listing devices is
+        two pactl runs and the session polls twice a second; re-read when an
+        index is new (a device appeared) and every ten seconds regardless."""
+        clock = time.monotonic()
+        if (kind, index) not in self.names or clock - self.names_read > 10.0:
+            self.names = device_names()
+            self.names_read = clock
+        return self.names.get((kind, index))
+
     def keep_desk_default(self, streams):
         """Put the desk's default output back if the session moved it to the TV.
 
@@ -617,15 +634,20 @@ class AudioFocus:
         console mode's own output. The session's streams are pinned there first,
         so they stay on the TV rather than following the default back.
         """
+        clock = time.monotonic()
+        if clock - self.default_checked < self.default_every:
+            return
+        self.default_checked = clock
         sink, _ = self.console_devices()
         now = default_sink()
-        if self.desk_default is None:
-            # Remembered once per session. A default already on the TV (the
-            # service restarted mid-session) is not the desk's.
-            if now and now != sink:
-                self.desk_default = now
+        if now and now != sink:
+            # Followed, not remembered once: the person at the desk may pick
+            # another output during the session, and that is what they get back.
+            # A default already on the TV (the service restarted mid-session) is
+            # never taken for the desk's.
+            self.desk_default = now
             return
-        if not sink or now != sink or self.desk_default == sink:
+        if not sink or not now or not self.desk_default or self.desk_default == sink:
             return
         for stream in streams:
             if self.in_session(stream.pid):
@@ -654,9 +676,8 @@ class AudioFocus:
         sink, _ = self.console_devices()
         if not sink:
             return
-        names = device_names()
         for stream in mine:
-            if names.get(("sinks", stream.device)) == sink:
+            if self.device_name("sinks", stream.device) == sink:
                 continue
             if move_stream("sinks", stream.index, sink, self.dry_run):
                 log(f"moved {stream.name!r} to console mode's output, {sink}")

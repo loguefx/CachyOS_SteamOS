@@ -143,6 +143,17 @@ with tempfile.TemporaryDirectory() as tmp:
           ["/dev/input/event3", "/dev/input/event5"])
     check("an unknown family still hears every pad rather than none",
           pr.pads_for("nonsense", tmp, "/dev/input") != [], True)
+with tempfile.TemporaryDirectory() as tmp:
+    d = os.path.join(tmp, "event4", "device")
+    os.makedirs(os.path.join(d, "capabilities"))
+    os.makedirs(os.path.join(d, "id"))
+    with open(os.path.join(d, "capabilities", "key"), "w") as fh:
+        fh.write(f"{1 << (pr.BTN_SOUTH - 256):x} 0 0 0 0\n")
+    with open(os.path.join(d, "id", "vendor"), "w") as fh:
+        fh.write("045e\n")
+    check("with no Steam pad around, a Steam Controller prompt does not fall back "
+          "to the desk's Xbox pad (the controller is heard through hidraw)",
+          pr.pads_for("steam", tmp, "/dev/input"), [])
 
 print()
 print("A and B from the Steam Controller's own reports:")

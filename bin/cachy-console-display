@@ -999,6 +999,13 @@ def in_session(pid, proc_root="/proc", limit=40):
     Everything console mode starts -- its Steam, the games, Discord from the
     library -- is a descendant of gamescope. Anything at the desk is not.
     """
+    # gamescope's children carry this, and it survives re-parenting.
+    try:
+        with open(f"{proc_root}/{pid}/environ", "rb") as fh:
+            if b"\0GAMESCOPE_WAYLAND_DISPLAY=" in b"\0" + fh.read():
+                return True
+    except OSError:
+        pass
     seen = 0
     while pid and pid > 1 and seen < limit:
         if _is_gamescope(pid, proc_root):
