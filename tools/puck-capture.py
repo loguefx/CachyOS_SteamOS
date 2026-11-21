@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Find which report bits a Steam Controller (puck) uses for A and B.
+"""Find which report bits a Steam Controller (puck) uses for its buttons.
 
-Reads the controller's hidraw nodes (read-only, alongside Steam) through three
-timed phases: hands off, press A three times, press B three times. A button
-bit is one that is quiet while idle and flips about six times (three presses,
-three releases) in exactly one phase. Prints the result as JSON.
+Reads the controller's hidraw nodes (read-only, alongside Steam) through timed
+phases: hands off, then each button pressed three times. A button bit is one
+that is quiet while idle and flips about six times (three presses, three
+releases) in exactly one phase. Prints the result as JSON.
 
-usage: tools/puck-capture.py [--seconds 6]
+usage: tools/puck-capture.py [--seconds 6] [BUTTON ...]     (default: A B)
+       tools/puck-capture.py Steam     -- press it slowly, a second apart, so
+                                          it is never a double press
 """
 
 import argparse
@@ -69,6 +71,7 @@ def countdown(text, seconds):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seconds", type=float, default=6.0)
+    ap.add_argument("buttons", nargs="*", default=["A", "B"])
     args = ap.parse_args()
     nodes = valve_nodes()
     if not nodes:
@@ -81,27 +84,31 @@ def main():
 
     countdown("HANDS OFF the controller", 4)
     idle = record(fds, 4)
-    countdown("Press A three times, slowly", args.seconds)
-    a = record(fds, args.seconds)
-    countdown("Press B three times, slowly", args.seconds)
-    b = record(fds, args.seconds)
+    phases = {}
+    for name in args.buttons:
+        countdown(f"Press {name} three times, slowly (a second apart)", args.seconds)
+        phases[name] = record(fds, args.seconds)
     for fd in fds:
         os.close(fd)
 
-    def buttons(phase, other):
+    def buttons(name):
+        others = [p for n, p in phases.items() if n != name]
         hits = []
-        for k, n in phase.items():
-            if idle.get(k) or other.get(k):
+        for k, n in phases[name].items():
+            if idle.get(k) or any(o.get(k) for o in others):
                 continue
             if 4 <= n <= 10:
                 hits.append({"node": k[0], "report": f"0x{k[1]:02x}",
                              "byte": k[2], "bit": k[3], "changes": n})
         return sorted(hits, key=lambda h: (h["report"], h["byte"], h["bit"]))
 
-    result = {"A": buttons(a, b), "B": buttons(b, a),
-              "reports_seen": sorted({f"0x{k[1]:02x}" for k in list(idle) + list(a) + list(b)})}
+    seen = set(idle)
+    for p in phases.values():
+        seen |= set(p)
+    result = {name: buttons(name) for name in phases}
+    result["reports_seen"] = sorted({f"0x{k[1]:02x}" for k in seen})
     print("\nRESULT " + json.dumps(result))
-    if len(result["A"]) == 1 and len(result["B"]) == 1:
+    if all(len(result[name]) == 1 for name in phases):
         print("Found one bit for each button.")
     else:
         print("Ambiguous or nothing found; the RESULT line shows every candidate.")

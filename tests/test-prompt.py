@@ -126,9 +126,11 @@ with tempfile.TemporaryDirectory() as tmp:
 
 with tempfile.TemporaryDirectory() as tmp:
     south = f"{1 << (pr.BTN_SOUTH - 256):x} 0 0 0 0"
-    for name, vendor in (("event3", "28de"),     # Steam's virtual pad
-                         ("event4", "045e"),     # an Xbox pad at the desk
-                         ("event5", "054c")):    # a DualSense
+    for name, vendor, product in (
+            ("event3", "28de", "11ff"),     # Steam's virtual pad (maybe the desk's)
+            ("event4", "045e", "0b12"),     # an Xbox pad at the desk
+            ("event5", "054c", "0ce6"),     # a DualSense
+            ("event6", "28de", "1205")):    # a real Valve pad (Steam Deck)
         d = os.path.join(tmp, name, "device")
         os.makedirs(os.path.join(d, "capabilities"))
         os.makedirs(os.path.join(d, "id"))
@@ -136,11 +138,14 @@ with tempfile.TemporaryDirectory() as tmp:
             fh.write(south + "\n")
         with open(os.path.join(d, "id", "vendor"), "w") as fh:
             fh.write(vendor + "\n")
-    check("a Steam Controller prompt hears Steam's virtual pad, not the desk's "
-          "Xbox pad", pr.pads_for("steam", tmp, "/dev/input"), ["/dev/input/event3"])
-    check("a PlayStation prompt hears the DualSense and Steam's pad",
-          pr.pads_for("playstation", tmp, "/dev/input"),
-          ["/dev/input/event3", "/dev/input/event5"])
+        with open(os.path.join(d, "id", "product"), "w") as fh:
+            fh.write(product + "\n")
+    check("a Steam Controller prompt hears real Valve pads only: not Steam's "
+          "virtual pad (the desktop client makes one for a desk controller too), "
+          "not the desk's Xbox pad",
+          pr.pads_for("steam", tmp, "/dev/input"), ["/dev/input/event6"])
+    check("a PlayStation prompt hears the DualSense only",
+          pr.pads_for("playstation", tmp, "/dev/input"), ["/dev/input/event5"])
     check("an unknown family still hears every pad rather than none",
           pr.pads_for("nonsense", tmp, "/dev/input") != [], True)
 with tempfile.TemporaryDirectory() as tmp:

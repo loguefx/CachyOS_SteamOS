@@ -1279,8 +1279,8 @@ status_sharing() {
             say "  close-games popup hears:"
             printf '%s\n' "$pads" | sed 's/^/    /'
         else
-            say "  close-games popup hears no controller right now. That is normal with"
-            say "  no game running: Steam's virtual pad only exists while one is."
+            say "  close-games popup hears no controller right now: is the console"
+            say "  controller switched on?"
         fi
     fi
     return "$n"
