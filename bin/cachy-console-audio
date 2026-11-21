@@ -584,8 +584,14 @@ class AudioFocus:
         """
         if not self.pin_voice:
             return
-        play = [s for s in streams if self.exempt(s, self.appid_for(s.pid))]
-        talk = [s for s in capture if self.exempt(s, self.appid_for(s.pid))]
+        # Only the session's own copies. A Discord or Spotify the person at the
+        # desk has open matches AUDIO_NEVER_MUTE just the same, and pulling its
+        # sound and microphone over to the television is exactly what two people
+        # at once must never do to each other.
+        play = [s for s in streams if self.in_session(s.pid)
+                and self.exempt(s, self.appid_for(s.pid))]
+        talk = [s for s in capture if self.in_session(s.pid)
+                and self.exempt(s, self.appid_for(s.pid))]
         if not play and not talk:
             return
 

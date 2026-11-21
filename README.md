@@ -326,7 +326,9 @@ device differs, the next call goes there instead — often a headset at the desk
 while you are across the room. `AUDIO_PIN_VOICE` closes that by moving the
 stream itself, which is the one thing an application cannot overrule, and
 re-checking every poll so a stream that wanders back is moved again. It only
-does this while a session is running, so Discord at your desk is left alone.
+does this while a session is running, and only to the copy started inside it,
+so a Discord or Spotify someone has open at the desk keeps its own speakers and
+microphone even while console mode runs.
 
 Expect Discord's own **Voice & Video** screen to keep naming the devices it
 saved at your desk while this is happening. It is not reading them back from the
@@ -429,7 +431,7 @@ VRR and HDR; they leave `AUDIO_NEVER_MUTE` and the rest as you set them.
 | `AUDIO_FOCUS` | `on` | Mute games you are not looking at |
 | `AUDIO_DEVICE` | *(follows display)* | HDMI monitor name (`Optoma UHD`) or device (`RODECaster Duo`). Kept until you change it in **Cachy Console** settings |
 | `AUDIO_NEVER_MUTE` | `Discord, Spotify` | Left audible even though Steam started it. Comma-separated names or appids. Read by the audio service, so restart it after editing |
-| `AUDIO_PIN_VOICE` | `on` | Hold those streams on `AUDIO_DEVICE` / `AUDIO_INPUT_DEVICE`, moving them back if the app sends them elsewhere. Only while a session is running |
+| `AUDIO_PIN_VOICE` | `on` | Hold those streams on `AUDIO_DEVICE` / `AUDIO_INPUT_DEVICE`, moving them back if the app sends them elsewhere. Only while a session is running, and only copies started inside it |
 | `AUDIO_INPUT_DEVICE` | *(session default)* | Microphone for console mode, e.g. `HyperX Cloud III S Wireless`. Empty leaves input alone |
 | `IGNORE_CONTROLLERS` | empty | Devices console mode should not treat as gamepads, as `0x31e3/0x1400`, comma separated. List them with `cachy-console controllers`. Hides them from Steam only; `cachy-console hide-controllers` hides them from games too |
 | `PRIMARY_CONTROLLER` | `steam` | Which controller is player one when several are connected: `steam`, `playstation`, `xbox`, `switch`, or `off` for Steam's own order. Also in Cachy Console |

@@ -342,6 +342,7 @@ def voice_world(**kw):
     kw.setdefault("devices", (TV, MIC))
     kw.setdefault("names", BOTH)
     kw.setdefault("focus", None)
+    kw.setdefault("session_pids", {500})
     return World(**kw), pa.AudioFocus()
 
 
@@ -386,6 +387,20 @@ focus.poll()
 check("pinning happens even though nothing is muted", world.moves,
       [("sinks", 10, TV)])
 check("and still nothing is muted", world.mute_calls, [])
+
+# Two people at once: a Discord open at the desk matches AUDIO_NEVER_MUTE just
+# like the one launched from the library, but it is the desk's, not the couch's.
+world, focus = voice_world(session_pids=set())
+focus.poll()
+check("a desk Discord (not in the session) keeps its own output and microphone",
+      world.moves, [])
+world, focus = voice_world(
+    streams=[stream(10, 500, "Discord", device=2), stream(20, 600, "Discord", device=2)],
+    capture=[stream(11, 500, "Discord", device=2), stream(21, 600, "Discord", device=2)],
+    owners={500: DISCORD, 600: None}, session_pids={500})
+focus.poll()
+check("only the session's Discord is pinned when both are there",
+      sorted(world.moves), [("sinks", 10, TV), ("sources", 11, MIC)])
 
 print()
 print("the desk keeps its own output:")
@@ -504,7 +519,10 @@ check("output can be pinned while input is left to the session",
 # Only exempt streams are pinned, so a game named like nothing special is safe.
 world, focus = voice_world(never=())
 focus.poll()
-check("with nothing exempt, nothing is pinned", world.moves, [])
+check("with nothing exempt, no microphone is pinned",
+      [m for m in world.moves if m[0] == "sources"], [])
+check("and its output only follows the session-wide rule (console output)",
+      world.moves, [("sinks", 10, TV)])
 
 # Exemption by appid has to pin too, since that is how a shortcut is named when
 # its stream label does not match.
