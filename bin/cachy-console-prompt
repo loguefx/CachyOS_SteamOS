@@ -28,7 +28,9 @@ their evdev nodes. This only ever shows while a game is running, and then Steam
 presents every controller it drives -- the Steam Controller included -- as its
 own virtual gamepad, which udev lets the logged-in user read. Only the family
 of controller that pressed the guide button (and Steam's virtual pad) is
-listened to, so a desk player's own gamepad cannot answer it either.
+listened to, so a desk player's own gamepad cannot answer it either. A Steam
+Controller is also read from its own raw reports (HID_FACE), so it answers
+even in a game Steam is not presenting it to through the virtual pad.
 
   ask      -> closing    A
   ask      -> (exit)     B, or nobody answers
@@ -347,6 +349,54 @@ def pads_for(family, sys_input="/sys/class/input", dev_root="/dev/input"):
     return mine or every
 
 
+# A and B straight from a Steam Controller's own reports, for a game Steam is
+# not presenting it to through the virtual pad (Steam Input off). Report id ->
+# (byte, bit) per button, measured on the 2026 controller's puck with
+# tools/puck-capture.py; byte 0 is the report id.
+HID_FACE = {
+    0x42: {"a": (2, 0), "b": (2, 1)},
+}
+
+
+def valve_hidraw_nodes(sys_hidraw="/sys/class/hidraw", dev_root="/dev"):
+    """Readable hidraw nodes of Valve controllers."""
+    out = []
+    try:
+        names = sorted(os.listdir(sys_hidraw))
+    except OSError:
+        return out
+    for name in names:
+        try:
+            with open(os.path.join(sys_hidraw, name, "device", "uevent")) as fh:
+                if ":000028DE:" not in fh.read().upper():
+                    continue
+        except OSError:
+            continue
+        out.append(os.path.join(dev_root, name))
+    return out
+
+
+def hid_face_presses(raw, held):
+    """'a' / 'b' for each button that went down in this report.
+
+    `held` is this node's set of buttons already down, updated in place, so a
+    button held across many reports is one press.
+    """
+    layout = HID_FACE.get(raw[0]) if raw else None
+    if not layout:
+        return []
+    out = []
+    for button, (byte, bit) in layout.items():
+        down = len(raw) > byte and bool(raw[byte] & (1 << bit))
+        if down and button not in held:
+            out.append(button)
+        if down:
+            held.add(button)
+        else:
+            held.discard(button)
+    return sorted(out)
+
+
 def gamepad_nodes(sys_input="/sys/class/input", dev_root="/dev/input"):
     """evdev nodes that have a south face button, i.e. gamepads."""
     nodes = []
@@ -564,6 +614,9 @@ def main():
     guide_name = pad["guide"]
 
     if args.list_pads:
+        for path in (valve_hidraw_nodes() if family == "steam" else []):
+            readable = "" if os.access(path, os.R_OK) else "  (not readable)"
+            print(f"{path}  Steam Controller (raw reports){readable}")
         for path in pads_for(family):
             name = ""
             try:
@@ -814,14 +867,56 @@ def main():
                 pass
             return False
         for press in face_presses(raw, pad):
-            log(f"{press.upper()} from {path}")
-            press_a() if press == "a" else press_b()
+            answer(press, path)
         return True
+
+    hid_held = {}
+
+    def on_hid(fd, _cond, path):
+        while True:
+            try:
+                raw = os.read(fd, 64)
+            except BlockingIOError:
+                return True
+            except OSError:
+                pad_fds.pop(path, None)
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                return False
+            if not raw:
+                return True
+            for press in hid_face_presses(raw, hid_held.setdefault(path, set())):
+                answer(press, path)
+
+    last_answer = {}
+
+    def answer(press, path):
+        # One press can arrive twice -- from the controller itself and from the
+        # virtual pad Steam mirrors it to -- so a repeat within a moment is the
+        # same press.
+        now = time.monotonic()
+        if now - last_answer.get(press, -1.0) < 0.25:
+            return
+        last_answer[press] = now
+        log(f"{press.upper()} from {path}")
+        press_a() if press == "a" else press_b()
 
     def listen():
         """Open any pad not already open. Run again every second while the
         prompt is up: Steam creates its virtual pad when it pleases, and a
         controller can wake up after the prompt has opened."""
+        if family == "steam":
+            for path in valve_hidraw_nodes():
+                if path in pad_fds:
+                    continue
+                try:
+                    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                except OSError:
+                    continue
+                pad_fds[path] = fd
+                GLib.io_add_watch(fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN, on_hid, path)
         for path in pads_for(family):
             if path in pad_fds:
                 continue

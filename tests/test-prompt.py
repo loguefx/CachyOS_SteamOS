@@ -145,6 +145,35 @@ with tempfile.TemporaryDirectory() as tmp:
           pr.pads_for("nonsense", tmp, "/dev/input") != [], True)
 
 print()
+print("A and B from the Steam Controller's own reports:")
+
+
+def report(rid, b2=0, size=64):
+    raw = bytearray(size)
+    raw[0], raw[2] = rid, b2
+    return bytes(raw)
+
+
+held = set()
+check("A is byte 2 bit 0 of report 0x42, as measured on the puck",
+      pr.hid_face_presses(report(0x42, 0b01), held), ["a"])
+check("held down across reports it is still one press",
+      pr.hid_face_presses(report(0x42, 0b01), held), [])
+check("released, then B", (pr.hid_face_presses(report(0x42, 0), held),
+                           pr.hid_face_presses(report(0x42, 0b10), held)), ([], ["b"]))
+check("another report's byte 2 is not a button",
+      pr.hid_face_presses(report(0x43, 0b11), set()), [])
+check("an empty read is nothing", pr.hid_face_presses(b"", set()), [])
+with tempfile.TemporaryDirectory() as tmp:
+    for name, hid in (("hidraw9", "0003:000028DE:00001304"),
+                      ("hidraw1", "0003:000031E3:00001400")):
+        os.makedirs(os.path.join(tmp, name, "device"))
+        with open(os.path.join(tmp, name, "device", "uevent"), "w") as fh:
+            fh.write(f"HID_ID={hid}\nHID_NAME=x\n")
+    check("only Valve hidraw nodes are read, not the keyboard's",
+          pr.valve_hidraw_nodes(tmp, "/dev"), ["/dev/hidraw9"])
+
+print()
 print("wording:")
 check("one game", pr.games_line([("1", "Deadlock")]),
       "Deadlock will be closed. Anything unsaved will be lost.")
