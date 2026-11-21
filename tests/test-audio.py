@@ -45,7 +45,7 @@ class World:
 
     def __init__(self, streams=(), owners=None, focus=None, session=True,
                  never=(), capture=(), devices=(None, None), names=None,
-                 pin=True):
+                 pin=True, desk_default=None, session_pids=()):
         self.streams = list(streams)
         self.owners = dict(owners or {})     # pid -> appid (None = not a game)
         self.focus = focus
@@ -65,6 +65,11 @@ class World:
         # what these tests are about: they are about what gets moved where.
         pa.AudioFocus.console_devices = lambda _self: self.devices
 
+        self.default = desk_default
+        self.default_sets = []
+        pa.default_sink = lambda: self.default
+        pa.set_default_sink = self._set_default
+        pa.in_session = lambda pid: pid in session_pids
         pa.sink_inputs = lambda: list(self.streams)
         pa.steam_appid = lambda pid, limit=24: self.owners.get(pid)
         pa.gamescope_displays = lambda: [":2"] if self.session else []
@@ -98,6 +103,11 @@ class World:
             for s in group:
                 if s.index == index:
                     s.device = target
+        return True
+
+    def _set_default(self, name, dry_run):
+        self.default_sets.append(name)
+        self.default = name
         return True
 
     def _set_mute(self, index, muted, dry_run):
@@ -377,6 +387,83 @@ check("pinning happens even though nothing is muted", world.moves,
       [("sinks", 10, TV)])
 check("and still nothing is muted", world.mute_calls, [])
 
+print()
+print("the desk keeps its own output:")
+# Console mode no longer makes the TV the desktop's default. Something in the
+# session that ignores PULSE_SINK lands on the desk's speakers; that is moved.
+world, focus = voice_world(
+    streams=[stream(1, 100, "GameA", device=2), stream(2, 900, "Firefox", device=2),
+             stream(3, 101, "Steam", device=1)],
+    capture=[], owners={100: GAME_A, 900: None, 101: None},
+    desk_default=DESK, session_pids={100, 101})
+focus.poll()
+check("a session game on the desk's default is moved to the TV, and only it",
+      world.moves, [("sinks", 1, TV)])
+world.moves.clear()
+focus.poll()
+check("and the next poll is quiet", world.moves, [])
+
+HEADSET = {("sinks", 3): "alsa_output.usb-HyperX.analog-stereo"}
+world, focus = voice_world(
+    streams=[stream(1, 100, "GameA", device=3)], capture=[],
+    owners={100: GAME_A}, names={**BOTH, **HEADSET},
+    desk_default=DESK, session_pids={100})
+focus.poll()
+check("a session stream moved to another device (Big Picture's picker) goes back "
+      "to the output Cachy Console names", world.moves, [("sinks", 1, TV)])
+
+# Big Picture's output picker sets the desktop-wide default.
+world, focus = voice_world(
+    streams=[stream(3, 101, "Steam", device=1), stream(2, 900, "Firefox", device=2)],
+    capture=[], owners={101: None, 900: None},
+    desk_default=DESK, session_pids={101})
+focus.poll()
+check("the desk's output is remembered when the session starts",
+      focus.desk_default, DESK)
+world.default = TV
+world.moves.clear()
+focus.poll()
+check("the TV made the default from inside the session is undone for the desk",
+      world.default_sets, [DESK])
+check("with the session's own stream pinned to the TV first",
+      world.moves, [("sinks", 3, TV)])
+world.default = HEADSET[("sinks", 3)]
+world.default_sets.clear()
+focus.poll()
+check("a default moved anywhere else is not second-guessed", world.default_sets, [])
+
+world, focus = voice_world(streams=[], capture=[], desk_default=TV, session_pids=set())
+focus.poll()
+focus.poll()
+check("a default already on the TV when watching began is not taken for the desk's",
+      (focus.desk_default, world.default_sets), (None, []))
+
+world, focus = voice_world(
+    streams=[stream(1, 100, "GameA", device=2)], capture=[],
+    owners={100: GAME_A}, desk_default=DESK, session_pids={100}, session=False)
+focus.poll()
+check("with no session running nothing is moved", world.moves, [])
+
+import tempfile as _tf
+_fresh = importlib.util.module_from_spec(spec)
+loader.exec_module(_fresh)
+with _tf.TemporaryDirectory() as _d:
+    _fresh.CONFIG_PATH = os.path.join(_d, "config")
+    with open(_fresh.CONFIG_PATH, "w") as _fh:
+        _fh.write("AUDIO_DEVICE=Optoma UHD\n")
+    _asked = []
+    _fresh.find_helper = lambda name: "helper"
+    _fresh.run = lambda args, timeout=5: _asked.append(args[1]) or "sink\n"
+    _fresh.log = lambda msg: None
+    _f = _fresh.AudioFocus()
+    _f.console_devices()
+    _f.console_devices()
+    check("the console output is not re-resolved every poll", len(_asked), 2)
+    os.utime(_fresh.CONFIG_PATH, ns=(1, 1))
+    _f.console_devices()
+    check("but is at once when Cachy Console saves a new one", len(_asked), 4)
+
+print()
 world, focus = voice_world(pin=False)
 focus.poll()
 check("AUDIO_PIN_VOICE=off moves nothing", world.moves, [])

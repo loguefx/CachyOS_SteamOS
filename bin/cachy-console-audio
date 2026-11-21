@@ -209,6 +209,35 @@ def parent_of(pid):
     return None
 
 
+def is_gamescope(pid):
+    try:
+        return os.path.basename(os.readlink(f"/proc/{pid}/exe")).startswith("gamescope")
+    except OSError:
+        return False
+
+
+def in_session(pid, limit=40):
+    """Whether a process runs inside a gamescope session: console mode's Steam,
+    its games and anything started from its library all descend from it."""
+    seen = 0
+    while pid and pid > 1 and seen < limit:
+        if is_gamescope(pid):
+            return True
+        pid = parent_of(pid)
+        seen += 1
+    return False
+
+
+def default_sink():
+    return (run(["pactl", "get-default-sink"]) or "").strip() or None
+
+
+def set_default_sink(name, dry_run):
+    if dry_run:
+        return True
+    return run(["pactl", "set-default-sink", name]) is not None
+
+
 def process_names(pid):
     """The command name and executable of a pid.
 
@@ -415,6 +444,9 @@ class AudioFocus:
         self.muted_appids = set()      # games we are holding muted
         self.appid_cache = {}          # pid -> appid, so we re-read /proc rarely
         self.exempt_cache = {}         # pid -> never-mute, for the same reason
+        self.session_cache = {}        # pid -> runs inside the gamescope session
+        self.desk_default = None       # the desk's output when the session began
+        self.config_stamp = None       # config mtime the targets were read at
         self.never_names, self.never_appids = never_mute()
         self.last_focus = None
         self.last_report = None
@@ -488,7 +520,7 @@ class AudioFocus:
 
     def prune(self, *stream_groups):
         live = {s.pid for group in stream_groups for s in group}
-        for cache in (self.appid_cache, self.exempt_cache):
+        for cache in (self.appid_cache, self.exempt_cache, self.session_cache):
             for pid in [p for p in cache if p not in live]:
                 del cache[pid]
 
@@ -503,9 +535,17 @@ class AudioFocus:
         plugged in mid-session, but not every poll: this shells out.
         """
         now = time.monotonic()
-        if now - self.targets_checked < 10.0:
+        # A new output picked in Cachy Console takes effect at once: otherwise
+        # the old target, cached here, would pull streams back from the output
+        # the settings window had just moved them to.
+        try:
+            stamp = os.stat(CONFIG_PATH).st_mtime_ns
+        except OSError:
+            stamp = None
+        if now - self.targets_checked < 10.0 and stamp == self.config_stamp:
             return self.targets
         self.targets_checked = now
+        self.config_stamp = stamp
         helper = find_helper("cachy-console-display")
         if not helper:
             if "helper" not in self.complained:
@@ -562,6 +602,65 @@ class AudioFocus:
                         log(f"could not move {stream.name!r} to {target}")
                         self.complained.add((kind, target))
 
+    def in_session(self, pid):
+        if pid not in self.session_cache:
+            self.session_cache[pid] = in_session(pid)
+        return self.session_cache[pid]
+
+    def keep_desk_default(self, streams):
+        """Put the desk's default output back if the session moved it to the TV.
+
+        Picking an output in Big Picture's audio settings sets the desktop-wide
+        default, so choosing the television there took the sound of whoever was
+        at the desk along with it. Nothing records which program changed the
+        default, so only the one unambiguous case is undone: the default became
+        console mode's own output. The session's streams are pinned there first,
+        so they stay on the TV rather than following the default back.
+        """
+        sink, _ = self.console_devices()
+        now = default_sink()
+        if self.desk_default is None:
+            # Remembered once per session. A default already on the TV (the
+            # service restarted mid-session) is not the desk's.
+            if now and now != sink:
+                self.desk_default = now
+            return
+        if not sink or now != sink or self.desk_default == sink:
+            return
+        for stream in streams:
+            if self.in_session(stream.pid):
+                move_stream("sinks", stream.index, sink, self.dry_run)
+        if set_default_sink(self.desk_default, self.dry_run):
+            log(f"the session made {sink} the desktop's default output; "
+                f"gave the desk back {self.desk_default}")
+
+    def keep_on_console_output(self, streams):
+        """Every stream in the session plays on the output Cachy Console names.
+
+        That setting (AUDIO_DEVICE, picked in Cachy Console) is where console
+        mode's sound goes, full stop. Console mode leaves the desktop's default
+        output to whoever is at the desk and points Steam at the console output
+        with PULSE_SINK, but a program that ignores PULSE_SINK opens on the
+        desk's speakers, and Big Picture's own output picker moves streams
+        wherever it likes. Both are put back here. To play somewhere else from
+        the couch, change the output in Cachy Console. Never-muted streams are
+        pin_exempt's.
+        """
+        mine = [s for s in streams
+                if self.in_session(s.pid)
+                and not self.exempt(s, self.appid_for(s.pid))]
+        if not mine:
+            return
+        sink, _ = self.console_devices()
+        if not sink:
+            return
+        names = device_names()
+        for stream in mine:
+            if names.get(("sinks", stream.device)) == sink:
+                continue
+            if move_stream("sinks", stream.index, sink, self.dry_run):
+                log(f"moved {stream.name!r} to console mode's output, {sink}")
+
     def poll(self):
         """One pass. Returns True if a session is active, for pacing."""
         streams = sink_inputs()
@@ -575,6 +674,10 @@ class AudioFocus:
         # so Discord at your desk is left wherever you put it.
         if displays:
             self.pin_exempt(streams, capture)
+            self.keep_desk_default(streams)
+            self.keep_on_console_output(streams)
+        else:
+            self.desk_default = None
         by_app = self.games(streams)
 
         # One game, or none, cannot drown anything out.

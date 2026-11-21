@@ -105,6 +105,12 @@ class FakeSession:
     def restore_audio(self):
         self.actions.append("restore-audio")
 
+    def ask_close_games(self, games, family="steam"):
+        self.actions.append("ask-close")
+        self.asked = games
+        self.asked_family = family
+        return True
+
     def relaunch_desktop_steam(self):
         self.actions.append("relaunch-steam")
         self._started_at = None
@@ -185,8 +191,38 @@ print()
 print("Steam button without Big Picture:")
 check("two presses start a session even when Steam is not focused",
       run([DESKTOP] * 8, guide=FakeGuide({2})), ["start"])
-check("and a desktop game is left alone",
-      run([GAME] * 8, guide=FakeGuide({2})), [])
+check("a desktop game is never closed unasked: the press asks instead",
+      run([GAME] * 8, guide=FakeGuide({2})), ["ask-close"])
+s = run_session([[GAME, DESKTOP]] * 8, guide=FakeGuide({2}))
+check("and it is told which game, by appid and title",
+      s.asked, [("1623730", "Pal")])
+check("with the console display off it only says so, never asks",
+      run_session([GAME] * 8, guide=FakeGuide({2}), connected=False).announced[:1],
+      [("Close your game first",
+        "Pal is running. Close it, then press the Steam button twice to "
+        "open console mode.")])
+
+class FamilyGuide(FakeGuide):
+    def __init__(self, ticks, family):
+        super().__init__(ticks)
+        self.last_family = family
+
+
+s = run_session([GAME] * 8, guide=FamilyGuide({2}, "playstation"))
+check("the prompt shows the buttons of the pad that was pressed",
+      s.asked_family, "playstation")
+s = run_session([GAME] * 8, guide=FamilyGuide({2}, "xbox"), connected=False)
+check("and the fallback names its guide button",
+      s.announced[0][1].endswith("press the Xbox button twice to open console mode."),
+      True)
+check("the primary controller from Cachy Console wins over the device",
+      pw.pad_family("xbox", {"PRIMARY_CONTROLLER": "steam"}), "steam")
+check("PRIMARY_CONTROLLER=off falls back to the device",
+      pw.pad_family("switch", {"PRIMARY_CONTROLLER": "off"}), "switch")
+check("and with neither, Steam's own",
+      pw.pad_family(None, {}), "steam")
+check("no presses, no question",
+      run([GAME] * 8), [])
 
 print()
 print("double-press timing:")
@@ -529,6 +565,84 @@ with _tempfile.TemporaryDirectory() as tmp:
               guide._presses.feed(1.2), True)
     finally:
         guide.close()
+
+print()
+print("only the primary controller starts console mode:")
+check("by default only the primary controller's kind counts",
+      pw.trigger_families({"PRIMARY_CONTROLLER": "steam"}), {"steam"})
+check("GUIDE_PRIMARY_ONLY=off lets any pad do it",
+      pw.trigger_families({"PRIMARY_CONTROLLER": "steam",
+                           "GUIDE_PRIMARY_ONLY": "off"}), None)
+check("with no primary controller picked, any pad does",
+      (pw.trigger_families({}), pw.trigger_families({"PRIMARY_CONTROLLER": "off"})),
+      (None, None))
+with _tempfile.TemporaryDirectory() as tmp:
+    fake_pad(tmp, "event0", "045e", cap=btn_mode_cap,
+             events=evdev_press() + evdev_press())
+    guide = pw.GuideButtons(
+        evdev_root=os.path.join(tmp, "input"),
+        hidraw_root=os.path.join(tmp, "hidraw"),
+        sys_input=os.path.join(tmp, "sys-input"),
+        sys_hidraw=os.path.join(tmp, "sys-hidraw"),
+        families={"steam"})
+    try:
+        guide.double_pressed(1.0)
+        check("an Xbox pad at the desk does not count toward a double press",
+              guide._presses.times, [])
+    finally:
+        guide.close()
+with _tempfile.TemporaryDirectory() as tmp:
+    fake_pad(tmp, "event0", "045e", cap=btn_mode_cap, events=evdev_press())
+    guide = pw.GuideButtons(
+        evdev_root=os.path.join(tmp, "input"),
+        hidraw_root=os.path.join(tmp, "hidraw"),
+        sys_input=os.path.join(tmp, "sys-input"),
+        sys_hidraw=os.path.join(tmp, "sys-hidraw"),
+        families={"xbox"})
+    try:
+        guide.double_pressed(1.0)
+        check("while the primary kind still does",
+              len(guide._presses.times), 1)
+    finally:
+        guide.close()
+
+print()
+print("console mode runs in a unit of its own:")
+_rt = _tempfile.mkdtemp()
+_saved = os.environ.get("XDG_RUNTIME_DIR")
+os.environ["XDG_RUNTIME_DIR"] = _rt
+check("without a reachable user manager it runs plainly, as before",
+      pw.in_own_scope(["cachy-console"]), ["cachy-console"])
+os.makedirs(os.path.join(_rt, "systemd"))
+open(os.path.join(_rt, "systemd", "private"), "w").close()
+_argv = pw.in_own_scope(["cachy-console", "--display", "HDMI-A-1"])
+if pw.shutil.which("systemd-run"):
+    check("with one, it is a transient scope that execs the session",
+          (_argv[:5], _argv[-4:]),
+          (["systemd-run", "--user", "--quiet", "--collect", "--scope"],
+           ["--", "cachy-console", "--display", "HDMI-A-1"]))
+    check("named so it can be found",
+          any(a.startswith("--unit=cachy-console-session-") for a in _argv), True)
+if _saved is None:
+    del os.environ["XDG_RUNTIME_DIR"]
+else:
+    os.environ["XDG_RUNTIME_DIR"] = _saved
+
+print()
+print("only a real gamescope counts as a session:")
+_fake_dir = _tempfile.mkdtemp()
+_fake = os.path.join(_fake_dir, "gamescope")
+with open(_fake, "w") as _fh:
+    _fh.write("#!/bin/bash\nsleep 5\n")
+os.chmod(_fake, 0o755)
+import subprocess as _sp
+_p = _sp.Popen([_fake])
+import time as _time
+_time.sleep(0.3)
+check("a script named gamescope is not taken for a session",
+      _p.pid in pw.gamescope_pids(), False)
+_p.kill()
+_p.wait()
 
 print()
 if FAILURES:

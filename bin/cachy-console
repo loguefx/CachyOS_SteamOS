@@ -53,6 +53,7 @@ CFG_IGNORE_CONTROLLERS=""
 CFG_PRIMARY_CONTROLLER=steam
 CFG_PRIMARY_ONLY=on
 CFG_STEAM_PAD_AS_XBOX=on
+CFG_SHARE_DESK=on
 CFG_EXTRA_GAMESCOPE_ARGS=""
 
 DRY_RUN=0
@@ -72,6 +73,12 @@ if [[ -z "$EXTEST_INIT_DIR" ]]; then
         EXTEST_INIT_DIR="/usr/lib/cachy-console"
     fi
 fi
+
+# The class console mode's gamescope window carries on the desktop, and the id of
+# the KWin rule that matches it. Its own class, so the rule can never catch a
+# gamescope someone started for something else.
+GS_WMCLASS="cachy-console-gamescope"
+KWIN_RULE_ID="cachy-console-gamescope"
 
 # gamescope runs this script again as its child, to start Steam once the desktop
 # client is gone, so it needs a path that does not depend on the caller's cwd.
@@ -120,9 +127,9 @@ load_config() {
         value="${value%\"}"; value="${value#\"}"
         value="${value%\'}"; value="${value#\'}"
         case "$key" in
-            DISPLAY|DISPLAY_MODEL|RESOLUTION|REFRESH|HDR|VRR|TRACKPAD_FIX|GRAB_CURSOR|RESTART_STEAM|EXTRA_GAMESCOPE_ARGS|AUDIO_DEVICE|AUDIO_INPUT_DEVICE|IGNORE_CONTROLLERS|PRIMARY_CONTROLLER|PRIMARY_ONLY|STEAM_PAD_AS_XBOX)
+            DISPLAY|DISPLAY_MODEL|RESOLUTION|REFRESH|HDR|VRR|TRACKPAD_FIX|GRAB_CURSOR|RESTART_STEAM|EXTRA_GAMESCOPE_ARGS|AUDIO_DEVICE|AUDIO_INPUT_DEVICE|IGNORE_CONTROLLERS|PRIMARY_CONTROLLER|PRIMARY_ONLY|STEAM_PAD_AS_XBOX|SHARE_DESK)
                 printf -v "CFG_$key" '%s' "$value" ;;
-            STEAM_BUTTON|AUDIO_FOCUS|AUDIO_NEVER_MUTE|AUDIO_PIN_VOICE|MOUSE_LAYOUT_APPS) ;;   # read by the services, not by us
+            STEAM_BUTTON|GUIDE_PRIMARY_ONLY|AUDIO_FOCUS|AUDIO_NEVER_MUTE|AUDIO_PIN_VOICE|MOUSE_LAYOUT_APPS) ;;   # read by the services, not by us
             "") ;;
             *) warn "ignoring unknown setting in $CONFIG_FILE: $key" ;;
         esac
@@ -291,6 +298,7 @@ launch_desktop_steam() {
     local -a clean=(env
         -u PULSE_SINK -u PULSE_SOURCE
         -u SDL_VIDEODRIVER -u SDL_GAMECONTROLLER_IGNORE_DEVICES
+        -u SDL_APP_ID -u SDL_VIDEO_X11_WMCLASS
         -u NODEVICE_SELECT -u DISABLE_LAYER_MESA_ANTI_LAG
         -u GDK_BACKEND -u QT_QPA_PLATFORM)
 
@@ -539,7 +547,10 @@ gamescope_argv() {
     # the game on the second. Switching to Discord is then a compositor switch,
     # not an X11 focus loss, so a Proton game does not drop exclusive fullscreen
     # and come back as a postage stamp in the corner.
+    # The window class is gamescope's alone: Steam and the games are SDL programs
+    # too, and inheriting it would put every one of them under the same rule.
     out+=(-- env -u WAYLAND_DISPLAY
+          -u SDL_APP_ID -u SDL_VIDEO_X11_WMCLASS
           GDK_BACKEND=x11
           QT_QPA_PLATFORM=xcb
           STEAM_MULTIPLE_XWAYLANDS=1)
@@ -738,6 +749,86 @@ close_leftovers() {
     kill -KILL $pids 2>/dev/null || true
 }
 
+# ---- sharing the desk ---------------------------------------------------
+
+# GRAB_CURSOR makes gamescope draw its own cursor by putting the pointer in
+# relative mode -- but SDL only grabs while its window has keyboard focus, and
+# KWin gives focus to every window that opens. So the moment console mode came
+# up, the mouse at the desk vanished into the television, and the keyboard
+# typed into Big Picture. Anyone clicking the television's screen did the same.
+# A rule saying this window never takes focus keeps both at the desk. Nothing in
+# the session needs host focus: the controller reaches Steam through hidraw and
+# the trackpad reaches gamescope through EIS, and gamescope draws that cursor
+# focused or not. What is lost is a desk keyboard and mouse driving the session,
+# which is what SHARE_DESK=off brings back.
+kwin_rules_file() { printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/kwinrulesrc"; }
+
+# Puts the rule in (on) or takes it out (off). Returns 0 only when the file
+# changed, so KWin is asked to reload just once rather than on every start.
+kwin_focus_rule() {
+    local want="$1" file rules r present=0
+    have kreadconfig6 && have kwriteconfig6 || return 1
+    file="$(kwin_rules_file)"
+    rules="$(kreadconfig6 --file "$file" --group General --key rules 2>/dev/null || true)"
+    local -a keep=() list=()
+    IFS=, read -ra list <<<"$rules"
+    for r in "${list[@]}"; do
+        [[ -z "$r" ]] && continue
+        if [[ "$r" == "$KWIN_RULE_ID" ]]; then present=1; else keep+=("$r"); fi
+    done
+    local -a keys=(
+        "Description=Cachy Console: never take focus from the desk"
+        "wmclass=$GS_WMCLASS"
+        "wmclassmatch=1"
+        "acceptfocus=false"
+        "acceptfocusrule=2")
+    local kv
+    if [[ "$want" == on ]]; then
+        if (( present )); then
+            local same=1
+            for kv in "${keys[@]}"; do
+                [[ "$(kreadconfig6 --file "$file" --group "$KWIN_RULE_ID" --key "${kv%%=*}" 2>/dev/null)" == "${kv#*=}" ]] || same=0
+            done
+            (( same )) && return 1
+        fi
+        mkdir -p "$(dirname -- "$file")"
+        for kv in "${keys[@]}"; do
+            kwriteconfig6 --file "$file" --group "$KWIN_RULE_ID" --key "${kv%%=*}" "${kv#*=}"
+        done
+        keep+=("$KWIN_RULE_ID")
+    else
+        (( present )) || return 1
+        for kv in "${keys[@]}"; do
+            kwriteconfig6 --file "$file" --group "$KWIN_RULE_ID" --key "${kv%%=*}" --delete
+        done
+    fi
+    local joined
+    joined="$(IFS=,; printf '%s' "${keep[*]}")"
+    kwriteconfig6 --file "$file" --group General --key count "${#keep[@]}"
+    kwriteconfig6 --file "$file" --group General --key rules "$joined"
+    return 0
+}
+
+kwin_reload() {
+    if have qdbus6; then
+        qdbus6 org.kde.KWin /KWin reconfigure >/dev/null 2>&1 && return 0
+    fi
+    have dbus-send && dbus-send --session --type=method_call \
+        --dest=org.kde.KWin /KWin org.kde.KWin.reconfigure >/dev/null 2>&1
+}
+
+# KWin only: elsewhere there is no rule to write, and the window behaves as it
+# always has.
+share_desk() {
+    [[ "${XDG_CURRENT_DESKTOP:-}" == *KDE* ]] || return 0
+    local want=off
+    is_on "$CFG_SHARE_DESK" && want=on
+    if kwin_focus_rule "$want"; then
+        kwin_reload || warn "could not ask KWin to reload its window rules"
+    fi
+    return 0
+}
+
 start_console() {
     have steam || die "Steam is not installed"
     have gamescope || die "gamescope is not installed — sudo pacman -S gamescope"
@@ -768,6 +859,7 @@ It will not choose a screen for you."
         say "  player one: ${CFG_PRIMARY_CONTROLLER:-off}"
         say "  hide other controllers: ${CFG_PRIMARY_ONLY:-off}"
         say "  Steam's pad as an Xbox 360 pad in games: ${CFG_STEAM_PAD_AS_XBOX:-off}"
+        say "  desk keeps its mouse and keyboard: ${CFG_SHARE_DESK:-off}"
         return 0
     fi
 
@@ -815,6 +907,10 @@ It will not choose a screen for you."
     export DISABLE_LAYER_MESA_ANTI_LAG=1
 
     export SDL_VIDEODRIVER=x11
+    # Names gamescope's window on the desktop (SDL3 reads the first, sdl2-compat
+    # passes the second through), so the KWin rule below can find it.
+    export SDL_APP_ID="$GS_WMCLASS" SDL_VIDEO_X11_WMCLASS="$GS_WMCLASS"
+    share_desk
 
     # Ask which screen it is one last time, as late as possible. SDL reads the
     # index when it creates the window, not when we chose it, and the relaunch
@@ -949,6 +1045,11 @@ RESTART_STEAM=$CFG_RESTART_STEAM
 # Read by cachy-console-watch.service.
 STEAM_BUTTON=on
 
+# Only the PRIMARY_CONTROLLER kind of pad may do that, so someone playing at
+# the desk with their own gamepad cannot put console mode on the TV. Off lets
+# any controller's guide button start it. Read by cachy-console-watch.service.
+GUIDE_PRIMARY_ONLY=on
+
 # With two or more games running, mute every game except the one you are
 # looking at. Read by cachy-console-audio.service.
 AUDIO_FOCUS=on
@@ -1011,6 +1112,12 @@ PRIMARY_ONLY=$CFG_PRIMARY_ONLY
 # virtual pad, which older games that only accept pads they know (Dead Rising 2)
 # refuse. Off only if a game needs to see the real Steam pad.
 STEAM_PAD_AS_XBOX=$CFG_STEAM_PAD_AS_XBOX
+
+# Two people at once: console mode on the television, someone else at the desk.
+# On, console mode's window never takes focus, so the desk's mouse and keyboard
+# stay at the desk while the controller and its trackpad drive the session.
+# Off lets a keyboard and mouse at the desk be used in the session. KDE only.
+SHARE_DESK=$CFG_SHARE_DESK
 
 # Extra arguments passed straight to gamescope, for anything not covered above.
 # For example: EXTRA_GAMESCOPE_ARGS=--mangoapp
@@ -1111,6 +1218,74 @@ first_run() {
 
 # ---- status -------------------------------------------------------------
 
+# The checks for console mode on the TV and someone else at the desk, neither
+# getting in the other's way. Returns the number of warnings.
+status_sharing() {
+    local n=0 rules console_sink desk_sink pads prompt
+    if [[ "${XDG_CURRENT_DESKTOP:-}" != *KDE* ]]; then
+        say "  focus: not KDE, so console mode's window may take the desk's"
+        say "  mouse and keyboard when it opens (SHARE_DESK needs KWin)."
+    elif is_on "$CFG_SHARE_DESK"; then
+        rules="$(kreadconfig6 --file "$(kwin_rules_file)" --group General --key rules 2>/dev/null || true)"
+        if [[ ",$rules," == *",$KWIN_RULE_ID,"* ]] && [[ "$(kreadconfig6 --file "$(kwin_rules_file)" \
+                --group "$KWIN_RULE_ID" --key acceptfocus 2>/dev/null)" == false ]]; then
+            say "  focus: the KWin rule is in place; console mode never takes the"
+            say "  desk's mouse or keyboard (SHARE_DESK=on)."
+        else
+            say "  focus: the KWin rule is added when console mode next starts"
+            say "  (SHARE_DESK=on)."
+        fi
+    else
+        say "  focus: SHARE_DESK is off; clicking the TV gives the session the desk's"
+        say "  mouse and keyboard."
+    fi
+
+    local primary="${CFG_PRIMARY_CONTROLLER,,}" guide_only=on
+    [[ -r "$CONFIG_FILE" ]] && guide_only="$(sed -n 's/^[[:space:]]*GUIDE_PRIMARY_ONLY[[:space:]]*=[[:space:]]*//p' "$CONFIG_FILE" | tail -1)"
+    guide_only="${guide_only:-on}"
+    if is_on "$guide_only" && [[ "$primary" =~ ^(steam|playstation|xbox|switch)$ ]]; then
+        say "  Steam button: only a $primary controller starts console mode, so a"
+        say "  gamepad at the desk cannot (GUIDE_PRIMARY_ONLY=on)."
+    else
+        say "  Steam button: any controller's guide button starts console mode."
+    fi
+
+    console_sink="$("$HELPER_DISPLAY" audio-resolve 2>/dev/null || true)"
+    desk_sink="$(pactl get-default-sink 2>/dev/null || true)"
+    if [[ -n "$console_sink" ]]; then
+        say "  audio: console mode plays on $console_sink (set in Cachy Console);"
+        say "  the desk's default output is ${desk_sink:-unknown}."
+        if [[ -n "$desk_sink" && "$desk_sink" == "$console_sink" ]] && ! "$(find_helper "$NAME-exit")" --running; then
+            warn "the desktop's default output is console mode's TV output with no"
+            warn "session running, so the desk's sound is going to the TV. Pick the"
+            warn "desk's output in the system volume settings."
+            n=$(( n + 1 ))
+        fi
+    else
+        say "  audio: console mode plays on ${CFG_AUDIO_DEVICE:-the console display}"
+        say "  (set in Cachy Console), whose output appears once console mode starts;"
+        say "  the desk keeps ${desk_sink:-its own default output}."
+    fi
+    if [[ "$(systemctl --user is-active "$NAME-audio.service" 2>/dev/null)" != active ]]; then
+        warn "$NAME-audio is not running, so console mode's sound is not kept on the"
+        warn "output picked in Cachy Console if Big Picture or a game moves it."
+        n=$(( n + 1 ))
+    fi
+
+    prompt="$(find_helper "$NAME-prompt" 2>/dev/null || true)"
+    if [[ -n "$prompt" ]]; then
+        pads="$("$prompt" --list-pads 2>/dev/null || true)"
+        if [[ -n "$pads" ]]; then
+            say "  close-games popup hears:"
+            printf '%s\n' "$pads" | sed 's/^/    /'
+        else
+            say "  close-games popup hears no controller right now. That is normal with"
+            say "  no game running: Steam's virtual pad only exists while one is."
+        fi
+    fi
+    return "$n"
+}
+
 status() {
     local problems=0 warnings=0
 
@@ -1182,6 +1357,13 @@ status() {
             warn "desktop: it is drawn only while the desktop's pointer is over the"
             warn "session's window, and never from the trackpad alone."
             warnings=$(( warnings + 1 ))
+        fi
+        if is_on "$CFG_SHARE_DESK"; then
+            say "  SHARE_DESK is on, so console mode never takes the desk's mouse or"
+            say "  keyboard: the controller drives the session, the desk stays yours."
+        else
+            say "  SHARE_DESK is off, so clicking the television hands the desk's mouse"
+            say "  and keyboard to the session until you leave it."
         fi
         if is_on "$CFG_TRACKPAD_FIX"; then
             if gamescope_has_eis; then
@@ -1307,6 +1489,10 @@ status() {
         warn "controllers stay visible in games. Grant it with ./install.sh."
         warnings=$(( warnings + 1 ))
     fi
+
+    say
+    say "== two people at once =="
+    status_sharing || warnings=$(( warnings + $? ))
 
     say
     say "== library tiles =="

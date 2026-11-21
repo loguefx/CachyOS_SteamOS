@@ -379,6 +379,17 @@ The other two are `TRACKPAD_FIX` and `GRAB_CURSOR`:
   in the session at all. Asking for the grab is what makes gamescope draw its
   own, and it keeps the pointer from sliding out onto the desk's monitor.
 
+Two people can use the PC at once: one on console mode, one at the desk playing
+something else. That works because of `SHARE_DESK=on`. The grab above only holds
+the pointer while gamescope's window has keyboard focus, and KWin hands focus to
+every window that opens, so without it the desk's mouse and keyboard disappeared
+into the television the moment console mode started. Console mode's gamescope
+window gets its own class (`cachy-console-gamescope`) and a KWin rule (in
+`~/.config/kwinrulesrc`, removed by `./uninstall.sh`) says it never takes focus.
+The controller and trackpad still drive Big Picture, Discord and Spotify through
+gamescope's own cursor; the desk keeps its pointer and keyboard, and clicking the
+television does nothing. Turn it off to drive the session from a desk keyboard.
+
 One limit to know: under the grab, gamescope takes relative motion and ignores
 absolute warps, so a trackpad configured as an *absolute* pad (touch a corner,
 the cursor goes to that corner) will not move anything. The default relative
@@ -411,7 +422,9 @@ VRR and HDR; they leave `AUDIO_NEVER_MUTE` and the rest as you set them.
 | `TRACKPAD_FIX` | `off` | Preload libextest so the trackpad is also a mouse on the desk. Off (the default) keeps the session cursor and the desktop cursor as two pointers. On only for a gamescope built without libeis |
 | `MOUSE_LAYOUT_APPS` | `Discord, Spotify` | Non-Steam shortcuts, by name or appid, that get a trackpad mouse layout on the Steam Controller unless you picked one. Empty turns it off |
 | `GRAB_CURSOR` | `on` | Hold gamescope in relative mouse mode, which is what makes a nested gamescope draw its own cursor and keeps the pointer in the session. Off hands the cursor back to the desktop, which draws one only while the desktop's pointer is over the session's window |
+| `SHARE_DESK` | `on` | Console mode's window never takes focus on the desktop, so someone at the desk keeps their mouse and keyboard while the controller drives the session. Off lets a desk keyboard and mouse into the session. KDE only |
 | `STEAM_BUTTON` | `on` | Let the Steam button open console mode |
+| `GUIDE_PRIMARY_ONLY` | `on` | Only the `PRIMARY_CONTROLLER` kind of pad starts console mode with a double guide press, so someone playing at the desk with their own gamepad cannot put it on the TV. Off lets any controller do it |
 | `RESTART_STEAM` | `on` | Start the desktop Steam client again when console mode ends, minimised to the tray, so the Steam button has a client to open Big Picture in next time |
 | `AUDIO_FOCUS` | `on` | Mute games you are not looking at |
 | `AUDIO_DEVICE` | *(follows display)* | HDMI monitor name (`Optoma UHD`) or device (`RODECaster Duo`). Kept until you change it in **Cachy Console** settings |
@@ -501,6 +514,24 @@ sitting in the tray. gamescope still cannot adopt a window owned by another
 compositor, so an already-open Big Picture is relaunched inside gamescope the
 same way.
 
+**A game already open on the desktop.** Console mode restarts Steam, which
+would take the game down with it, so a double press while a game is running
+never starts it unasked. Instead a console-style prompt covers the console
+display — *Close all games?* — answered with the controller alone. It never
+takes keyboard focus and never moves the mouse pointer, so someone at the desk
+keeps typing into their own window, and their Enter or Escape cannot answer it.
+A and B are read straight from the controller (while a game runs, Steam
+presents any controller it drives as its own virtual pad), and only from the
+kind of controller that pressed the guide button, so a desk player's own
+gamepad cannot answer it either.
+Confirm (A on Steam and Xbox pads, ✕ on PlayStation, A on the right of a Switch
+pad) closes every game, politely first and then the way Steam's Stop button
+does, then shows *Starting up Steam Big Picture…* and opens console mode. Back
+(B / ○) returns to the game. The buttons shown follow the primary controller
+picked in Cachy Console; with that set to *off*, they follow the pad whose
+guide button was pressed. If the console display is off, a desktop
+notification says to close the game first instead.
+
 **Getting a Steam button back.** The same fact runs the other way when you
 leave: the button needs a client to talk to, and leaving console mode kills
 gamescope, which takes the Steam inside it down too. `RESTART_STEAM` starts the
@@ -521,14 +552,25 @@ it. Steam's second instance hands its arguments to the client that already holds
 the IPC socket and exits, so the relaunch waits for gamescope's Steam to finish
 dying before starting one, and tries again if what it started never appeared.
 
-**HDMI audio.** GPU HDMI/DP audio exposes one stereo device at a time, and
-PipeWire names it after the graphics card (`Navi 31 HDMI/DP Audio`) even when
-that port is the TV. Settings save an `AUDIO_DEVICE` (the projector, a headset,
-or another HDMI monitor). Console mode switches the GPU profile to that output,
-moves already-playing streams onto it, renames the sink to the monitor's ELD
-(e.g. Optoma UHD), and points Steam at it with `PULSE_SINK`. The choice is
-kept until you pick a different one. Headset and other USB devices stay in the
-list. The desktop HDMI device comes back when you leave.
+**HDMI audio.** GPU HDMI/DP audio's stereo profiles open one screen at a time,
+so Steam's output list would only ever hold one of them, named after the
+graphics card (`Navi 31 HDMI/DP Audio`). Console mode switches the card to its
+pro-audio profile instead, which opens every port at once, and a WirePlumber
+rule (`52-cachy-console-hdmi-outputs.conf`) names each one after its screen's
+ELD (Optoma UHD, Odyssey G93SC, …) in stereo. WirePlumber only reads rules when
+it starts, so it is restarted the first time a set of screens is seen. Settings
+save an `AUDIO_DEVICE` (the projector, a headset, or another HDMI monitor);
+console mode points Steam at it with `PULSE_SINK`, which its games inherit,
+and moves the session's own streams onto it. The desktop's default output is
+left alone, so someone at the desk keeps their sound where it was: their game,
+browser and Discord are never moved to the television. **Console mode's output
+is chosen in Cachy Console**, and while a session runs the audio service keeps
+every stream in it there: one that ignores `PULSE_SINK`, or one moved by Big
+Picture's own output picker, is put back. Big Picture's picker also sets the
+desktop-wide default; if it makes the TV the default, the desk gets its own
+output back. A new output saved in Cachy Console mid-session takes effect at
+once. The desktop HDMI profile comes back when you leave. A card with no pro-audio
+profile falls back to switching its one stereo profile to the saved screen.
 
 **Per-game audio.** gamescope publishes which app it has focused; PipeWire can
 mute one stream. A stream is treated as a game's only when its process, or one

@@ -160,8 +160,8 @@ HINT = (
 
 AUDIO_HINT = (
     "Console mode plays through this output until you pick a different one. "
-    "HDMI monitors share one GPU audio device, so picking the projector "
-    "moves TV/monitor HDMI audio onto that screen for the session."
+    "Every HDMI/DP screen is also listed in Steam's own audio settings while "
+    "console mode is open, so you can switch from the couch."
 )
 
 INPUT_HINT = (

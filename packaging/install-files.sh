@@ -18,7 +18,8 @@ install_bin() {
 for tool in cachy-console cachy-console-display cachy-console-watch \
             cachy-console-audio cachy-console-exit cachy-console-shortcut \
             cachy-console-app cachy-console-art cachy-console-settings \
-            cachy-console-session cachy-console-pads; do
+            cachy-console-session cachy-console-pads \
+            cachy-console-prompt; do
     install_bin "$tool"
 done
 

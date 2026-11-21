@@ -103,6 +103,7 @@ echo "  --force-grab-cursor  always use relative mouse mode"
 # real one does, so steam-in-session runs too.
 def gamescope_recorder(state):
     return GAMESCOPE + f"""printf "%s\\n" "$@" > {state}/gamescope-argv
+printf "%s\\n" "${{SDL_APP_ID:-}}" "${{SDL_VIDEO_X11_WMCLASS:-}}" > {state}/gamescope-class
 echo gamescope >> {state}/sequence
 while (( $# )) && [[ "$1" != "--" ]]; do shift; done
 shift
@@ -168,7 +169,11 @@ class World:
                            ("gamescope", gamescope_recorder(self.state)),
                            ("steam", STEAM),
                            ("pgrep", PGREP),
-                           ("cachy-console-exit", "#!/bin/bash\nexit 1\n")):
+                           ("cachy-console-exit", "#!/bin/bash\nexit 1\n"),
+                           # KWin is the desk's, not ours: a reload is written
+                           # down, never sent.
+                           ("qdbus6", '#!/bin/bash\necho "qdbus6 $*" >> "$CACHY_TEST_STATE/kwin"\n'),
+                           ("dbus-send", '#!/bin/bash\necho "dbus-send $*" >> "$CACHY_TEST_STATE/kwin"\n')):
             path = os.path.join(self.bin, name)
             with open(path, "w") as fh:
                 fh.write(body)
@@ -210,6 +215,7 @@ class World:
         env["WAYLAND_DISPLAY"] = "wayland-desk"
         env["CACHY_CONSOLE_STEAM_ROOT"] = self.steam_root
         env["CACHY_CONSOLE_LIB"] = self.lib
+        env["XDG_CURRENT_DESKTOP"] = "KDE"
         return env
 
     def read(self, name):
@@ -242,6 +248,13 @@ class World:
             return []
         with open(recorded) as fh:
             return [line.rstrip("\n") for line in fh]
+
+    def rule(self, group, key):
+        res = subprocess.run(["kreadconfig6", "--file",
+                              os.path.join(self.config_home, "kwinrulesrc"),
+                              "--group", group, "--key", key],
+                             capture_output=True, text=True)
+        return res.stdout.strip()
 
     def clean(self):
         shutil.rmtree(self.dir, ignore_errors=True)
@@ -545,6 +558,62 @@ w.started()
 check("with no helper beside it, a session still starts, and nothing on PATH "
       "is borrowed", "steam -steamos3 -gamepadui" in w.read("sequence"), True)
 w.clean()
+
+print()
+print("two people at once: the desk keeps its mouse and keyboard")
+w = World("DISPLAY=HDMI-A-1\n")
+check("Steam and its games do not inherit gamescope's window class",
+      ["-u", "SDL_APP_ID", "-u", "SDL_VIDEO_X11_WMCLASS"]
+      == w.argv()[w.argv().index("env") + 3:w.argv().index("env") + 7], True)
+if shutil.which("kreadconfig6") and shutil.which("kwriteconfig6"):
+    w.started()
+    check("gamescope's window carries a class of its own",
+          w.read("gamescope-class"), ["cachy-console-gamescope"] * 2)
+    check("a KWin rule for that class, and only that class, refuses it focus",
+          (w.rule("General", "rules"), w.rule("General", "count"),
+           w.rule("cachy-console-gamescope", "wmclass"),
+           w.rule("cachy-console-gamescope", "wmclassmatch"),
+           w.rule("cachy-console-gamescope", "acceptfocus"),
+           w.rule("cachy-console-gamescope", "acceptfocusrule")),
+          ("cachy-console-gamescope", "1", "cachy-console-gamescope", "1",
+           "false", "2"))
+    check("and KWin is told to reload its rules", len(w.read("kwin")), 1)
+    w.started()
+    check("a second start finds the rule in place and leaves KWin alone",
+          len(w.read("kwin")), 1)
+    w.clean()
+
+    w = World("DISPLAY=HDMI-A-1\n")
+    subprocess.run(["kwriteconfig6", "--file",
+                    os.path.join(w.config_home, "kwinrulesrc"),
+                    "--group", "General", "--key", "rules", "mine"])
+    subprocess.run(["kwriteconfig6", "--file",
+                    os.path.join(w.config_home, "kwinrulesrc"),
+                    "--group", "General", "--key", "count", "1"])
+    w.started()
+    check("the user's own rules are kept beside it",
+          (w.rule("General", "rules"), w.rule("General", "count")),
+          ("mine,cachy-console-gamescope", "2"))
+    with open(os.path.join(w.config_home, "cachy-console", "config"), "a") as fh:
+        fh.write("SHARE_DESK=off\n")
+    w.started()
+    check("SHARE_DESK=off takes the rule out again, theirs left alone",
+          (w.rule("General", "rules"), w.rule("General", "count"),
+           w.rule("cachy-console-gamescope", "acceptfocus")),
+          ("mine", "1", ""))
+    check("nor warns about an unknown setting", "unknown setting" in w.output, False)
+    w.clean()
+
+    w = World("DISPLAY=HDMI-A-1\n")
+    env = w.env()
+    env["XDG_CURRENT_DESKTOP"] = "GNOME"
+    subprocess.run([os.path.join(w.bin, "cachy-console"), "start"],
+                   capture_output=True, text=True, timeout=120, env=env)
+    check("outside KDE no rule is written",
+          os.path.exists(os.path.join(w.config_home, "kwinrulesrc")), False)
+    w.clean()
+else:
+    print("  SKIP  KWin rule (kreadconfig6/kwriteconfig6 not installed)")
 
 print()
 if FAILURES:
