@@ -1218,6 +1218,74 @@ first_run() {
 
 # ---- status -------------------------------------------------------------
 
+# The checks for console mode on the TV and someone else at the desk, neither
+# getting in the other's way. Returns the number of warnings.
+status_sharing() {
+    local n=0 rules console_sink desk_sink pads prompt
+    if [[ "${XDG_CURRENT_DESKTOP:-}" != *KDE* ]]; then
+        say "  focus: not KDE, so console mode's window may take the desk's"
+        say "  mouse and keyboard when it opens (SHARE_DESK needs KWin)."
+    elif is_on "$CFG_SHARE_DESK"; then
+        rules="$(kreadconfig6 --file "$(kwin_rules_file)" --group General --key rules 2>/dev/null || true)"
+        if [[ ",$rules," == *",$KWIN_RULE_ID,"* ]] && [[ "$(kreadconfig6 --file "$(kwin_rules_file)" \
+                --group "$KWIN_RULE_ID" --key acceptfocus 2>/dev/null)" == false ]]; then
+            say "  focus: the KWin rule is in place; console mode never takes the"
+            say "  desk's mouse or keyboard (SHARE_DESK=on)."
+        else
+            say "  focus: the KWin rule is added when console mode next starts"
+            say "  (SHARE_DESK=on)."
+        fi
+    else
+        say "  focus: SHARE_DESK is off; clicking the TV gives the session the desk's"
+        say "  mouse and keyboard."
+    fi
+
+    local primary="${CFG_PRIMARY_CONTROLLER,,}" guide_only=on
+    [[ -r "$CONFIG_FILE" ]] && guide_only="$(sed -n 's/^[[:space:]]*GUIDE_PRIMARY_ONLY[[:space:]]*=[[:space:]]*//p' "$CONFIG_FILE" | tail -1)"
+    guide_only="${guide_only:-on}"
+    if is_on "$guide_only" && [[ "$primary" =~ ^(steam|playstation|xbox|switch)$ ]]; then
+        say "  Steam button: only a $primary controller starts console mode, so a"
+        say "  gamepad at the desk cannot (GUIDE_PRIMARY_ONLY=on)."
+    else
+        say "  Steam button: any controller's guide button starts console mode."
+    fi
+
+    console_sink="$("$HELPER_DISPLAY" audio-resolve 2>/dev/null || true)"
+    desk_sink="$(pactl get-default-sink 2>/dev/null || true)"
+    if [[ -n "$console_sink" ]]; then
+        say "  audio: console mode plays on $console_sink (set in Cachy Console);"
+        say "  the desk's default output is ${desk_sink:-unknown}."
+        if [[ -n "$desk_sink" && "$desk_sink" == "$console_sink" ]] && ! "$(find_helper "$NAME-exit")" --running; then
+            warn "the desktop's default output is console mode's TV output with no"
+            warn "session running, so the desk's sound is going to the TV. Pick the"
+            warn "desk's output in the system volume settings."
+            n=$(( n + 1 ))
+        fi
+    else
+        say "  audio: console mode plays on ${CFG_AUDIO_DEVICE:-the console display}"
+        say "  (set in Cachy Console), whose output appears once console mode starts;"
+        say "  the desk keeps ${desk_sink:-its own default output}."
+    fi
+    if [[ "$(systemctl --user is-active "$NAME-audio.service" 2>/dev/null)" != active ]]; then
+        warn "$NAME-audio is not running, so console mode's sound is not kept on the"
+        warn "output picked in Cachy Console if Big Picture or a game moves it."
+        n=$(( n + 1 ))
+    fi
+
+    prompt="$(find_helper "$NAME-prompt" 2>/dev/null || true)"
+    if [[ -n "$prompt" ]]; then
+        pads="$("$prompt" --list-pads 2>/dev/null || true)"
+        if [[ -n "$pads" ]]; then
+            say "  close-games popup hears:"
+            printf '%s\n' "$pads" | sed 's/^/    /'
+        else
+            say "  close-games popup hears no controller right now. That is normal with"
+            say "  no game running: Steam's virtual pad only exists while one is."
+        fi
+    fi
+    return "$n"
+}
+
 status() {
     local problems=0 warnings=0
 
@@ -1421,6 +1489,10 @@ status() {
         warn "controllers stay visible in games. Grant it with ./install.sh."
         warnings=$(( warnings + 1 ))
     fi
+
+    say
+    say "== two people at once =="
+    status_sharing || warnings=$(( warnings + $? ))
 
     say
     say "== library tiles =="

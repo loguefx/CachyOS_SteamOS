@@ -554,12 +554,26 @@ def main():
                     help="close the games but do not start console mode (testing)")
     ap.add_argument("--only-appid", default=None,
                     help="close only this appid rather than every game (testing)")
+    ap.add_argument("--list-pads", action="store_true",
+                    help="print the controllers the prompt would listen to, then exit")
     args = ap.parse_args()
 
     games = parse_games(args.game)
     family = pick_pad(args.pad.strip().lower())
     pad = PADS[family]
     guide_name = pad["guide"]
+
+    if args.list_pads:
+        for path in pads_for(family):
+            name = ""
+            try:
+                with open(f"/sys/class/input/{os.path.basename(path)}/device/name") as fh:
+                    name = fh.read().strip()
+            except OSError:
+                pass
+            readable = "" if os.access(path, os.R_OK) else "  (not readable)"
+            print(f"{path}  {name}{readable}")
+        return 0
 
     # GTK reads its own options out of sys.argv when it loads, and --display
     # is one of them (an X display name), so it must not see ours.
