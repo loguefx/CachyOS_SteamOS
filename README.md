@@ -379,6 +379,17 @@ The other two are `TRACKPAD_FIX` and `GRAB_CURSOR`:
   in the session at all. Asking for the grab is what makes gamescope draw its
   own, and it keeps the pointer from sliding out onto the desk's monitor.
 
+Two people can use the PC at once: one on console mode, one at the desk playing
+something else. That works because of `SHARE_DESK=on`. The grab above only holds
+the pointer while gamescope's window has keyboard focus, and KWin hands focus to
+every window that opens, so without it the desk's mouse and keyboard disappeared
+into the television the moment console mode started. Console mode's gamescope
+window gets its own class (`cachy-console-gamescope`) and a KWin rule (in
+`~/.config/kwinrulesrc`, removed by `./uninstall.sh`) says it never takes focus.
+The controller and trackpad still drive Big Picture, Discord and Spotify through
+gamescope's own cursor; the desk keeps its pointer and keyboard, and clicking the
+television does nothing. Turn it off to drive the session from a desk keyboard.
+
 One limit to know: under the grab, gamescope takes relative motion and ignores
 absolute warps, so a trackpad configured as an *absolute* pad (touch a corner,
 the cursor goes to that corner) will not move anything. The default relative
@@ -411,6 +422,7 @@ VRR and HDR; they leave `AUDIO_NEVER_MUTE` and the rest as you set them.
 | `TRACKPAD_FIX` | `off` | Preload libextest so the trackpad is also a mouse on the desk. Off (the default) keeps the session cursor and the desktop cursor as two pointers. On only for a gamescope built without libeis |
 | `MOUSE_LAYOUT_APPS` | `Discord, Spotify` | Non-Steam shortcuts, by name or appid, that get a trackpad mouse layout on the Steam Controller unless you picked one. Empty turns it off |
 | `GRAB_CURSOR` | `on` | Hold gamescope in relative mouse mode, which is what makes a nested gamescope draw its own cursor and keeps the pointer in the session. Off hands the cursor back to the desktop, which draws one only while the desktop's pointer is over the session's window |
+| `SHARE_DESK` | `on` | Console mode's window never takes focus on the desktop, so someone at the desk keeps their mouse and keyboard while the controller drives the session. Off lets a desk keyboard and mouse into the session. KDE only |
 | `STEAM_BUTTON` | `on` | Let the Steam button open console mode |
 | `RESTART_STEAM` | `on` | Start the desktop Steam client again when console mode ends, minimised to the tray, so the Steam button has a client to open Big Picture in next time |
 | `AUDIO_FOCUS` | `on` | Mute games you are not looking at |

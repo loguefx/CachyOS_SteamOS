@@ -47,6 +47,22 @@ rm -rf "$HOME/.local/lib/cachy-console"
 rm -f "$APP_DIR/cachy-console.desktop" "$APP_DIR/cachy-console-settings.desktop"
 rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/cachy-console-session-env.desktop"
 
+# The KWin rule that keeps console mode from taking the desk's focus.
+rules="${XDG_CONFIG_HOME:-$HOME/.config}/kwinrulesrc"
+if command -v kreadconfig6 >/dev/null && command -v kwriteconfig6 >/dev/null \
+        && [[ ",$(kreadconfig6 --file "$rules" --group General --key rules 2>/dev/null)," == *,cachy-console-gamescope,* ]]; then
+    for key in Description wmclass wmclassmatch acceptfocus acceptfocusrule; do
+        kwriteconfig6 --file "$rules" --group cachy-console-gamescope --key "$key" --delete
+    done
+    left="$(kreadconfig6 --file "$rules" --group General --key rules \
+            | tr , '\n' | grep -vx 'cachy-console-gamescope' | grep -v '^$' | paste -sd, -)" || true
+    kwriteconfig6 --file "$rules" --group General --key rules "$left"
+    kwriteconfig6 --file "$rules" --group General --key count \
+        "$( [[ -z "$left" ]] && echo 0 || tr , '\n' <<<"$left" | wc -l )"
+    qdbus6 org.kde.KWin /KWin reconfigure >/dev/null 2>&1 || true
+    say "  removed the KWin focus rule"
+fi
+
 if (( PURGE )); then
     rm -rf "$CONFIG_DIR"
     say "  removed $CONFIG_DIR"
