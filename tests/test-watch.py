@@ -648,21 +648,85 @@ print()
 print("the running kernel's modules deleted by an update:")
 _mods = _tempfile.mkdtemp()
 _said = []
-_k = pw.KernelModules(announce=lambda s, b: _said.append(s), root=_mods,
-                      release="9.9.9-test")
+_unclaimed = {}
+_k = pw.KernelModules(announce=lambda s, b: _said.append((s, b)), root=_mods,
+                      release="9.9.9-test", scan=lambda: dict(_unclaimed))
 _k.check(0.0)
-check("missing modules are announced", len(_said), 1)
+check("a pending restart is announced", [t for t, _ in _said], ["Restart needed"])
+check("in plain words", "restart" in _said[0][1] and "kernel" not in _said[0][1], True)
 _k.check(1.0)
 _k.check(500.0)
 check("only once, however long it stays that way", len(_said), 1)
-os.mkdir(os.path.join(_mods, "9.9.9-test"))
-_k.check(1000.0)
-check("present modules say nothing", len(_said), 1)
+
+_unclaimed["/sys/hid/0003:054C:0CE6.0002"] = \
+    "Sony Interactive Entertainment DualSense Wireless Controller"
+_k.check(502.0)
+check("a pad still probing is not reported yet", len(_said), 1)
+_k.check(507.0)
+check("a pad left with no driver is reported by name",
+      _said[-1][0], "Restart to use your PS5 controller")
+_k.check(530.0)
+check("once per plug-in", len(_said), 2)
+_unclaimed.clear()
+_k.check(533.0)
+_unclaimed["/sys/hid/0003:054C:0CE6.0003"] = \
+    "Sony Interactive Entertainment DualSense Wireless Controller"
+_k.check(536.0)
+_k.check(541.0)
+check("and again when it is plugged in again", len(_said), 3)
+_unclaimed.clear()
+_unclaimed["/sys/usb/1-4:1.0"] = "Some Gadget"
+_k.check(544.0)
+_k.check(549.0)
+check("anything else gets a general title",
+      _said[-1][0], "Restart to use what you plugged in")
+
 _said.clear()
+_unclaimed.clear()
+_unclaimed["/sys/hid/already"] = "Old Pad"
+_k3 = pw.KernelModules(announce=lambda s, b: _said.append(s), root=_mods,
+                       release="8.8.8-test", scan=lambda: dict(_unclaimed))
+_k3.check(0.0)
+_k3.check(10.0)
+check("what was already unclaimed is covered by the first message", _said,
+      ["Restart needed"])
+
+_said.clear()
+os.mkdir(os.path.join(_mods, "9.9.9-test"))
+_unclaimed["/sys/hid/x"] = "Sony Interactive Entertainment DualSense Wireless Controller"
 _k2 = pw.KernelModules(announce=lambda s, b: _said.append(s), root=_mods,
-                       release="9.9.9-test")
+                       release="9.9.9-test", scan=lambda: dict(_unclaimed))
 _k2.check(0.0)
-check("and a healthy kernel is never announced", _said, [])
+_k2.check(10.0)
+check("with the kernel's modules present nothing is ever said", _said, [])
+
+print()
+print("finding devices left without a driver:")
+_sys = _tempfile.mkdtemp()
+_hid = os.path.join(_sys, "hid"); _usb = os.path.join(_sys, "usb")
+def _mk(path, files, driver=False):
+    os.makedirs(path, exist_ok=True)
+    for k, v in files.items():
+        with open(os.path.join(path, k), "w") as fh:
+            fh.write(v)
+    if driver:
+        os.makedirs(os.path.join(path, "driver"), exist_ok=True)
+_mk(os.path.join(_hid, "0003:054C:0CE6.0001"),
+    {"uevent": "HID_ID=0003:0000054C:00000CE6\nHID_NAME=Sony Interactive "
+               "Entertainment DualSense Wireless Controller\n"})
+_mk(os.path.join(_hid, "0003:28DE:1304.0002"),
+    {"uevent": "HID_NAME=Valve Software Steam Controller Puck\n"}, driver=True)
+_mk(os.path.join(_usb, "1-3"), {"product": "DualSense Wireless Controller\n"})
+_mk(os.path.join(_usb, "1-3:1.0"), {"bInterfaceClass": "01\n"})
+_mk(os.path.join(_usb, "1-3:1.3"), {"bInterfaceClass": "03\n"}, driver=True)
+_mk(os.path.join(_usb, "5-1"), {"product": "Wooting 80HE\n"})
+_mk(os.path.join(_usb, "5-1:1.2"), {"bInterfaceClass": "03\n", "authorized": "0\n"})
+_found = pw.stranded_devices(_hid, _usb)
+check("the DualSense with no HID driver is found, nothing else",
+      sorted(_found.values()),
+      ["Sony Interactive Entertainment DualSense Wireless Controller"])
+check("and called a PS5 controller", pw.friendly_name(list(_found.values())[0]),
+      "PS5 controller")
 
 print()
 if FAILURES:

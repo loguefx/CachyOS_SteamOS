@@ -115,44 +115,180 @@ def notify(summary, body):
         pass
 
 
-class KernelModules:
-    """Says so once when the running kernel's modules have been deleted.
+# Plasma's own restart dialog: it counts down, lets running apps save, and can be
+# cancelled -- a click on a notification is too easy to make by accident to
+# reboot on the spot. Without Plasma, the click is the confirmation.
+REBOOT_CMD = ("qdbus6 org.kde.LogoutPrompt /LogoutPrompt promptReboot 2>/dev/null"
+              " || systemctl reboot")
 
-    A kernel update removes the old kernel's module directory while it is still
-    running, and the first sign is a controller that does nothing: a DualSense
-    plugged in afterwards gets its audio but no gamepad, since hid-playstation
-    can no longer be loaded and hid-generic leaves it alone. Nothing looks like
-    that cause, so the watcher, which is up all the time, says it before then.
+
+def notify_reboot(summary, body):
+    """notify(), with clicking it (or its Restart button) offering a reboot.
+
+    notify-send has to stay up to hear the click, so this is a detached shell of
+    its own rather than anything the watcher waits on; it is reaped with the
+    rest. The kernel is already installed by the time this is said -- that is
+    what removed the old modules -- so a restart is all that is left to do."""
+    if not shutil.which("notify-send"):
+        return
+    _sent[:] = [p for p in _sent if p.poll() is None]
+    script = ('choice="$(notify-send --app-name="Console Mode" '
+              '--icon=system-reboot --urgency=critical '
+              '--action=default=Restart --action=reboot="Restart now" '
+              '"$1" "$2")"; '
+              'case "$choice" in default|reboot) ' + REBOOT_CMD + ' ;; esac')
+    try:
+        _sent.append(subprocess.Popen(
+            ["sh", "-c", script, "sh", summary, body],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True))
+    except OSError:
+        pass
+
+
+def _read(path):
+    try:
+        with open(path) as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
+def stranded_devices(hid_root=None, usb_root=None):
+    """{sysfs path: name} for input devices plugged in with no driver bound.
+
+    Normally every one of these has a driver within a moment of being plugged
+    in. With the running kernel's modules gone, the ones whose driver was not
+    loaded yet never get it: a DualSense's HID device sits there unclaimed
+    (hid-generic leaves devices that have a driver of their own alone), so no
+    game, and not Steam, ever sees a controller."""
+    hid_root = hid_root or os.environ.get("CACHY_CONSOLE_HID_DEVICES",
+                                          "/sys/bus/hid/devices")
+    usb_root = usb_root or os.environ.get("CACHY_CONSOLE_USB_DEVICES",
+                                          "/sys/bus/usb/devices")
+    found = {}
+    try:
+        hids = sorted(os.listdir(hid_root))
+    except OSError:
+        hids = []
+    for name in hids:
+        dev = os.path.join(hid_root, name)
+        if os.path.exists(os.path.join(dev, "driver")):
+            continue
+        label = ""
+        for line in _read(os.path.join(dev, "uevent")).splitlines():
+            if line.startswith("HID_NAME="):
+                label = line.split("=", 1)[1].strip()
+        found[os.path.realpath(dev)] = label or name
+    try:
+        usbs = sorted(os.listdir(usb_root))
+    except OSError:
+        usbs = []
+    for name in usbs:
+        iface = os.path.join(usb_root, name)
+        if ":" not in name or _read(os.path.join(iface, "bInterfaceClass")).strip() != "03":
+            continue
+        if (os.path.exists(os.path.join(iface, "driver"))
+                or _read(os.path.join(iface, "authorized")).strip() == "0"):
+            continue
+        parent = os.path.join(usb_root, name.split(":")[0])
+        label = _read(os.path.join(parent, "product")).strip()
+        found[os.path.realpath(iface)] = label or name
+    return found
+
+
+def friendly_name(label):
+    low = label.lower()
+    if "dualsense" in low:
+        return "PS5 controller"
+    if "dualshock" in low or ("wireless controller" in low and "sony" in low):
+        return "PS4 controller"
+    if "xbox" in low:
+        return "Xbox controller"
+    if "pro controller" in low or "joy-con" in low:
+        return "Switch controller"
+    return label or "A device you plugged in"
+
+
+class KernelModules:
+    """Tells you, in plain words, when a restart is needed for controllers.
+
+    A system update that installs a new kernel deletes the running kernel's
+    modules, and nothing says so. Devices already working keep working; the
+    first sign is one plugged in afterwards doing nothing -- a DualSense gets
+    its audio but no gamepad. Nothing about that points at an update, so the
+    watcher, which is up all the time, says it twice: once when the update
+    lands, and again, naming the controller, the moment one is plugged in and
+    cannot work. Both offer the restart that fixes it.
     """
 
     INTERVAL = 60.0
+    # While a restart is pending, plugged-in devices are looked at this often;
+    # one with no driver this long after it appeared is not just still probing.
+    SCAN_INTERVAL = 2.0
+    SETTLE = 4.0
 
-    def __init__(self, announce=None, root=None, release=None):
-        self.announce = announce or notify
+    def __init__(self, announce=None, root=None, release=None, scan=None):
+        self.announce = announce or notify_reboot
         self.root = root or os.environ.get("CACHY_CONSOLE_MODULES_ROOT",
                                            "/usr/lib/modules")
         self.release = release or os.uname().release
+        self.scan = scan or stranded_devices
         self.next_check = 0.0
+        self.next_scan = 0.0
+        self.pending = False
         self.warned = False
+        self.seen = {}
+        self.told = set()
 
     def missing(self):
         return not os.path.isdir(os.path.join(self.root, self.release))
 
     def check(self, now):
-        if now < self.next_check:
+        if now >= self.next_check:
+            self.next_check = now + self.INTERVAL
+            self.pending = self.missing()
+            if not self.pending:
+                self.warned = False
+                self.seen.clear()
+                self.told.clear()
+            elif not self.warned:
+                self.warned = True
+                # Whatever is already unclaimed when the update is noticed is
+                # covered by this message; only new arrivals get their own.
+                self.told.update(self.scan())
+                message = ("Your computer installed a system update that needs a "
+                           "restart. Until you restart, controllers you plug in "
+                           "(like a PS5 controller) may not be detected. "
+                           "Click to restart.")
+                log(f"kernel {self.release} was updated; its modules are gone. "
+                    "Restart needed for newly plugged devices to work.")
+                self.announce("Restart needed", message)
+        if not self.pending or now < self.next_scan:
             return
-        self.next_check = now + self.INTERVAL
-        if not self.missing():
-            self.warned = False
-            return
-        if self.warned:
-            return
-        self.warned = True
-        message = (f"The kernel was updated and the modules for the running "
-                   f"{self.release} are gone. Controllers plugged in before you "
-                   f"reboot may not work (a DualSense shows up as audio only).")
-        log(message)
-        self.announce("Reboot to finish the kernel update", message)
+        self.next_scan = now + self.SCAN_INTERVAL
+        current = self.scan()
+        for path in list(self.seen):
+            if path not in current:
+                del self.seen[path]
+        self.told &= set(current)
+        fresh = []
+        for path, label in current.items():
+            first = self.seen.setdefault(path, now)
+            if path not in self.told and now - first >= self.SETTLE:
+                self.told.add(path)
+                fresh.append(label)
+        if fresh:
+            names = sorted({friendly_name(label) for label in fresh})
+            what = " and ".join(names)
+            log(f"plugged in but not working until a restart: {', '.join(fresh)}")
+            title = (f"Restart to use your {what}"
+                     if all(n.endswith("controller") for n in names)
+                     else "Restart to use what you plugged in")
+            self.announce(title,
+                          f"{what} was plugged in but cannot work until you "
+                          "restart, because of a system update. "
+                          "Click to restart.")
 
 
 def ensure_session_env():

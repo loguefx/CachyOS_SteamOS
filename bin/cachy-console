@@ -1326,12 +1326,25 @@ status() {
     kernel="$(uname -r)"
     modules_dir="${CACHY_CONSOLE_MODULES_ROOT:-/usr/lib/modules}/$kernel"
     if [[ -d "$modules_dir" ]]; then
-        printf '  %-20s %s\n' "kernel modules" "ok ($kernel)"
+        printf '  %-20s %s\n' "restart needed" "no"
     else
-        printf '  %-20s %s\n' "kernel modules" "MISSING for $kernel -- reboot"
-        say "     The kernel was updated since this boot and its modules are gone."
-        say "     Controllers plugged in from now on may not work (a DualSense"
-        say "     shows up as audio only) until you reboot into the new kernel."
+        printf '  %-20s %s\n' "restart needed" "YES"
+        say "     A system update installed a new kernel (the core of the OS), and"
+        say "     it only takes over after a restart. Until then, controllers you"
+        say "     plug in -- a PS5 controller, for one -- may not be detected."
+        say "     Restart the computer to fix it."
+        warnings=$(( warnings + 1 ))
+    fi
+    # kernel-modules-hook keeps the running kernel's modules through an update,
+    # so a controller plugged in before the restart still works.
+    if have pacman && pacman -Q kernel-modules-hook >/dev/null 2>&1; then
+        printf '  %-20s %s\n' "update protection" "on (kernel-modules-hook)"
+    elif have pacman; then
+        printf '  %-20s %s\n' "update protection" "off"
+        say "     Without it, every kernel update stops newly plugged controllers"
+        say "     working until you restart. Turn it on with:"
+        say "       sudo pacman -S kernel-modules-hook"
+        say "       sudo systemctl enable linux-modules-cleanup.service"
         warnings=$(( warnings + 1 ))
     fi
 

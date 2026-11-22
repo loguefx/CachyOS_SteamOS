@@ -709,6 +709,17 @@ it returns on every restart. libextest implements those calls against
 
 ## Troubleshooting
 
+**A controller I plugged in does nothing (a PS5 controller works as a headset
+but not as a gamepad).** A system update probably installed a new kernel and
+you have not restarted since. Until you do, the kernel cannot load drivers it
+has not loaded already, so a controller plugged in afterwards is never
+detected. Restart and it works. Cachy Console tells you when this happens: a
+**Restart needed** notification when the update lands, and **Restart to use
+your PS5 controller** (or whichever) when you plug one in that cannot work.
+Click either to restart. `cachy-console check` shows it as **restart needed:
+YES**. To stop it happening at all, install `kernel-modules-hook`
+(`./install.sh` offers it), which keeps controllers working until you restart.
+
 **It opened on the wrong screen.** Search for **Cachy Console**, save the
 display you want, then if gamescope is already running exit and Steam-button
 twice so the next session uses it.
