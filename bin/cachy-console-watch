@@ -115,6 +115,46 @@ def notify(summary, body):
         pass
 
 
+class KernelModules:
+    """Says so once when the running kernel's modules have been deleted.
+
+    A kernel update removes the old kernel's module directory while it is still
+    running, and the first sign is a controller that does nothing: a DualSense
+    plugged in afterwards gets its audio but no gamepad, since hid-playstation
+    can no longer be loaded and hid-generic leaves it alone. Nothing looks like
+    that cause, so the watcher, which is up all the time, says it before then.
+    """
+
+    INTERVAL = 60.0
+
+    def __init__(self, announce=None, root=None, release=None):
+        self.announce = announce or notify
+        self.root = root or os.environ.get("CACHY_CONSOLE_MODULES_ROOT",
+                                           "/usr/lib/modules")
+        self.release = release or os.uname().release
+        self.next_check = 0.0
+        self.warned = False
+
+    def missing(self):
+        return not os.path.isdir(os.path.join(self.root, self.release))
+
+    def check(self, now):
+        if now < self.next_check:
+            return
+        self.next_check = now + self.INTERVAL
+        if not self.missing():
+            self.warned = False
+            return
+        if self.warned:
+            return
+        self.warned = True
+        message = (f"The kernel was updated and the modules for the running "
+                   f"{self.release} are gone. Controllers plugged in before you "
+                   f"reboot may not work (a DualSense shows up as audio only).")
+        log(message)
+        self.announce("Reboot to finish the kernel update", message)
+
+
 def ensure_session_env():
     """Plasma often starts systemd --user without DISPLAY/WAYLAND_DISPLAY."""
     if not os.environ.get("DISPLAY"):
@@ -1083,7 +1123,7 @@ def main():
     guide = GuideButtons(families=families)
     try:
         run_loop(xprop, session, bpm_re, args, stopping, time.sleep, guide=guide,
-                 flush_shortcuts=maybe_flush_shortcuts)
+                 flush_shortcuts=maybe_flush_shortcuts, kernel=KernelModules())
     finally:
         guide.close()
     log("stopped.")
@@ -1095,7 +1135,7 @@ IDLE, STARTING, GAME = "idle", "starting", "game"
 
 def run_loop(xprop, session, bpm_re, args, stopping, sleep,
              now=time.monotonic, announce=notify, guide=None,
-             flush_shortcuts=None):
+             flush_shortcuts=None, kernel=None):
     """The state machine, kept separate so it can be driven by fakes in tests."""
     state = IDLE
     engage_streak = 0
@@ -1129,6 +1169,8 @@ def run_loop(xprop, session, bpm_re, args, stopping, sleep,
             last_standdown = reason
 
     while not stopping["now"]:
+        if kernel:
+            kernel.check(now())
         if state == GAME:
             if not session.running():
                 log("console mode ended -> bringing the desktop Steam client back.")

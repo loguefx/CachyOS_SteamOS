@@ -1317,6 +1317,24 @@ status() {
         fi
     fi
 
+    # A kernel update deletes the running kernel's module directory, and nothing
+    # says so until something needs a module that is not loaded yet: a DualSense
+    # plugged in afterwards gets its audio (snd-usb-audio is already in) but no
+    # gamepad, because hid-playstation can no longer be loaded and hid-generic
+    # leaves devices with a driver of their own alone. Only a reboot fixes it.
+    local kernel modules_dir
+    kernel="$(uname -r)"
+    modules_dir="${CACHY_CONSOLE_MODULES_ROOT:-/usr/lib/modules}/$kernel"
+    if [[ -d "$modules_dir" ]]; then
+        printf '  %-20s %s\n' "kernel modules" "ok ($kernel)"
+    else
+        printf '  %-20s %s\n' "kernel modules" "MISSING for $kernel -- reboot"
+        say "     The kernel was updated since this boot and its modules are gone."
+        say "     Controllers plugged in from now on may not work (a DualSense"
+        say "     shows up as audio only) until you reboot into the new kernel."
+        warnings=$(( warnings + 1 ))
+    fi
+
     # The services read X11 window properties, so they need DISPLAY and
     # XAUTHORITY in the *systemd user manager's* environment, which is separate
     # from this shell's. Desktops are supposed to import them at login; when one

@@ -645,6 +645,26 @@ _p.kill()
 _p.wait()
 
 print()
+print("the running kernel's modules deleted by an update:")
+_mods = _tempfile.mkdtemp()
+_said = []
+_k = pw.KernelModules(announce=lambda s, b: _said.append(s), root=_mods,
+                      release="9.9.9-test")
+_k.check(0.0)
+check("missing modules are announced", len(_said), 1)
+_k.check(1.0)
+_k.check(500.0)
+check("only once, however long it stays that way", len(_said), 1)
+os.mkdir(os.path.join(_mods, "9.9.9-test"))
+_k.check(1000.0)
+check("present modules say nothing", len(_said), 1)
+_said.clear()
+_k2 = pw.KernelModules(announce=lambda s, b: _said.append(s), root=_mods,
+                       release="9.9.9-test")
+_k2.check(0.0)
+check("and a healthy kernel is never announced", _said, [])
+
+print()
 if FAILURES:
     print(f"{FAILURES} failure(s)")
     sys.exit(1)
