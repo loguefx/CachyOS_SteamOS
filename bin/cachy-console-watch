@@ -146,6 +146,38 @@ def notify_reboot(summary, body):
         pass
 
 
+# Restart chosen in our own dialog already, so Plasma is asked to log out and
+# restart straight away -- apps still close the normal way -- rather than to put
+# up a second countdown asking the same thing.
+RESTART_NOW_CMD = ("qdbus6 org.kde.Shutdown /Shutdown logoutAndReboot 2>/dev/null"
+                   " || systemctl reboot")
+
+
+def prompt_restart(summary, body):
+    """A Restart now / Later dialog; returns its process, or None if none could
+    be shown (the caller falls back to a notification).
+
+    Detached and never waited on, like the notifications: the person may leave
+    it open for hours, and the Steam button has to keep working meanwhile."""
+    if shutil.which("kdialog"):
+        ask = ('kdialog --title "$1" --icon system-reboot '
+               '--yes-label "Restart now" --no-label "Later" --yesno "$2"')
+    elif shutil.which("zenity"):
+        ask = ('zenity --question --title "$1" --icon=system-reboot '
+               '--ok-label "Restart now" --cancel-label "Later" --text "$2"')
+    else:
+        return None
+    try:
+        proc = subprocess.Popen(
+            ["sh", "-c", f"{ask} && {{ {RESTART_NOW_CMD}; }}", "sh", summary, body],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        return None
+    _sent.append(proc)
+    return proc
+
+
 def _read(path):
     try:
         with open(path) as fh:
@@ -211,15 +243,20 @@ def friendly_name(label):
 
 
 class KernelModules:
-    """Tells you, in plain words, when a restart is needed for controllers.
+    """Asks you to restart when a system update needs it for controllers.
 
     A system update that installs a new kernel deletes the running kernel's
     modules, and nothing says so. Devices already working keep working; the
     first sign is one plugged in afterwards doing nothing -- a DualSense gets
     its audio but no gamepad. Nothing about that points at an update, so the
-    watcher, which is up all the time, says it twice: once when the update
-    lands, and again, naming the controller, the moment one is plugged in and
-    cannot work. Both offer the restart that fixes it.
+    watcher, which is up all the time, asks for the restart itself: when the
+    update lands, and again, naming the controller, when one is plugged in
+    that cannot work.
+
+    The question is a Restart now / Later dialog, but never over a game: while
+    one is running (or console mode is) it is a notification instead, and the
+    dialog waits for the game to close. Later means no more dialogs until a
+    controller is plugged in that cannot work.
     """
 
     INTERVAL = 60.0
@@ -228,8 +265,11 @@ class KernelModules:
     SCAN_INTERVAL = 2.0
     SETTLE = 4.0
 
-    def __init__(self, announce=None, root=None, release=None, scan=None):
+    def __init__(self, announce=None, prompt=None, busy=None, root=None,
+                 release=None, scan=None):
         self.announce = announce or notify_reboot
+        self.prompt = prompt or prompt_restart
+        self.busy = busy or (lambda: False)
         self.root = root or os.environ.get("CACHY_CONSOLE_MODULES_ROOT",
                                            "/usr/lib/modules")
         self.release = release or os.uname().release
@@ -240,33 +280,71 @@ class KernelModules:
         self.warned = False
         self.seen = {}
         self.told = set()
+        # The question still to be put to you, as (title, text), and the
+        # dialog currently on screen, so a second never stacks on the first.
+        self.owed = None
+        self.dialog = None
+        self.in_session = False
 
     def missing(self):
         return not os.path.isdir(os.path.join(self.root, self.release))
 
-    def check(self, now):
+    def _dialog_open(self):
+        if self.dialog is None:
+            return False
+        if hasattr(self.dialog, "poll") and self.dialog.poll() is not None:
+            self.dialog = None
+            return False
+        return True
+
+    def _ask(self, title, text):
+        """Dialog now if you are free; otherwise a notification now and the
+        dialog once the game is closed."""
+        if self._busy():
+            self.announce(title, text + " Click to restart.")
+            self.owed = (title, text)
+            return
+        self._show(title, text)
+
+    def _show(self, title, text):
+        self.owed = None
+        if self._dialog_open():
+            return
+        self.dialog = self.prompt(title, text)
+        if self.dialog is None:
+            self.announce(title, text + " Click to restart.")
+
+    def _busy(self):
+        return self.in_session or self.busy()
+
+    def check(self, now, in_session=False):
+        self.in_session = in_session
         if now >= self.next_check:
             self.next_check = now + self.INTERVAL
             self.pending = self.missing()
             if not self.pending:
                 self.warned = False
+                self.owed = None
                 self.seen.clear()
                 self.told.clear()
             elif not self.warned:
                 self.warned = True
                 # Whatever is already unclaimed when the update is noticed is
-                # covered by this message; only new arrivals get their own.
+                # covered by this question; only new arrivals get their own.
                 self.told.update(self.scan())
-                message = ("Your computer installed a system update that needs a "
-                           "restart. Until you restart, controllers you plug in "
-                           "(like a PS5 controller) may not be detected. "
-                           "Click to restart.")
                 log(f"kernel {self.release} was updated; its modules are gone. "
                     "Restart needed for newly plugged devices to work.")
-                self.announce("Restart needed", message)
-        if not self.pending or now < self.next_scan:
+                self._ask("Restart needed",
+                          "Your computer installed a system update that needs "
+                          "a restart. Until you restart, controllers you plug "
+                          "in (like a PS5 controller) may not be detected.")
+        if not self.pending:
+            return
+        if now < self.next_scan:
             return
         self.next_scan = now + self.SCAN_INTERVAL
+        if self.owed and not self._busy():
+            self._show(*self.owed)
         current = self.scan()
         for path in list(self.seen):
             if path not in current:
@@ -285,10 +363,8 @@ class KernelModules:
             title = (f"Restart to use your {what}"
                      if all(n.endswith("controller") for n in names)
                      else "Restart to use what you plugged in")
-            self.announce(title,
-                          f"{what} was plugged in but cannot work until you "
-                          "restart, because of a system update. "
-                          "Click to restart.")
+            self._ask(title, f"{what} was plugged in but cannot work until you "
+                             "restart, because of a system update.")
 
 
 def ensure_session_env():
@@ -1259,7 +1335,8 @@ def main():
     guide = GuideButtons(families=families)
     try:
         run_loop(xprop, session, bpm_re, args, stopping, time.sleep, guide=guide,
-                 flush_shortcuts=maybe_flush_shortcuts, kernel=KernelModules())
+                 flush_shortcuts=maybe_flush_shortcuts,
+                 kernel=KernelModules(busy=lambda: bool(running_games(xprop))))
     finally:
         guide.close()
     log("stopped.")
@@ -1306,7 +1383,9 @@ def run_loop(xprop, session, bpm_re, args, stopping, sleep,
 
     while not stopping["now"]:
         if kernel:
-            kernel.check(now())
+            # Console mode counts as busy as well as a game on the desktop: the
+            # dialog would open on the desk, behind whatever is on the TV.
+            kernel.check(now(), in_session=state != IDLE)
         if state == GAME:
             if not session.running():
                 log("console mode ended -> bringing the desktop Steam client back.")

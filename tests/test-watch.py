@@ -647,58 +647,112 @@ _p.wait()
 print()
 print("the running kernel's modules deleted by an update:")
 _mods = _tempfile.mkdtemp()
-_said = []
+
+
+class _Dialog:
+    def __init__(self):
+        self.open = True
+
+    def poll(self):
+        return None if self.open else 0
+
+
+def _kernel(release, unclaimed, busy=None):
+    log = {"notes": [], "dialogs": []}
+
+    def prompt(title, text):
+        d = _Dialog()
+        log["dialogs"].append((title, text, d))
+        return d
+    k = pw.KernelModules(announce=lambda t, b: log["notes"].append(t),
+                         prompt=prompt, busy=busy or (lambda: False),
+                         root=_mods, release=release,
+                         scan=lambda: dict(unclaimed))
+    return k, log
+
+
 _unclaimed = {}
-_k = pw.KernelModules(announce=lambda s, b: _said.append((s, b)), root=_mods,
-                      release="9.9.9-test", scan=lambda: dict(_unclaimed))
+_k, _log = _kernel("9.9.9-test", _unclaimed)
 _k.check(0.0)
-check("a pending restart is announced", [t for t, _ in _said], ["Restart needed"])
-check("in plain words", "restart" in _said[0][1] and "kernel" not in _said[0][1], True)
+check("a pending restart asks with a dialog",
+      [t for t, _, _ in _log["dialogs"]], ["Restart needed"])
+check("in plain words",
+      "restart" in _log["dialogs"][0][1] and "kernel" not in _log["dialogs"][0][1], True)
+check("and no notification on top of it", _log["notes"], [])
 _k.check(1.0)
 _k.check(500.0)
-check("only once, however long it stays that way", len(_said), 1)
+check("only once, however long it stays that way", len(_log["dialogs"]), 1)
+_log["dialogs"][0][2].open = False  # Later
 
 _unclaimed["/sys/hid/0003:054C:0CE6.0002"] = \
     "Sony Interactive Entertainment DualSense Wireless Controller"
 _k.check(502.0)
-check("a pad still probing is not reported yet", len(_said), 1)
+check("a pad still probing is not reported yet", len(_log["dialogs"]), 1)
 _k.check(507.0)
-check("a pad left with no driver is reported by name",
-      _said[-1][0], "Restart to use your PS5 controller")
+check("a pad left with no driver asks again, by name",
+      _log["dialogs"][-1][0], "Restart to use your PS5 controller")
 _k.check(530.0)
-check("once per plug-in", len(_said), 2)
+check("once per plug-in", len(_log["dialogs"]), 2)
 _unclaimed.clear()
 _k.check(533.0)
 _unclaimed["/sys/hid/0003:054C:0CE6.0003"] = \
     "Sony Interactive Entertainment DualSense Wireless Controller"
 _k.check(536.0)
 _k.check(541.0)
-check("and again when it is plugged in again", len(_said), 3)
+check("a dialog still open is never stacked on", len(_log["dialogs"]), 2)
+_log["dialogs"][-1][2].open = False
 _unclaimed.clear()
-_unclaimed["/sys/usb/1-4:1.0"] = "Some Gadget"
 _k.check(544.0)
-_k.check(549.0)
+_unclaimed["/sys/usb/1-4:1.0"] = "Some Gadget"
+_k.check(547.0)
+_k.check(552.0)
 check("anything else gets a general title",
-      _said[-1][0], "Restart to use what you plugged in")
+      _log["dialogs"][-1][0], "Restart to use what you plugged in")
 
-_said.clear()
+print()
+print("never over a game:")
+_playing = {"now": True}
+_unclaimed.clear()
+_kg, _glog = _kernel("7.7.7-test", _unclaimed, busy=lambda: _playing["now"])
+_kg.check(0.0)
+check("while a game runs it is a notification", _glog["notes"], ["Restart needed"])
+check("and no dialog", _glog["dialogs"], [])
+_kg.check(3.0)
+check("still none while the game is open", _glog["dialogs"], [])
+_playing["now"] = False
+_kg.check(6.0)
+check("the dialog comes once the game is closed",
+      [t for t, _, _ in _glog["dialogs"]], ["Restart needed"])
+_kg.check(9.0)
+check("and only that once", len(_glog["dialogs"]), 1)
+_kc, _clog = _kernel("6.6.6-test", {})
+_kc.check(0.0, in_session=True)
+check("console mode counts as playing", (_clog["notes"], _clog["dialogs"]),
+      (["Restart needed"], []))
+_kc.check(3.0, in_session=False)
+check("and the dialog follows it", len(_clog["dialogs"]), 1)
+_kn = pw.KernelModules(announce=lambda t, b: _clog["notes"].append("fallback"),
+                       prompt=lambda t, b: None, root=_mods, release="5.5.5-test",
+                       scan=dict)
+_kn.check(0.0)
+check("no dialog program: a notification instead", _clog["notes"][-1], "fallback")
+
+print()
 _unclaimed.clear()
 _unclaimed["/sys/hid/already"] = "Old Pad"
-_k3 = pw.KernelModules(announce=lambda s, b: _said.append(s), root=_mods,
-                       release="8.8.8-test", scan=lambda: dict(_unclaimed))
+_k3, _log3 = _kernel("8.8.8-test", _unclaimed)
 _k3.check(0.0)
 _k3.check(10.0)
-check("what was already unclaimed is covered by the first message", _said,
-      ["Restart needed"])
+check("what was already unclaimed is covered by the first question",
+      [t for t, _, _ in _log3["dialogs"]], ["Restart needed"])
 
-_said.clear()
-os.mkdir(os.path.join(_mods, "9.9.9-test"))
+os.mkdir(os.path.join(_mods, "4.4.4-test"))
 _unclaimed["/sys/hid/x"] = "Sony Interactive Entertainment DualSense Wireless Controller"
-_k2 = pw.KernelModules(announce=lambda s, b: _said.append(s), root=_mods,
-                       release="9.9.9-test", scan=lambda: dict(_unclaimed))
+_k2, _log2 = _kernel("4.4.4-test", _unclaimed)
 _k2.check(0.0)
 _k2.check(10.0)
-check("with the kernel's modules present nothing is ever said", _said, [])
+check("with the kernel's modules present nothing is ever said",
+      (_log2["notes"], _log2["dialogs"]), ([], []))
 
 print()
 print("finding devices left without a driver:")
