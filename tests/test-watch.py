@@ -647,6 +647,8 @@ _p.wait()
 print()
 print("the running kernel's modules deleted by an update:")
 _mods = _tempfile.mkdtemp()
+# What a kernel update leaves: the new kernel's folder, not the running one's.
+os.mkdir(os.path.join(_mods, "10.0.0-new"))
 
 
 class _Dialog:
@@ -753,6 +755,31 @@ _k2.check(0.0)
 _k2.check(10.0)
 check("with the kernel's modules present nothing is ever said",
       (_log2["notes"], _log2["dialogs"]), ([], []))
+
+print()
+print("other distributions:")
+_said_other = []
+_empty = _tempfile.mkdtemp()
+_kx = pw.KernelModules(announce=lambda t, b: _said_other.append(t),
+                       prompt=lambda t, b: _said_other.append(t),
+                       root=_empty, release="1.0.0", scan=dict)
+_kx.check(0.0)
+check("no module folders where we look (NixOS): never asks", _said_other, [])
+_ky = pw.KernelModules(announce=lambda t, b: _said_other.append(t),
+                       prompt=lambda t, b: _said_other.append(t),
+                       root=os.path.join(_empty, "nope"), release="1.0.0", scan=dict)
+_ky.check(0.0)
+check("no such folder at all: never asks", _said_other, [])
+os.mkdir(os.path.join(_empty, "1.0.0"))
+os.mkdir(os.path.join(_empty, "2.0.0"))
+_kz = pw.KernelModules(announce=lambda t, b: _said_other.append(t),
+                       prompt=lambda t, b: _said_other.append(t),
+                       root=_empty, release="1.0.0", scan=dict)
+_kz.check(0.0)
+check("old kernel kept beside the new (Fedora, Ubuntu): never asks",
+      _said_other, [])
+_real = pw.KernelModules(scan=dict)
+check("this machine: nothing missing", _real.missing(), False)
 
 print()
 print("finding devices left without a driver:")

@@ -119,6 +119,7 @@ def notify(summary, body):
 # cancelled -- a click on a notification is too easy to make by accident to
 # reboot on the spot. Without Plasma, the click is the confirmation.
 REBOOT_CMD = ("qdbus6 org.kde.LogoutPrompt /LogoutPrompt promptReboot 2>/dev/null"
+              " || gnome-session-quit --reboot 2>/dev/null"
               " || systemctl reboot")
 
 
@@ -150,6 +151,7 @@ def notify_reboot(summary, body):
 # restart straight away -- apps still close the normal way -- rather than to put
 # up a second countdown asking the same thing.
 RESTART_NOW_CMD = ("qdbus6 org.kde.Shutdown /Shutdown logoutAndReboot 2>/dev/null"
+                   " || gnome-session-quit --reboot --no-prompt 2>/dev/null"
                    " || systemctl reboot")
 
 
@@ -242,6 +244,11 @@ def friendly_name(label):
     return label or "A device you plugged in"
 
 
+# Where distributions keep kernel modules: merged-/usr ones in the first, older
+# layouts in the second (on merged systems it is the same folder).
+MODULE_ROOTS = ("/usr/lib/modules", "/lib/modules")
+
+
 class KernelModules:
     """Asks you to restart when a system update needs it for controllers.
 
@@ -270,8 +277,8 @@ class KernelModules:
         self.announce = announce or notify_reboot
         self.prompt = prompt or prompt_restart
         self.busy = busy or (lambda: False)
-        self.root = root or os.environ.get("CACHY_CONSOLE_MODULES_ROOT",
-                                           "/usr/lib/modules")
+        root = root or os.environ.get("CACHY_CONSOLE_MODULES_ROOT")
+        self.roots = [root] if root else list(MODULE_ROOTS)
         self.release = release or os.uname().release
         self.scan = scan or stranded_devices
         self.next_check = 0.0
@@ -287,7 +294,23 @@ class KernelModules:
         self.in_session = False
 
     def missing(self):
-        return not os.path.isdir(os.path.join(self.root, self.release))
+        """The running kernel's modules are gone and another kernel's are
+        where they were -- what an in-place kernel update leaves behind.
+
+        Only that counts. A distribution keeping modules somewhere this does
+        not look (NixOS) has none of these folders, and one that keeps the old
+        kernel installed beside the new (Fedora, Ubuntu) still has ours, so
+        neither is ever told to restart."""
+        layout_seen = False
+        for root in self.roots:
+            if os.path.isdir(os.path.join(root, self.release)):
+                return False
+            try:
+                layout_seen = layout_seen or any(
+                    os.path.isdir(os.path.join(root, d)) for d in os.listdir(root))
+            except OSError:
+                pass
+        return layout_seen
 
     def _dialog_open(self):
         if self.dialog is None:

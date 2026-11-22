@@ -7,6 +7,13 @@ post_install() {
     echo "  That enables the Steam-button and audio services, picks a display"
     echo "  if you have not already, and queues Discord / Spotify tiles"
     echo "  so they are written the next time Steam is not running."
+    echo
+    echo "  After a kernel update, controllers you plug in are not detected"
+    echo "  until you restart (cachy-console asks you to). To keep them working"
+    echo "  until then:"
+    echo
+    echo "    sudo pacman -S kernel-modules-hook"
+    echo "    sudo systemctl enable linux-modules-cleanup.service"
     echo "  If you used ./install.sh before, first-run removes those home"
     echo "  copies so /usr is what runs."
     echo

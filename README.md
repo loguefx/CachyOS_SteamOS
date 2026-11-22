@@ -719,6 +719,10 @@ your PS5 controller** (or whichever) when you plug one in that cannot work.
 Click either to restart. `cachy-console check` shows it as **restart needed:
 YES**. To stop it happening at all, install `kernel-modules-hook`
 (`./install.sh` offers it), which keeps controllers working until you restart.
+This is an Arch-family thing (CachyOS, Arch, EndeavourOS, Garuda): their kernel
+updates replace the running kernel in place. Fedora, Ubuntu and the like keep
+the old kernel installed, so it does not happen there, and Cachy Console never
+asks them to restart. The installer only offers the package where `pacman` is.
 
 **It opened on the wrong screen.** Search for **Cachy Console**, save the
 display you want, then if gamescope is already running exit and Steam-button

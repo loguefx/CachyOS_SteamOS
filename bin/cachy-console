@@ -1322,10 +1322,18 @@ status() {
     # plugged in afterwards gets its audio (snd-usb-audio is already in) but no
     # gamepad, because hid-playstation can no longer be loaded and hid-generic
     # leaves devices with a driver of their own alone. Only a reboot fixes it.
-    local kernel modules_dir
+    # Only when another kernel's folder is where ours was -- what an in-place
+    # update leaves. Distributions that keep modules elsewhere (NixOS) or keep
+    # the old kernel installed (Fedora, Ubuntu) are never told to restart.
+    local kernel root restart=no layout=0 roots=(/usr/lib/modules /lib/modules)
     kernel="$(uname -r)"
-    modules_dir="${CACHY_CONSOLE_MODULES_ROOT:-/usr/lib/modules}/$kernel"
-    if [[ -d "$modules_dir" ]]; then
+    [[ -n "${CACHY_CONSOLE_MODULES_ROOT:-}" ]] && roots=("$CACHY_CONSOLE_MODULES_ROOT")
+    for root in "${roots[@]}"; do
+        if [[ -d "$root/$kernel" ]]; then layout=0; break; fi
+        compgen -G "$root/*/" >/dev/null && layout=1
+    done
+    (( layout )) && restart=yes
+    if [[ "$restart" == no ]]; then
         printf '  %-20s %s\n' "restart needed" "no"
     else
         printf '  %-20s %s\n' "restart needed" "YES"
