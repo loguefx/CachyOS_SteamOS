@@ -1279,8 +1279,8 @@ status_sharing() {
             say "  close-games popup hears:"
             printf '%s\n' "$pads" | sed 's/^/    /'
         else
-            say "  close-games popup hears no controller right now. That is normal with"
-            say "  no game running: Steam's virtual pad only exists while one is."
+            say "  close-games popup hears no controller right now: is the console"
+            say "  controller switched on?"
         fi
     fi
     return "$n"
@@ -1315,6 +1315,45 @@ status() {
             say "       sudo setcap CAP_SYS_NICE=eip $(command -v gamescope)"
             warnings=$(( warnings + 1 ))
         fi
+    fi
+
+    # A kernel update deletes the running kernel's module directory, and nothing
+    # says so until something needs a module that is not loaded yet: a DualSense
+    # plugged in afterwards gets its audio (snd-usb-audio is already in) but no
+    # gamepad, because hid-playstation can no longer be loaded and hid-generic
+    # leaves devices with a driver of their own alone. Only a reboot fixes it.
+    # Only when another kernel's folder is where ours was -- what an in-place
+    # update leaves. Distributions that keep modules elsewhere (NixOS) or keep
+    # the old kernel installed (Fedora, Ubuntu) are never told to restart.
+    local kernel root restart=no layout=0 roots=(/usr/lib/modules /lib/modules)
+    kernel="$(uname -r)"
+    [[ -n "${CACHY_CONSOLE_MODULES_ROOT:-}" ]] && roots=("$CACHY_CONSOLE_MODULES_ROOT")
+    for root in "${roots[@]}"; do
+        if [[ -d "$root/$kernel" ]]; then layout=0; break; fi
+        compgen -G "$root/*/" >/dev/null && layout=1
+    done
+    (( layout )) && restart=yes
+    if [[ "$restart" == no ]]; then
+        printf '  %-20s %s\n' "restart needed" "no"
+    else
+        printf '  %-20s %s\n' "restart needed" "YES"
+        say "     A system update installed a new kernel (the core of the OS), and"
+        say "     it only takes over after a restart. Until then, controllers you"
+        say "     plug in -- a PS5 controller, for one -- may not be detected."
+        say "     Restart the computer to fix it."
+        warnings=$(( warnings + 1 ))
+    fi
+    # kernel-modules-hook keeps the running kernel's modules through an update,
+    # so a controller plugged in before the restart still works.
+    if have pacman && pacman -Q kernel-modules-hook >/dev/null 2>&1; then
+        printf '  %-20s %s\n' "update protection" "on (kernel-modules-hook)"
+    elif have pacman; then
+        printf '  %-20s %s\n' "update protection" "off"
+        say "     Without it, every kernel update stops newly plugged controllers"
+        say "     working until you restart. Turn it on with:"
+        say "       sudo pacman -S kernel-modules-hook"
+        say "       sudo systemctl enable linux-modules-cleanup.service"
+        warnings=$(( warnings + 1 ))
     fi
 
     # The services read X11 window properties, so they need DISPLAY and

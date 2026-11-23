@@ -466,6 +466,33 @@ finish(proc)
 check("leaving the session switches it back on",
       open(os.path.join(usb, "5-2", "authorized")).read().strip(), "1")
 w.clean()
+
+# gamescope gone without anyone stopping the watcher: the desktop client that
+# comes back answers the same port, and the DualSense must not stay switched off.
+open(log, "w").close()
+w = World([pad(DUALSENSE, 0), pad(STEAM_CONTROLLER, 1)])
+gs_bin = os.path.join(w.dir, "cachy-fake-gs")
+shutil.copy("/bin/sleep", gs_bin)
+fake_gs = subprocess.Popen([gs_bin, "60"])
+proc = w.watch(only=True, CACHY_CONSOLE_USB_DEVICES=usb,
+               CACHY_CONSOLE_USB_HELPER=helper, CACHY_CONSOLE_PKEXEC="",
+               CACHY_CONSOLE_GAMESCOPE_COMM="cachy-fake-gs")
+w.settle(lambda: "0 5-2" in open(log).read())
+check("during a session the DualSense is switched off",
+      open(os.path.join(usb, "5-2", "authorized")).read().strip(), "0")
+fake_gs.kill()
+fake_gs.wait()
+try:
+    out = proc.communicate(timeout=10)[0]
+    exited = True
+except subprocess.TimeoutExpired:
+    exited = False
+    out = finish(proc)
+check("when console mode ends, the watcher stops on its own", exited, True)
+check("and the DualSense is switched back on",
+      open(os.path.join(usb, "5-2", "authorized")).read().strip(), "1")
+check("saying why", "console mode has ended" in out, True)
+w.clean()
 shutil.rmtree(usb)
 
 print()

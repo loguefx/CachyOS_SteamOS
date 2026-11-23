@@ -24,13 +24,12 @@ as the prompt closes.
 The window never takes keyboard focus, so someone typing at the desk keeps
 typing into their own window, and their Enter or Escape cannot answer it. A and
 B are read straight from the controllers instead, as BTN_SOUTH / BTN_EAST on
-their evdev nodes. This only ever shows while a game is running, and then Steam
-presents every controller it drives -- the Steam Controller included -- as its
-own virtual gamepad, which udev lets the logged-in user read. Only the family
-of controller that pressed the guide button (and Steam's virtual pad) is
-listened to, so a desk player's own gamepad cannot answer it either. A Steam
-Controller is also read from its own raw reports (HID_FACE), so it answers
-even in a game Steam is not presenting it to through the virtual pad.
+their evdev nodes. Only the family of controller that pressed the guide
+button is listened to, so a desk player's own gamepad cannot answer it. Steam's
+virtual gamepad is not listened to either: the desktop client makes one for
+every controller it has Steam Input on for, a desk player's included, so a
+press on it could be anyone's. A Steam Controller is read from its own raw
+reports (HID_FACE) instead, which works with or without Steam Input.
 
   ask      -> closing    A
   ask      -> (exit)     B, or nobody answers
@@ -317,8 +316,7 @@ def keycap_has_bit(text, bit):
     return idx < len(words) and bool(words[-(idx + 1)] & (1 << off))
 
 
-# USB vendor ids per family, as sysfs prints them. Steam's virtual pad is
-# Valve's whatever is behind it, so it is always listened to.
+# USB vendor ids per family, as sysfs prints them.
 FAMILY_VENDORS = {
     "steam": {"28de"},
     "xbox": {"045e", "2dc8"},
@@ -326,27 +324,49 @@ FAMILY_VENDORS = {
     "switch": {"057e"},
 }
 STEAM_VENDOR = "28de"
+# Steam's virtual gamepad ("Microsoft X-Box 360 pad"). The desktop client makes
+# one for every controller it has Steam Input on for -- a DualSense or Xbox pad
+# at the desk included -- so it says nothing about whose hand it is in.
+STEAM_VIRTUAL = ("28de", "11ff")
 
 
-def node_vendor(sys_input, name):
+def _node_id(sys_input, name, field):
     try:
-        with open(os.path.join(sys_input, name, "device", "id", "vendor")) as fh:
+        with open(os.path.join(sys_input, name, "device", "id", field)) as fh:
             return fh.read().strip().lower().zfill(4)
     except OSError:
         return ""
 
 
-def pads_for(family, sys_input="/sys/class/input", dev_root="/dev/input"):
-    """The gamepads to listen to: the family that asked, and Steam's own.
+def node_vendor(sys_input, name):
+    return _node_id(sys_input, name, "vendor")
 
-    Falls back to every gamepad when none match, so an unrecognised controller
-    in hand can still answer rather than the prompt timing out.
+
+def is_steam_virtual(sys_input, name):
+    return (node_vendor(sys_input, name),
+            _node_id(sys_input, name, "product")) == STEAM_VIRTUAL
+
+
+def pads_for(family, sys_input="/sys/class/input", dev_root="/dev/input"):
+    """The gamepads to listen to: only the family that asked.
+
+    Never Steam's virtual pad for a known family: the desktop client makes one
+    for a controller at the desk too, so listening to it let the desk answer.
+    The controller that asked is heard directly -- its own evdev node, or for a
+    Steam Controller its own reports -- whether or not Steam Input is on.
+
+    Falls back to every gamepad when nothing matches an unknown family, so an
+    unrecognised controller in hand can still answer rather than the prompt
+    timing out. Never for a known one: that would only let a gamepad at the
+    desk answer for it.
     """
     every = gamepad_nodes(sys_input, dev_root)
-    wanted = FAMILY_VENDORS.get(family, set()) | {STEAM_VENDOR}
-    mine = [n for n in every
-            if node_vendor(sys_input, os.path.basename(n)) in wanted]
-    return mine or every
+    wanted = FAMILY_VENDORS.get(family)
+    if wanted is None:
+        return every
+    return [n for n in every
+            if node_vendor(sys_input, os.path.basename(n)) in wanted
+            and not is_steam_virtual(sys_input, os.path.basename(n))]
 
 
 # A and B straight from a Steam Controller's own reports, for a game Steam is

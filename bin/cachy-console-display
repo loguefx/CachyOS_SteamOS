@@ -999,6 +999,13 @@ def in_session(pid, proc_root="/proc", limit=40):
     Everything console mode starts -- its Steam, the games, Discord from the
     library -- is a descendant of gamescope. Anything at the desk is not.
     """
+    # gamescope's children carry this, and it survives re-parenting.
+    try:
+        with open(f"{proc_root}/{pid}/environ", "rb") as fh:
+            if b"\0GAMESCOPE_WAYLAND_DISPLAY=" in b"\0" + fh.read():
+                return True
+    except OSError:
+        pass
     seen = 0
     while pid and pid > 1 and seen < limit:
         if _is_gamescope(pid, proc_root):
@@ -1540,12 +1547,13 @@ def _remember_restore_state(target):
     previous_sink = _default_sink()
     previous_profile = target.get("card_profile")
     existing = _load_audio_state()
-    # A crashed session may already have switched the profile. Keep the
-    # original desktop device so the next restore still lands there.
+    # Routing runs more than once a session, and a crashed session leaves its
+    # state behind: either way the output to go back to is the one the desktop
+    # had before console mode first started, so the first one recorded wins.
     if existing and existing.get("applied"):
+        previous_sink = existing.get("previous_sink") or previous_sink
         if not target.get("card") or existing.get("card") == target.get("card"):
             previous_profile = existing.get("previous_profile") or previous_profile
-            previous_sink = existing.get("previous_sink") or previous_sink
     _save_audio_state({
         "card": target.get("card"),
         "previous_profile": previous_profile,
@@ -1650,8 +1658,7 @@ def _route_pro(args, target):
         print(f"would set {card} to {PRO_AUDIO} and default to "
               f"{target['eld']} ({target['pro_sink']})")
         return 0
-    if target.get("card_profile") != PRO_AUDIO:
-        _remember_restore_state(target)
+    _remember_restore_state(target)
     ports = [p for p in hdmi_ports() if p.get("card") == card and p.get("pro_sink")]
     if _write_pro_rule(ports):
         _restart_wireplumber(card)
@@ -1681,12 +1688,14 @@ def _route_hdmi(args, target):
                   f"({target['eld']})")
         return 0
 
+    # Recorded even when the profile needs no change: leaving console mode
+    # still has to give the desktop back the output it had.
+    _remember_restore_state(target)
     if target["card_profile"] == target["profile"]:
         print(f"HDMI audio already on {target['eld']} ({target['profile']})")
         _apply_console_sink(target)
         return 0
 
-    _remember_restore_state(target)
     # Name the node before it appears, so Steam never sees the GPU card name.
     _write_wp_rule(
         target["card"].replace("alsa_card.", "alsa_output.", 1)
@@ -1732,14 +1741,14 @@ def cmd_audio_restore(args):
     if args.dry_run:
         print(f"would restore {state.get('card')} to {state.get('previous_profile')}")
         return 0
-    # Console mode no longer moves the desktop's default, so this is only for
-    # when something else did -- Steam's own output picker sets it -- or for a
-    # state file left by an older version that did. A default the person at
-    # the desk chose during the session is theirs and stays. Read before the
-    # profile changes, which takes the TV's sinks away.
+    # Back to the desktop means back to the output the desktop had before
+    # console mode started, whatever happened in between: Big Picture's output
+    # picker changes the desktop-wide default, to the TV or to anything else.
     sink = state.get("previous_sink")
     now = _default_sink()
-    put_back = bool(sink) and now != sink and _console_sink(state, now)
+    # Never "back" onto the TV itself, which only a state file from a session
+    # that started with the TV as the default could hold.
+    put_back = bool(sink) and now != sink and sink != state.get("console_sink")
     card = state.get("card")
     profile = state.get("previous_profile")
     if card and profile:

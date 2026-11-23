@@ -209,6 +209,31 @@ elif [[ ! -x "$USB_HELPER" ]] || ! grep -q "subject.user == \"$USER\"" "$USB_RUL
     fi
 fi
 
+# A kernel update deletes the running kernel's modules, so until the next
+# restart a controller plugged in can get no driver: a DualSense comes up as
+# audio only and no game sees it, with nothing saying why. kernel-modules-hook
+# keeps the old modules until the restart, so it keeps working.
+if have pacman && ! pacman -Q kernel-modules-hook >/dev/null 2>&1; then
+    say
+    say "== controllers after system updates =="
+    say "  When a system update installs a new kernel, controllers you plug in"
+    say "  afterwards (a PS5 controller, for one) stop being detected until you"
+    say "  restart. kernel-modules-hook, from Arch's own repository, keeps them"
+    say "  working until you get round to restarting."
+    read -rp "  Install it with sudo? [Y/n] " reply
+    if [[ "${reply,,}" != n* ]]; then
+        if sudo pacman -S --needed --noconfirm kernel-modules-hook \
+                && sudo systemctl enable linux-modules-cleanup.service; then
+            say "  installed. Controllers keep working after kernel updates."
+        else
+            warn "could not install kernel-modules-hook; Cachy Console will still"
+            warn "tell you when a restart is needed."
+        fi
+    else
+        say "  skipped. Cachy Console will tell you when a restart is needed."
+    fi
+fi
+
 # gamescope's --rt flag is silently ignored without this capability, and the
 # difference shows up as stutter under load rather than as an error.
 if have gamescope && ! getcap "$(command -v gamescope)" 2>/dev/null | grep -q cap_sys_nice; then

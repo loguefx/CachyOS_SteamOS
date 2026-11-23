@@ -342,6 +342,7 @@ def voice_world(**kw):
     kw.setdefault("devices", (TV, MIC))
     kw.setdefault("names", BOTH)
     kw.setdefault("focus", None)
+    kw.setdefault("session_pids", {500})
     return World(**kw), pa.AudioFocus()
 
 
@@ -387,6 +388,20 @@ check("pinning happens even though nothing is muted", world.moves,
       [("sinks", 10, TV)])
 check("and still nothing is muted", world.mute_calls, [])
 
+# Two people at once: a Discord open at the desk matches AUDIO_NEVER_MUTE just
+# like the one launched from the library, but it is the desk's, not the couch's.
+world, focus = voice_world(session_pids=set())
+focus.poll()
+check("a desk Discord (not in the session) keeps its own output and microphone",
+      world.moves, [])
+world, focus = voice_world(
+    streams=[stream(10, 500, "Discord", device=2), stream(20, 600, "Discord", device=2)],
+    capture=[stream(11, 500, "Discord", device=2), stream(21, 600, "Discord", device=2)],
+    owners={500: DISCORD, 600: None}, session_pids={500})
+focus.poll()
+check("only the session's Discord is pinned when both are there",
+      sorted(world.moves), [("sinks", 10, TV), ("sources", 11, MIC)])
+
 print()
 print("the desk keeps its own output:")
 # Console mode no longer makes the TV the desktop's default. Something in the
@@ -417,9 +432,16 @@ world, focus = voice_world(
     streams=[stream(3, 101, "Steam", device=1), stream(2, 900, "Firefox", device=2)],
     capture=[], owners={101: None, 900: None},
     desk_default=DESK, session_pids={101})
+focus.default_every = 0          # read every poll here; live it is every 2 s
 focus.poll()
 check("the desk's output is remembered when the session starts",
       focus.desk_default, DESK)
+world.default = "alsa_output.desk-speakers"
+focus.poll()
+check("and follows the desk if they pick another output mid-session",
+      focus.desk_default, "alsa_output.desk-speakers")
+world.default = DESK
+focus.poll()
 world.default = TV
 world.moves.clear()
 focus.poll()
@@ -433,6 +455,7 @@ focus.poll()
 check("a default moved anywhere else is not second-guessed", world.default_sets, [])
 
 world, focus = voice_world(streams=[], capture=[], desk_default=TV, session_pids=set())
+focus.default_every = 0
 focus.poll()
 focus.poll()
 check("a default already on the TV when watching began is not taken for the desk's",
@@ -463,6 +486,15 @@ with _tf.TemporaryDirectory() as _d:
     _f.console_devices()
     check("but is at once when Cachy Console saves a new one", len(_asked), 4)
 
+    _calls = []
+    _fresh.device_names = lambda: _calls.append(1) or {("sinks", 1): "tv"}
+    _f.device_name("sinks", 1)
+    _f.device_name("sinks", 1)
+    check("device names are cached between polls", len(_calls), 1)
+    _f.device_name("sinks", 9)
+    check("and re-read when a stream sits on a device not seen before",
+          len(_calls), 2)
+
 print()
 world, focus = voice_world(pin=False)
 focus.poll()
@@ -487,7 +519,10 @@ check("output can be pinned while input is left to the session",
 # Only exempt streams are pinned, so a game named like nothing special is safe.
 world, focus = voice_world(never=())
 focus.poll()
-check("with nothing exempt, nothing is pinned", world.moves, [])
+check("with nothing exempt, no microphone is pinned",
+      [m for m in world.moves if m[0] == "sources"], [])
+check("and its output only follows the session-wide rule (console output)",
+      world.moves, [("sinks", 10, TV)])
 
 # Exemption by appid has to pin too, since that is how a shortcut is named when
 # its stream label does not match.

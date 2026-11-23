@@ -326,7 +326,9 @@ device differs, the next call goes there instead — often a headset at the desk
 while you are across the room. `AUDIO_PIN_VOICE` closes that by moving the
 stream itself, which is the one thing an application cannot overrule, and
 re-checking every poll so a stream that wanders back is moved again. It only
-does this while a session is running, so Discord at your desk is left alone.
+does this while a session is running, and only to the copy started inside it,
+so a Discord or Spotify someone has open at the desk keeps its own speakers and
+microphone even while console mode runs.
 
 Expect Discord's own **Voice & Video** screen to keep naming the devices it
 saved at your desk while this is happening. It is not reading them back from the
@@ -429,7 +431,7 @@ VRR and HDR; they leave `AUDIO_NEVER_MUTE` and the rest as you set them.
 | `AUDIO_FOCUS` | `on` | Mute games you are not looking at |
 | `AUDIO_DEVICE` | *(follows display)* | HDMI monitor name (`Optoma UHD`) or device (`RODECaster Duo`). Kept until you change it in **Cachy Console** settings |
 | `AUDIO_NEVER_MUTE` | `Discord, Spotify` | Left audible even though Steam started it. Comma-separated names or appids. Read by the audio service, so restart it after editing |
-| `AUDIO_PIN_VOICE` | `on` | Hold those streams on `AUDIO_DEVICE` / `AUDIO_INPUT_DEVICE`, moving them back if the app sends them elsewhere. Only while a session is running |
+| `AUDIO_PIN_VOICE` | `on` | Hold those streams on `AUDIO_DEVICE` / `AUDIO_INPUT_DEVICE`, moving them back if the app sends them elsewhere. Only while a session is running, and only copies started inside it |
 | `AUDIO_INPUT_DEVICE` | *(session default)* | Microphone for console mode, e.g. `HyperX Cloud III S Wireless`. Empty leaves input alone |
 | `IGNORE_CONTROLLERS` | empty | Devices console mode should not treat as gamepads, as `0x31e3/0x1400`, comma separated. List them with `cachy-console controllers`. Hides them from Steam only; `cachy-console hide-controllers` hides them from games too |
 | `PRIMARY_CONTROLLER` | `steam` | Which controller is player one when several are connected: `steam`, `playstation`, `xbox`, `switch`, or `off` for Steam's own order. Also in Cachy Console |
@@ -569,7 +571,9 @@ every stream in it there: one that ignores `PULSE_SINK`, or one moved by Big
 Picture's own output picker, is put back. Big Picture's picker also sets the
 desktop-wide default; if it makes the TV the default, the desk gets its own
 output back. A new output saved in Cachy Console mid-session takes effect at
-once. The desktop HDMI profile comes back when you leave. A card with no pro-audio
+once. When you leave, the desktop gets back the HDMI profile and the output
+it had before console mode started, whatever Big Picture's picker changed it to
+in between. A card with no pro-audio
 profile falls back to switching its one stereo profile to the saved screen.
 
 **Per-game audio.** gamescope publishes which app it has focused; PipeWire can
@@ -704,6 +708,21 @@ it returns on every restart. libextest implements those calls against
 `/dev/uinput` instead, so there is nothing to approve.
 
 ## Troubleshooting
+
+**A controller I plugged in does nothing (a PS5 controller works as a headset
+but not as a gamepad).** A system update probably installed a new kernel and
+you have not restarted since. Until you do, the kernel cannot load drivers it
+has not loaded already, so a controller plugged in afterwards is never
+detected. Restart and it works. Cachy Console tells you when this happens: a
+**Restart needed** notification when the update lands, and **Restart to use
+your PS5 controller** (or whichever) when you plug one in that cannot work.
+Click either to restart. `cachy-console check` shows it as **restart needed:
+YES**. To stop it happening at all, install `kernel-modules-hook`
+(`./install.sh` offers it), which keeps controllers working until you restart.
+This is an Arch-family thing (CachyOS, Arch, EndeavourOS, Garuda): their kernel
+updates replace the running kernel in place. Fedora, Ubuntu and the like keep
+the old kernel installed, so it does not happen there, and Cachy Console never
+asks them to restart. The installer only offers the package where `pacman` is.
 
 **It opened on the wrong screen.** Search for **Cachy Console**, save the
 display you want, then if gamescope is already running exit and Steam-button

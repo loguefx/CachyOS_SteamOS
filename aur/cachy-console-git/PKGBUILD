@@ -14,6 +14,7 @@ optdepends=(
     'libextest-git: trackpad mouse on a gamescope built without libeis'
     'discord: couch voice-chat tile'
     'spotify-launcher: couch music tile'
+    'kernel-modules-hook: controllers plugged in after a kernel update work before you restart'
 )
 makedepends=('git' 'gcc' 'lib32-glibc')
 provides=('cachy-console')

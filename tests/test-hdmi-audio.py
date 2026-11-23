@@ -213,14 +213,18 @@ check("a second restore with no state is a no-op",
       (cd.cmd_audio_restore(types.SimpleNamespace(dry_run=False)), commands),
       (0, []))
 
-# Steam's own output picker sets the default; if it moved it onto the TV, the
-# desk gets its device back when the session ends.
+# Back to the desktop means back to the output it had before console mode,
+# whatever Big Picture's output picker (which sets the desktop-wide default)
+# or anything else did in between.
+BEFORE = "alsa_output.pci-0000_0c_00.1.hdmi-stereo"
 for now, label, want in (
         ("alsa_output.pci-0000_0c_00.1.hdmi-stereo-extra3",
-         "a default something moved onto the TV is put back on leaving",
-         [["set-default-sink", "alsa_output.pci-0000_0c_00.1.hdmi-stereo"]]),
-        ("alsa_output.usb-RODE_RODECaster_Duo.analog-stereo",
-         "a default the person at the desk picked mid-session is theirs", [])):
+         "a default moved onto the TV is put back on leaving",
+         [["set-default-sink", BEFORE]]),
+        ("alsa_output.usb-HyperX_Cloud_III.analog-stereo",
+         "a default moved anywhere else (a headset) is put back too",
+         [["set-default-sink", BEFORE]]),
+        (BEFORE, "a default already where it was is left alone", [])):
     cd._save_audio_state({"card": HDMI_CARD, "applied": True,
                           "previous_profile": "output:hdmi-stereo",
                           "previous_sink": "alsa_output.pci-0000_0c_00.1.hdmi-stereo",
@@ -229,6 +233,32 @@ for now, label, want in (
     commands.clear()
     cd.cmd_audio_restore(types.SimpleNamespace(dry_run=False))
     check(label, [c for c in commands if c[:1] == ["set-default-sink"]], want)
+# A state file whose "before" is the TV itself (a session that began with the
+# TV as the default) must not put the desk back onto the TV.
+cd._save_audio_state({"card": HDMI_CARD, "applied": True,
+                      "previous_profile": "output:hdmi-stereo",
+                      "previous_sink": "alsa_output.pci-0000_0c_00.1.hdmi-stereo-extra3",
+                      "console_sink": "alsa_output.pci-0000_0c_00.1.hdmi-stereo-extra3"})
+cd._default_sink = lambda: "alsa_output.usb-RODE_RODECaster_Duo.analog-stereo"
+commands.clear()
+cd.cmd_audio_restore(types.SimpleNamespace(dry_run=False))
+check("the TV is never what the desk is put back on",
+      [c for c in commands if c[:1] == ["set-default-sink"]], [])
+cd._default_sink = lambda: "alsa_output.pci-0000_0c_00.1.hdmi-stereo"
+
+# A session that finds the profile already on the TV still records where the
+# desktop was, or leaving it would have nothing to put back.
+cd._drop_audio_state()
+cd._default_sink = lambda: "alsa_output.usb-RODE_RODECaster_Duo.analog-stereo"
+cd.cmd_audio_route(args)
+cd._default_sink = lambda: "alsa_output.usb-HyperX_Cloud_III.analog-stereo"
+cd.cmd_audio_route(args)          # routed again later in the same session
+with open(cd.AUDIO_STATE) as fh:
+    state = json.load(fh)
+check("already on the TV, the desk's output is still remembered, and the "
+      "first one recorded wins",
+      state.get("previous_sink"), "alsa_output.usb-RODE_RODECaster_Duo.analog-stereo")
+cd._drop_audio_state()
 cd._default_sink = lambda: "alsa_output.pci-0000_0c_00.1.hdmi-stereo"
 
 print()
@@ -252,6 +282,12 @@ with tempfile.TemporaryDirectory() as proc:
           fresh_mod.in_session(23, proc_root=proc), True)
     check("Firefox at the desk is not",
           fresh_mod.in_session(30, proc_root=proc), False)
+    fake(50, 1, "/usr/bin/some-launcher")
+    with open(os.path.join(proc, "50", "environ"), "wb") as fh:
+        fh.write(b"HOME=/h\0GAMESCOPE_WAYLAND_DISPLAY=gamescope-0\0")
+    check("a session process re-parented away from gamescope is still found "
+          "by the environment gamescope gave it",
+          fresh_mod.in_session(50, proc_root=proc), True)
 
 print()
 print("sink matching:")

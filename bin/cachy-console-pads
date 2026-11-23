@@ -468,10 +468,32 @@ def _watch(kind, wait, interval, hider):
             "the controller order is left to Steam")
         return 1
     last = None
+    # Ends with the session, not only with the client. The desktop client that
+    # comes back afterwards answers on the same DevTools port -- the flag file
+    # stays -- so a watcher that outlived its session (gamescope crashing out
+    # from under the shell that would have stopped it) went on hiding every
+    # controller but player one on the desktop: a DualSense dead in desktop
+    # games, with nothing on screen to say why. Only once a session has been
+    # seen, so running it by hand outside one still works.
+    seen_session = False
+
+    def session_over():
+        nonlocal seen_session
+        if console_running():
+            seen_session = True
+            return False
+        return seen_session
+
     while True:
+        if session_over():
+            say("console mode has ended; stopping and putting controllers back")
+            page.close()
+            return 0
         try:
             force_ps_support(page)
             while True:
+                if session_over():
+                    raise CDPError("console mode ended")
                 pads = controllers(page)
                 if hider:
                     hider.tick(pads)
@@ -491,6 +513,9 @@ def _watch(kind, wait, interval, hider):
                 time.sleep(interval)
         except (OSError, CDPError, ValueError):
             page.close()
+        if session_over():
+            say("console mode has ended; stopping and putting controllers back")
+            return 0
         # The UI reloading drops the connection as well as Steam exiting;
         # only a client that stops answering altogether ends the watch.
         page = connect(RECONNECT_WAIT)
