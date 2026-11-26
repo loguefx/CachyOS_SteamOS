@@ -960,7 +960,9 @@ cachy-console compat apply 15100     # apply one now (the game must be closed)
 cachy-console compat remove 15100    # take it back out, exactly as it was
 ```
 
-A fix only goes onto the exact game build it was made for (checked by hash),
+A fix only goes onto the exact game build it was made for (checked by hash, or,
+where the patch's author publishes no hashes, by the same check the patch itself
+makes before it changes anything),
 only from downloads pinned by SHA-256, and never over a file it did not put
 there: another mod's `dinput8.dll` is reported as a conflict and left alone. A
 game must have been started once, so it has a Wine prefix for the DLL override.
@@ -968,6 +970,7 @@ game must have been started once, so it has a Wine prefix for the DLL override.
 | Game | Fix | What it changes |
 | --- | --- | --- |
 | Assassin's Creed: Director's Cut (`15100`) | [EaglePatchAC1](https://github.com/Sergeanur/EaglePatch) 1.1 with Ultimate ASI Loader 4.68 | Pad and keyboard/mouse work together, any XInput controller, hot-plug. `scripts/EaglePatchAC1.ini` in the game folder holds its options (`PS3Controls`, `SkipIntroVideos`); your edits there are kept |
+| Assassin's Creed II (`33230`) | [EaglePatchAC2](https://github.com/Sergeanur/EaglePatch) 1.1 with Ultimate ASI Loader 4.68 | The same controller fixes, plus the patch's own extras (longer draw distance, sharper shadows, the UPlay bonus items), each switchable in `scripts/EaglePatchAC2.ini`. Only for the digital UPlay or retail 1.01 build, which is what the patch supports |
 
 To tell a game problem from a session one: with the game running,
 `DISPLAY=:2 xprop -root GAMESCOPE_FOCUSED_APP` should name the game's app id

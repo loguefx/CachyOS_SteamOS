@@ -319,6 +319,84 @@ check("setting the same value twice changes nothing", again, text)
 check("the file keeps its header", text.startswith("WINE REGISTRY Version 2\n"), True)
 
 print()
+print("builds known only by the patch's own check")
+
+
+def make_pe(va, value, base=0x400000):
+    """A minimal 32-bit PE image with one section, holding `value` at `va`."""
+    import struct
+    vaddr, size, rptr = 0x1000, 0x20000, 0x400
+    data = bytearray(rptr + size)
+    data[0:2] = b"MZ"
+    struct.pack_into("<I", data, 0x3C, 0x40)
+    data[0x40:0x44] = b"PE\0\0"
+    struct.pack_into("<HH", data, 0x44, 0x14C, 1)          # machine, sections
+    struct.pack_into("<H", data, 0x44 + 16, 224)           # optional header size
+    opt = 0x58
+    struct.pack_into("<H", data, opt, 0x10B)
+    struct.pack_into("<I", data, opt + 28, base)
+    sec = opt + 224
+    struct.pack_into("<IIII", data, sec + 8, size, vaddr, size, rptr)
+    struct.pack_into("<I", data, rptr + (va - base - vaddr), value)
+    return bytes(data)
+
+
+def signature_world(files):
+    w = World(exes=())
+    for name in os.listdir(w.game):
+        os.remove(os.path.join(w.game, name))
+    for name, data in files.items():
+        with open(os.path.join(w.game, name), "wb") as fh:
+            fh.write(data)
+    fix = w.mod.FIXES["4242"]
+    del fix["exes"]
+    fix["signatures"] = [(0x414A55, 0x01CA6FC8, "digital build"),
+                         (0x4149F5, 0x01CA4FA0, "retail build")]
+    return w
+
+
+w = signature_world({"Launcher.exe": make_pe(0x414A55, 0x12345678),
+                     "TheGame.exe": make_pe(0x414A55, 0x01CA6FC8)})
+check("the exe carrying the patch's build value is found, whatever its name",
+      w.mod.matching_exes(w.fix, w.game), ["TheGame.exe"])
+check("only that exe gets the override, not the launcher next to it",
+      (w.apply(), w.override("TheGame.exe"), w.override("Launcher.exe")),
+      (0, '"native,builtin"', None))
+w.clean()
+
+w = signature_world({"TheGame.exe": make_pe(0x4149F5, 0x01CA4FA0)})
+check("either of the patch's builds counts", w.status(), "available")
+w.clean()
+
+w = signature_world({"TheGame.exe": make_pe(0x414A55, 0x01CA6FC9),
+                     "notes.txt": b"x", "Broken.exe": b"MZ not really"})
+check("one value off is an unsupported build", w.status(), "unsupported build")
+check("and nothing is installed", (w.apply(), w.exists("dinput8.dll")), (1, False))
+w.clean()
+
+w = World()
+check("a file that is not a PE image reads as nothing",
+      w.mod.read_u32_at_va(os.path.join(w.game, "Game_Dx9.exe"), 0x401376), None)
+w.clean()
+
+AC1 = os.path.expanduser("~/.local/share/Steam/steamapps/common/Assassins Creed")
+if os.path.isfile(os.path.join(AC1, "AssassinsCreed_Dx10.exe")):
+    w = World()
+    # EaglePatchAC1's DllMain: MEMCMP32(0x00401375 + 1, 0x42d6) for DX9 and
+    # MEMCMP32(0x004013DE + 1, 0x428d) for DX10 -- the reader must find those
+    # in the real executables, and not each other's.
+    rd = w.mod.read_u32_at_va
+    check("the reader finds EaglePatch's own check value in the real AC1 exes",
+          (rd(os.path.join(AC1, "AssassinsCreed_Dx9.exe"), 0x401376),
+           rd(os.path.join(AC1, "AssassinsCreed_Dx10.exe"), 0x4013DF)), (0x42d6, 0x428d))
+    check("and not the other build's",
+          (rd(os.path.join(AC1, "AssassinsCreed_Dx9.exe"), 0x4013DF) == 0x428d,
+           rd(os.path.join(AC1, "AssassinsCreed_Dx10.exe"), 0x401376) == 0x42d6), (False, False))
+    w.clean()
+else:
+    print("  (skipped: Assassin's Creed is not installed here, so the reader is not checked against it)")
+
+print()
 print("the real table")
 w = World()
 real = w.load()
@@ -326,8 +404,11 @@ w.clean()
 for appid, fix in real.FIXES.items():
     check(f"{appid}: every download is pinned by a full sha256",
           all(len(d["sha256"]) == 64 for d in fix["downloads"]), True)
-    check(f"{appid}: every exe by a full md5",
-          all(len(m) == 32 for m in fix["exes"].values()), True)
+    check(f"{appid}: gated by full exe md5s or by the patch's own build check",
+          bool(fix.get("exes") or fix.get("signatures"))
+          and all(len(m) == 32 for m in fix.get("exes", {}).values())
+          and all(isinstance(va, int) and isinstance(v, int)
+                  for va, v, _ in fix.get("signatures", [])), True)
     check(f"{appid}: downloads only from GitHub releases over https",
           all(d["url"].startswith("https://github.com/") and "/releases/download/" in d["url"]
               for d in fix["downloads"]), True)
