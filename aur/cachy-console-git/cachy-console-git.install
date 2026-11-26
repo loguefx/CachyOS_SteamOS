@@ -18,7 +18,7 @@ post_install() {
     echo "  copies so /usr is what runs."
     echo
     echo "  Some games ignore a controller because of their own input code"
-    echo "  (Assassin's Creed). Console mode applies the known fixes for"
+    echo "  (Assassin's Creed I and II). Console mode applies the known fixes for"
     echo "  installed games when it starts; see them with:"
     echo
     echo "    cachy-console compat"
@@ -38,7 +38,7 @@ post_remove() {
     echo
     echo "  Config is left in ~/.config/cachy-console. Remove it if you want."
     echo "  Steam library tiles (Discord, Spotify) are yours to delete."
-    echo "  Game fixes from cachy-console compat (Assassin's Creed's EaglePatch)"
+    echo "  Game fixes from cachy-console compat (EaglePatch in Assassin's Creed I and II)"
     echo "  stay in those games' folders so they keep working with a controller."
     echo "  To take one out, run before removing: cachy-console compat remove APPID"
     echo
