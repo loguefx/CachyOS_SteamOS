@@ -14,6 +14,7 @@
 #   cachy-console displays     list displays, their modes and gamescope indices
 #   cachy-console controllers  list gamepads and the ones console mode hides
 #   cachy-console hide-controllers  hide those from games too (asks for your password)
+#   cachy-console compat       games with a known controller fix, and whether it is in
 #   cachy-console shortcut     add Discord / Spotify (or another couch tile)
 #   cachy-console first-run    enable services, pick a display, queue couch tiles
 #   cachy-console restart-steam  bring the desktop Steam client back
@@ -54,6 +55,7 @@ CFG_PRIMARY_CONTROLLER=steam
 CFG_PRIMARY_ONLY=on
 CFG_STEAM_PAD_AS_XBOX=on
 CFG_SHARE_DESK=on
+CFG_GAME_FIXES=on
 CFG_EXTRA_GAMESCOPE_ARGS=""
 
 DRY_RUN=0
@@ -127,7 +129,7 @@ load_config() {
         value="${value%\"}"; value="${value#\"}"
         value="${value%\'}"; value="${value#\'}"
         case "$key" in
-            DISPLAY|DISPLAY_MODEL|RESOLUTION|REFRESH|HDR|VRR|TRACKPAD_FIX|GRAB_CURSOR|RESTART_STEAM|EXTRA_GAMESCOPE_ARGS|AUDIO_DEVICE|AUDIO_INPUT_DEVICE|IGNORE_CONTROLLERS|PRIMARY_CONTROLLER|PRIMARY_ONLY|STEAM_PAD_AS_XBOX|SHARE_DESK)
+            DISPLAY|DISPLAY_MODEL|RESOLUTION|REFRESH|HDR|VRR|TRACKPAD_FIX|GRAB_CURSOR|RESTART_STEAM|EXTRA_GAMESCOPE_ARGS|AUDIO_DEVICE|AUDIO_INPUT_DEVICE|IGNORE_CONTROLLERS|PRIMARY_CONTROLLER|PRIMARY_ONLY|STEAM_PAD_AS_XBOX|SHARE_DESK|GAME_FIXES)
                 printf -v "CFG_$key" '%s' "$value" ;;
             STEAM_BUTTON|GUIDE_PRIMARY_ONLY|AUDIO_FOCUS|AUDIO_NEVER_MUTE|AUDIO_PIN_VOICE|MOUSE_LAYOUT_APPS) ;;   # read by the services, not by us
             "") ;;
@@ -665,6 +667,7 @@ steam_in_session() {
     fi
     local pads_pid=""
     pads_pid="$(start_player_one)"
+    start_game_fixes
     local status=0
     if [[ -n "${CACHY_CONSOLE_PRELOAD:-}" ]]; then
         env -u CACHY_CONSOLE_PRELOAD \
@@ -675,6 +678,29 @@ steam_in_session() {
     fi
     [[ -n "$pads_pid" ]] && kill "$pads_pid" 2>/dev/null
     close_leftovers "$status"
+}
+
+# ---- game fixes -----------------------------------------------------------
+
+# Some games ignore a controller console mode hands them because of their own
+# input code, not anything in the session -- Assassin's Creed reads only the
+# device picked in its Controls menu, and starts on the keyboard. The compat
+# helper knows those games and the patch for each, and puts them in here, in
+# the gap before the session's client starts, when no game can be running.
+# In the background: a download must never hold up console mode, and a game
+# whose patch is not in yet when it is launched gets it next session.
+compat_helper() {
+    local helper
+    helper="$(dirname -- "$SELF")/$NAME-compat"
+    [[ -x "$helper" ]] && printf '%s\n' "$helper"
+}
+
+start_game_fixes() {
+    is_on "$CFG_GAME_FIXES" || return 0
+    local helper
+    helper="$(compat_helper)" || return 0
+    "$helper" apply --all </dev/null >&2 9>&- &
+    disown 2>/dev/null || true
 }
 
 # ---- player one -----------------------------------------------------------
@@ -860,6 +886,7 @@ It will not choose a screen for you."
         say "  hide other controllers: ${CFG_PRIMARY_ONLY:-off}"
         say "  Steam's pad as an Xbox 360 pad in games: ${CFG_STEAM_PAD_AS_XBOX:-off}"
         say "  desk keeps its mouse and keyboard: ${CFG_SHARE_DESK:-off}"
+        say "  known game fixes applied at start: ${CFG_GAME_FIXES:-off}"
         return 0
     fi
 
@@ -1118,6 +1145,13 @@ STEAM_PAD_AS_XBOX=$CFG_STEAM_PAD_AS_XBOX
 # stay at the desk while the controller and its trackpad drive the session.
 # Off lets a keyboard and mouse at the desk be used in the session. KDE only.
 SHARE_DESK=$CFG_SHARE_DESK
+
+# Apply known per-game controller fixes when console mode starts, to installed
+# games whose own input code ignores a controller console mode hands them
+# (Assassin's Creed: EaglePatch). Only the exact game builds each patch was made
+# for, from downloads checked against a pinned hash, and never over a file
+# something else put there. See them with: cachy-console compat
+GAME_FIXES=$CFG_GAME_FIXES
 
 # Extra arguments passed straight to gamescope, for anything not covered above.
 # For example: EXTRA_GAMESCOPE_ARGS=--mangoapp
@@ -1529,6 +1563,27 @@ status() {
         warnings=$(( warnings + 1 ))
     fi
 
+    local compat
+    if compat="$(compat_helper)"; then
+        say
+        say "== game fixes =="
+        say "  apply at start: ${CFG_GAME_FIXES:-off}"
+        local pending
+        pending="$("$compat" list --pending 2>/dev/null || true)"
+        if [[ -n "$pending" ]]; then
+            printf '%s\n' "$pending" | sed 's/^ */  /'
+            if is_on "$CFG_GAME_FIXES"; then
+                say "  (pending fixes go in when console mode next starts, or now with: $NAME compat apply --all)"
+            else
+                warn "GAME_FIXES is off, so these games keep ignoring the controller."
+                warn "Apply them with: $NAME compat apply --all"
+                warnings=$(( warnings + 1 ))
+            fi
+        else
+            say "  nothing pending"
+        fi
+    fi
+
     say
     say "== two people at once =="
     status_sharing || warnings=$(( warnings + $? ))
@@ -1628,7 +1683,7 @@ ARGS=()
 while (( $# )); do
     case "$1" in
         -h|--help|help)     usage ;;
-        start|setup|settings|status|check|displays|controllers|hide-controllers|exit|stop|shortcut|first-run|restart-steam|steam-in-session)
+        start|setup|settings|status|check|displays|controllers|hide-controllers|compat|exit|stop|shortcut|first-run|restart-steam|steam-in-session)
                             COMMAND="$1" ;;
         --display)          DISPLAY_OVERRIDE="${2-}"; shift ;;
         --display=*)        DISPLAY_OVERRIDE="${1#*=}" ;;
@@ -1650,6 +1705,7 @@ case "$COMMAND" in
     displays)   "$HELPER_DISPLAY" list ;;
     controllers) "$HELPER_DISPLAY" controllers ;;
     hide-controllers) hide_controllers ;;
+    compat)     exec "$(find_helper "$NAME-compat")" "${ARGS[@]+"${ARGS[@]}"}" ;;
     exit|stop)  exec "$(find_helper "$NAME-exit")" ;;
     shortcut)   exec "$(find_helper "$NAME-shortcut")" "${ARGS[@]+"${ARGS[@]}"}" ;;
     first-run)  first_run ;;
