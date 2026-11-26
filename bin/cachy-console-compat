@@ -1,0 +1,623 @@
+#!/usr/bin/env python3
+"""Known per-game controller fixes, applied to installed Steam games.
+
+Console mode gets the controller to a game the same way for every title: Steam
+Input's virtual pad, shown to Proton games as an Xbox 360 pad. That reaches
+almost everything. What it cannot reach is a game whose own input code refuses
+a pad that is plainly there -- Assassin's Creed (2008) reads exactly one device,
+the one chosen in its Controls menu, starts on the keyboard, and polls and
+throws away the pad until someone finds that menu. No session setting fixes
+that; a patch to the game does.
+
+Each fix here is one such game and the community patch for it. A fix is only
+ever applied:
+  - to the exact executables it was made for, checked by hash, so a different
+    build of the game is left alone rather than crashed;
+  - from downloads pinned by SHA-256, so what lands in the game folder is what
+    was checked when the fix was added here;
+  - where it would not overwrite a file this did not put there, so another mod
+    is never clobbered;
+  - while the game is not running, because its Wine prefix's registry is only
+    safe to write with nothing holding it.
+Everything it adds is recorded, and `remove` takes exactly that back out.
+
+    cachy-console-compat [list]            installed games with a known fix
+    cachy-console-compat apply APPID...    apply the fix for these games
+    cachy-console-compat apply --all       every installed game with a fix
+    cachy-console-compat remove APPID...   take a fix back out
+"""
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+import time
+import urllib.request
+import zipfile
+
+STEAM_ROOT = os.environ.get("CACHY_CONSOLE_STEAM_ROOT") or os.path.expanduser(
+    "~/.local/share/Steam")
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME")
+                     or os.path.expanduser("~/.local/state"), "cachy-console", "compat")
+CACHE = os.environ.get("CACHY_CONSOLE_COMPAT_CACHE") or os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+    "cachy-console", "compat")
+PROC = os.environ.get("CACHY_CONSOLE_PROC", "/proc")
+DOWNLOAD_TIMEOUT = float(os.environ.get("CACHY_CONSOLE_COMPAT_TIMEOUT", "30"))
+
+ULTIMATE_ASI_LOADER = {
+    "url": "https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases/download/"
+           "v4.68/Ultimate-ASI-Loader.zip",
+    "sha256": "7517c7d5bd8c475f18e6545b7998df379eed6e2e0a19fcd2139669152f9bcddb",
+    "files": {"dinput8.dll": "dinput8.dll"},
+}
+
+# appid -> fix. `exes` are the executables the patch was built for, by MD5 as
+# its author publishes them; only the ones present and matching get the DLL
+# override, and with none matching the fix is not applied at all. `files` maps
+# a zip member to where it goes in the game folder. `settings` files are the
+# patch's own ini: the player may edit them, so they are neither a conflict to
+# re-apply over nor deleted on remove once changed.
+FIXES = {
+    "15100": {
+        "id": "eaglepatch-ac1",
+        "name": "Assassin's Creed: Director's Cut",
+        "patch": "EaglePatchAC1 1.1",
+        "why": "reads only the input device picked in its Controls menu and "
+               "starts on the keyboard, so the controller does nothing; the "
+               "patch reads the pad and keyboard together and takes any "
+               "XInput controller, hot-plugged too",
+        "exes": {
+            "AssassinsCreed_Dx9.exe": "8e72c3333743780e43bc2c34bbf625f9",
+            "AssassinsCreed_Dx10.exe": "ca87753255e2d14b1f18bb737c643792",
+        },
+        "downloads": [
+            {
+                "url": "https://github.com/Sergeanur/EaglePatch/releases/download/"
+                       "v1.1/EaglePatchAC1.zip",
+                "sha256": "6dc496ac6b298b92fb70c3f90a34e323f77ac88e6ea97544f84e52435038aeea",
+                "files": {"EaglePatchAC1.asi": "scripts/EaglePatchAC1.asi",
+                          "EaglePatchAC1.ini": "scripts/EaglePatchAC1.ini"},
+            },
+            ULTIMATE_ASI_LOADER,
+        ],
+        "settings": ["scripts/EaglePatchAC1.ini"],
+        "dll_overrides": {"dinput8": "native,builtin"},
+    },
+}
+
+APPLIED = "applied"
+AVAILABLE = "available"
+NOT_INSTALLED = "not installed"
+UNSUPPORTED = "unsupported build"
+NEEDS_FIRST_RUN = "run it once first"
+CONFLICT = "conflict"
+
+
+def say(msg):
+    print(f"cachy-console-compat: {msg}", flush=True)
+
+
+class FixError(Exception):
+    pass
+
+
+# ---- Steam library ----------------------------------------------------------
+
+def _vdf_paths(text):
+    return re.findall(r'"path"\s+"((?:[^"\\]|\\.)*)"', text)
+
+
+def libraries():
+    """Every Steam library folder, the main one first."""
+    found = [STEAM_ROOT]
+    vdf = os.path.join(STEAM_ROOT, "steamapps", "libraryfolders.vdf")
+    try:
+        with open(vdf, encoding="utf-8", errors="replace") as fh:
+            for path in _vdf_paths(fh.read()):
+                path = path.replace("\\\\", "\\")
+                if os.path.realpath(path) not in map(os.path.realpath, found):
+                    found.append(path)
+    except OSError:
+        pass
+    return found
+
+
+def find_game(appid):
+    """(game folder, Wine prefix or None) for an installed app, or None."""
+    for lib in libraries():
+        acf = os.path.join(lib, "steamapps", f"appmanifest_{appid}.acf")
+        try:
+            with open(acf, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        m = re.search(r'"installdir"\s+"([^"]+)"', text)
+        if not m:
+            continue
+        game = os.path.join(lib, "steamapps", "common", m.group(1))
+        if not os.path.isdir(game):
+            continue
+        pfx = os.path.join(lib, "steamapps", "compatdata", appid, "pfx")
+        return game, (pfx if os.path.isfile(os.path.join(pfx, "user.reg")) else None)
+    return None
+
+
+def _digest(path, algo):
+    h = hashlib.new(algo)
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def sha256_file(path):
+    return _digest(path, "sha256")
+
+
+def matching_exes(fix, game):
+    """The executables in the folder that are the exact build the patch is for."""
+    out = []
+    for exe, md5 in fix["exes"].items():
+        path = os.path.join(game, exe)
+        try:
+            if _digest(path, "md5") == md5:
+                out.append(exe)
+        except OSError:
+            continue
+    return out
+
+
+def game_running(appid, pfx):
+    """Anything Steam launched for this app, or anything inside its prefix."""
+    try:
+        pids = [p for p in os.listdir(PROC) if p.isdigit()]
+    except OSError:
+        return False
+    marker = f"AppId={appid}".encode()
+    want = os.path.realpath(pfx).encode() if pfx else None
+    for pid in pids:
+        try:
+            with open(os.path.join(PROC, pid, "cmdline"), "rb") as fh:
+                if marker in fh.read().split(b"\0"):
+                    return True
+        except OSError:
+            continue
+        if want is None:
+            continue
+        try:
+            with open(os.path.join(PROC, pid, "environ"), "rb") as fh:
+                for var in fh.read().split(b"\0"):
+                    if var.startswith(b"WINEPREFIX=") and \
+                            os.path.realpath(var[11:].decode(errors="replace")).encode() == want:
+                        return True
+        except OSError:
+            continue
+    return False
+
+
+# ---- downloads --------------------------------------------------------------
+
+def fetch(download):
+    """The download's bytes, from the cache or the network, checked by SHA-256."""
+    os.makedirs(CACHE, exist_ok=True)
+    cached = os.path.join(CACHE, download["sha256"] + ".zip")
+    if os.path.isfile(cached) and sha256_file(cached) == download["sha256"]:
+        with open(cached, "rb") as fh:
+            return fh.read()
+    req = urllib.request.Request(download["url"],
+                                 headers={"User-Agent": "cachy-console-compat"})
+    try:
+        with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT) as resp:
+            data = resp.read()
+    except Exception as exc:  # noqa: BLE001 -- any network failure is the same here
+        raise FixError(f"could not download {download['url']}: {exc}") from exc
+    got = hashlib.sha256(data).hexdigest()
+    if got != download["sha256"]:
+        raise FixError(f"{download['url']} is not the file this fix was checked "
+                       f"against (sha256 {got}); nothing installed")
+    fd, tmp = tempfile.mkstemp(dir=CACHE)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+    os.replace(tmp, cached)
+    return data
+
+
+def payload(fix):
+    """{relative destination: bytes} for every file the fix puts in the game."""
+    out = {}
+    for download in fix["downloads"]:
+        data = fetch(download)
+        try:
+            archive = zipfile.ZipFile(io.BytesIO(data))
+            for member, dest in download["files"].items():
+                out[dest] = archive.read(member)
+        except (zipfile.BadZipFile, KeyError) as exc:
+            raise FixError(f"{download['url']}: {exc}") from exc
+    return out
+
+
+# ---- Wine registry ----------------------------------------------------------
+
+def _section_name(exe):
+    return f"Software\\\\Wine\\\\AppDefaults\\\\{exe}\\\\DllOverrides"
+
+
+def _find_section(lines, exe):
+    head = "[" + _section_name(exe).lower() + "]"
+    for i, line in enumerate(lines):
+        if line.lower().startswith(head):
+            end = i + 1
+            while end < len(lines) and not lines[end].startswith("["):
+                end += 1
+            return i, end
+    return None
+
+
+def _value_re(name):
+    return re.compile(r'^"' + re.escape(name) + r'"=(.*)$', re.IGNORECASE)
+
+
+def read_override(reg_text, exe, dll):
+    lines = reg_text.split("\n")
+    sec = _find_section(lines, exe)
+    if not sec:
+        return None
+    pat = _value_re(dll)
+    for line in lines[sec[0] + 1:sec[1]]:
+        m = pat.match(line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def set_override(reg_text, exe, dll, raw):
+    """The registry text with `"dll"=raw` under the exe's DllOverrides, or with
+    it taken out when raw is None. `raw` is the value as the file stores it,
+    quotes included, so a previous value goes back exactly as it was."""
+    lines = reg_text.split("\n")
+    sec = _find_section(lines, exe)
+    pat = _value_re(dll)
+    if sec:
+        start, end = sec
+        for i in range(start + 1, end):
+            if pat.match(lines[i]):
+                if raw is None:
+                    del lines[i]
+                else:
+                    lines[i] = f'"{dll}"={raw}'
+                return "\n".join(lines)
+        if raw is None:
+            return reg_text
+        at = start + 1
+        while at < end and lines[at].startswith("#"):
+            at += 1
+        lines.insert(at, f'"{dll}"={raw}')
+        return "\n".join(lines)
+    if raw is None:
+        return reg_text
+    text = reg_text.rstrip("\n") + "\n\n"
+    text += f"[{_section_name(exe)}] {int(time.time())}\n"
+    text += f'"{dll}"={raw}\n'
+    return text
+
+
+def write_registry(pfx, text):
+    reg = os.path.join(pfx, "user.reg")
+    backup = reg + ".before-cachy-console-compat"
+    if not os.path.exists(backup):
+        shutil.copy2(reg, backup)
+    fd, tmp = tempfile.mkstemp(dir=pfx, prefix=".user.reg.")
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+        fh.write(text)
+    shutil.copymode(reg, tmp)
+    os.replace(tmp, reg)
+
+
+def read_registry(pfx):
+    with open(os.path.join(pfx, "user.reg"), encoding="utf-8", errors="surrogateescape",
+              newline="") as fh:
+        return fh.read()
+
+
+# ---- state ------------------------------------------------------------------
+
+def manifest_path(fix):
+    return os.path.join(STATE, fix["id"] + ".json")
+
+
+def load_manifest(fix):
+    try:
+        with open(manifest_path(fix), encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def save_manifest(fix, data):
+    os.makedirs(STATE, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=STATE)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    os.replace(tmp, manifest_path(fix))
+
+
+def expected_hashes(fix):
+    """sha256 of each file the fix installs, from the manifest of the last
+    apply. Without one, nothing is known to be ours."""
+    man = load_manifest(fix) or {}
+    return man.get("files", {})
+
+
+# ---- status -----------------------------------------------------------------
+
+def status(appid, fix):
+    """(state, detail) for one fix."""
+    found = find_game(appid)
+    if not found:
+        return NOT_INSTALLED, ""
+    game, pfx = found
+    exes = matching_exes(fix, game)
+    if not exes:
+        return UNSUPPORTED, ("the patch is for a different build of "
+                             + ", ".join(fix["exes"]))
+    ours = expected_hashes(fix)
+    settings = set(fix.get("settings", []))
+    dests = [d for dl in fix["downloads"] for d in dl["files"].values()]
+    missing, foreign = [], []
+    for dest in dests:
+        path = os.path.join(game, dest)
+        if not os.path.exists(path):
+            missing.append(dest)
+        elif dest not in settings and sha256_file(path) != ours.get(dest):
+            foreign.append(dest)
+    overrides_ok = pfx is not None and all(
+        read_override(read_registry(pfx), exe, dll) == f'"{val}"'
+        for exe in exes for dll, val in fix["dll_overrides"].items())
+    if not missing and not foreign and overrides_ok:
+        return APPLIED, ""
+    if foreign and ours:
+        # Ours once, changed since: a game update or another mod. Not ours now.
+        return CONFLICT, "changed since it was applied: " + ", ".join(foreign)
+    if foreign and not ours:
+        # Not installed by us. Same bytes as the fix's own files counts as the
+        # player having installed the patch by hand, which apply adopts.
+        if not _all_match_payload_hint(fix, game, foreign):
+            return CONFLICT, ("already in the game folder from something else: "
+                              + ", ".join(foreign))
+    if pfx is None:
+        return NEEDS_FIRST_RUN, "no Wine prefix yet; start the game once, then this applies"
+    return AVAILABLE, ""
+
+
+def _all_match_payload_hint(fix, game, dests):
+    """Whether files already in place are byte-for-byte the fix's own, judged
+    from the cached downloads only -- status never goes to the network."""
+    for download in fix["downloads"]:
+        cached = os.path.join(CACHE, download["sha256"] + ".zip")
+        if not os.path.isfile(cached):
+            continue
+        try:
+            archive = zipfile.ZipFile(cached)
+        except zipfile.BadZipFile:
+            continue
+        for member, dest in download["files"].items():
+            if dest in dests:
+                try:
+                    want = hashlib.sha256(archive.read(member)).hexdigest()
+                except KeyError:
+                    return False
+                if sha256_file(os.path.join(game, dest)) != want:
+                    return False
+                dests = [d for d in dests if d != dest]
+    return not dests
+
+
+# ---- apply / remove ---------------------------------------------------------
+
+def apply(appid, fix):
+    found = find_game(appid)
+    if not found:
+        raise FixError(f"{fix['name']} is not installed")
+    game, pfx = found
+    exes = matching_exes(fix, game)
+    if not exes:
+        raise FixError(f"{fix['name']}: not the build {fix['patch']} supports; left alone")
+    if pfx is None:
+        raise FixError(f"{fix['name']}: no Wine prefix yet; start the game once first")
+    if game_running(appid, pfx):
+        raise FixError(f"{fix['name']} is running; close it and try again")
+
+    files = payload(fix)
+    ours = expected_hashes(fix)
+    settings = set(fix.get("settings", []))
+
+    # Every check before the first write, so a conflict leaves nothing half done.
+    plan = {}
+    for dest, data in files.items():
+        path = os.path.join(game, dest)
+        want = hashlib.sha256(data).hexdigest()
+        if os.path.exists(path):
+            have = sha256_file(path)
+            if have == want:
+                continue
+            if dest in settings:
+                continue        # the player's own settings
+            if ours.get(dest) != have:
+                raise FixError(f"{fix['name']}: {dest} is already there and is not "
+                               f"from this fix; left alone so nothing else breaks")
+        plan[dest] = data
+
+    for dest, data in plan.items():
+        path = os.path.join(game, dest)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".cachy-console-")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+
+    man = load_manifest(fix) or {}
+    previous = man.get("previous_overrides", {})
+    text = read_registry(pfx)
+    original = text
+    for exe in exes:
+        for dll, val in fix["dll_overrides"].items():
+            key = f"{exe}/{dll}"
+            current = read_override(text, exe, dll)
+            if key not in previous:
+                previous[key] = current
+            text = set_override(text, exe, dll, f'"{val}"')
+    if text != original:
+        write_registry(pfx, text)
+
+    save_manifest(fix, {
+        "appid": appid,
+        "game": game,
+        "prefix": pfx,
+        "patch": fix["patch"],
+        "files": {dest: hashlib.sha256(data).hexdigest() for dest, data in files.items()},
+        "previous_overrides": previous,
+        "applied": int(time.time()),
+    })
+    return game
+
+
+def remove(appid, fix):
+    man = load_manifest(fix)
+    if not man:
+        raise FixError(f"{fix['name']}: not applied by cachy-console")
+    game, pfx = man["game"], man.get("prefix")
+    if game_running(appid, pfx):
+        raise FixError(f"{fix['name']} is running; close it and try again")
+    kept = []
+    settings = set(fix.get("settings", []))
+    for dest, digest in man.get("files", {}).items():
+        path = os.path.join(game, dest)
+        if not os.path.exists(path):
+            continue
+        if sha256_file(path) != digest:
+            kept.append(dest)
+            continue
+        os.remove(path)
+    for dest in sorted({os.path.dirname(d) for d in man.get("files", {}) if os.path.dirname(d)},
+                       key=len, reverse=True):
+        try:
+            os.rmdir(os.path.join(game, dest))
+        except OSError:
+            pass
+    if pfx and os.path.isfile(os.path.join(pfx, "user.reg")):
+        text = read_registry(pfx)
+        original = text
+        for key, raw in man.get("previous_overrides", {}).items():
+            exe, dll = key.split("/", 1)
+            text = set_override(text, exe, dll, raw)
+        if text != original:
+            write_registry(pfx, text)
+    os.remove(manifest_path(fix))
+    for dest in kept:
+        if dest in settings:
+            say(f"kept {dest}: you changed it")
+        else:
+            say(f"kept {dest}: it changed after the fix put it there")
+    return game
+
+
+# ---- main -------------------------------------------------------------------
+
+def cmd_list(args):
+    shown = 0
+    for appid, fix in FIXES.items():
+        state, detail = status(appid, fix)
+        if state == NOT_INSTALLED and not args.all:
+            continue
+        if args.pending and state not in (AVAILABLE, NEEDS_FIRST_RUN, CONFLICT):
+            continue
+        shown += 1
+        print(f"{appid:>8}  {fix['name']}: {state}" + (f" ({detail})" if detail else ""))
+        if args.verbose:
+            print(f"          {fix['patch']} -- {fix['why']}")
+    if not shown and not args.pending:
+        print("No installed game needs a fix this knows of.")
+    return 0
+
+
+def cmd_apply(args):
+    targets = list(FIXES) if args.all else args.appid
+    if not targets:
+        say("name a game's app id, or --all")
+        return 2
+    failed = 0
+    for appid in targets:
+        fix = FIXES.get(appid)
+        if not fix:
+            say(f"no known fix for app {appid}")
+            failed += 1
+            continue
+        state, detail = status(appid, fix)
+        if args.all and state in (NOT_INSTALLED, UNSUPPORTED, APPLIED, NEEDS_FIRST_RUN):
+            continue
+        if state == APPLIED:
+            say(f"{fix['name']}: already applied")
+            continue
+        try:
+            game = apply(appid, fix)
+        except FixError as exc:
+            say(str(exc))
+            failed += 1
+            continue
+        except OSError as exc:
+            say(f"{fix['name']}: {exc}")
+            failed += 1
+            continue
+        say(f"{fix['name']}: applied {fix['patch']} in {game}")
+    return 1 if failed else 0
+
+
+def cmd_remove(args):
+    failed = 0
+    for appid in args.appid:
+        fix = FIXES.get(appid)
+        if not fix:
+            say(f"no known fix for app {appid}")
+            failed += 1
+            continue
+        try:
+            game = remove(appid, fix)
+        except (FixError, OSError) as exc:
+            say(str(exc))
+            failed += 1
+            continue
+        say(f"{fix['name']}: removed {fix['patch']} from {game}")
+    return 1 if failed else 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="cachy-console-compat",
+                                     description="Known per-game controller fixes.")
+    sub = parser.add_subparsers(dest="cmd")
+    p = sub.add_parser("list")
+    p.add_argument("--all", action="store_true", help="include games not installed")
+    p.add_argument("--pending", action="store_true", help="only fixes not yet applied")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.set_defaults(func=cmd_list)
+    p = sub.add_parser("apply")
+    p.add_argument("appid", nargs="*")
+    p.add_argument("--all", action="store_true")
+    p.set_defaults(func=cmd_apply)
+    p = sub.add_parser("remove")
+    p.add_argument("appid", nargs="+")
+    p.set_defaults(func=cmd_remove)
+    args = parser.parse_args(argv)
+    if not args.cmd:
+        args = parser.parse_args(["list", "-v"] + (argv or []))
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

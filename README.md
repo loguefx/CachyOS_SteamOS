@@ -437,6 +437,7 @@ VRR and HDR; they leave `AUDIO_NEVER_MUTE` and the rest as you set them.
 | `PRIMARY_CONTROLLER` | `steam` | Which controller is player one when several are connected: `steam`, `playstation`, `xbox`, `switch`, or `off` for Steam's own order. Also in Cachy Console |
 | `PRIMARY_ONLY` | `on` | Hide every other controller while that one is connected, so Big Picture and games only see player one. Off for local multiplayer. Needs the USB helper `./install.sh` can grant |
 | `STEAM_PAD_AS_XBOX` | `on` | Show games Steam's controller as an Xbox 360 pad (`045e:028e`) instead of Steam's own virtual pad (`28de:11ff`), which older games that only accept pads they know refuse — Dead Rising 2 among them. Off only for a game that needs to see the real Steam pad |
+| `GAME_FIXES` | `on` | Apply known per-game controller fixes when console mode starts, for installed games whose own input code ignores the controller (Assassin's Creed: EaglePatch). See them with `cachy-console compat` |
 | `EXTRA_GAMESCOPE_ARGS` | empty | Passed straight through, e.g. `--mangoapp` |
 
 ## How it works
@@ -896,6 +897,35 @@ PROTON_SPOOF_STEAMINPUT_VIDPID=1 %command%
 What a game loses by it is the real pad's identity: an SDL game running under
 Proton shows Xbox button prompts rather than PlayStation ones for a DualSense
 going through Steam Input.
+
+**A game sees the controller but does nothing with it.** Some games read only
+one input device, picked in their own options, and start on the keyboard.
+Assassin's Creed (2008) is one: it finds the pad, then polls it and throws the
+input away until the player finds *Options > Controls*. Nothing in the session
+can change that, so console mode carries a short list of games like this and
+the community patch for each, and puts it in when console mode starts
+(`GAME_FIXES=on`):
+
+```bash
+cachy-console compat                 # installed games with a known fix, and its state
+cachy-console compat apply 15100     # apply one now (the game must be closed)
+cachy-console compat remove 15100    # take it back out, exactly as it was
+```
+
+A fix only goes onto the exact game build it was made for (checked by hash),
+only from downloads pinned by SHA-256, and never over a file it did not put
+there: another mod's `dinput8.dll` is reported as a conflict and left alone. A
+game must have been started once, so it has a Wine prefix for the DLL override.
+
+| Game | Fix | What it changes |
+| --- | --- | --- |
+| Assassin's Creed: Director's Cut (`15100`) | [EaglePatchAC1](https://github.com/Sergeanur/EaglePatch) 1.1 with Ultimate ASI Loader 4.68 | Pad and keyboard/mouse work together, any XInput controller, hot-plug. `scripts/EaglePatchAC1.ini` in the game folder holds its options (`PS3Controls`, `SkipIntroVideos`); your edits there are kept |
+
+To tell a game problem from a session one: with the game running,
+`DISPLAY=:2 xprop -root GAMESCOPE_FOCUSED_APP` should name the game's app id
+(not `769`, Big Picture), and Steam's `logs/controller.txt` should show
+`Queueing activation for controller: 1 app: <its id>`. If both do, the pad is
+reaching the game and it is the game's own input that needs a fix.
 
 **The cursor works in Big Picture but stops in Discord.** That is Discord's
 controller layout, not the cursor: with none chosen it is a gamepad layout.

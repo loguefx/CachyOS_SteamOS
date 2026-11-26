@@ -35,7 +35,7 @@ for tool in cachy-console cachy-console-display cachy-console-watch \
             cachy-console-audio cachy-console-exit cachy-console-shortcut \
             cachy-console-app cachy-console-art cachy-console-settings \
             cachy-console-session cachy-console-pads \
-            cachy-console-prompt; do
+            cachy-console-prompt cachy-console-compat; do
     if [[ -e "$BIN_DIR/$tool" ]]; then
         rm -f "$BIN_DIR/$tool"
         say "  removed $tool"
@@ -82,6 +82,9 @@ say "  - the udev rule from cachy-console hide-controllers, if you ran it. Empty
 say "    IGNORE_CONTROLLERS and run it again before uninstalling, or afterwards:"
 say "      sudo rm /etc/udev/rules.d/70-cachy-console-hide-controllers.rules"
 say "    and unplug the device once to get its gamepad back."
+say "  - game fixes from cachy-console compat (Assassin's Creed's EaglePatch),"
+say "    which keep those games working with a controller. To take them out too,"
+say "    before uninstalling: cachy-console compat remove APPID"
 say "  - Steam's DevTools port, turned on for the player-one setting. If nothing"
 say "    else uses it (Decky Loader does), turn it off and restart Steam:"
 say "      rm ~/.local/share/Steam/.cef-enable-remote-debugging"
