@@ -11,8 +11,9 @@ that; a patch to the game does.
 
 Each fix here is one such game and the community patch for it. A fix is only
 ever applied:
-  - to the exact executables it was made for, checked by hash, so a different
-    build of the game is left alone rather than crashed;
+  - to the exact executables it was made for, checked by hash -- or, where the
+    patch's author publishes none, by the same build check the patch makes
+    itself -- so a different build of the game is left alone rather than crashed;
   - from downloads pinned by SHA-256, so what lands in the game folder is what
     was checked when the fix was added here;
   - where it would not overwrite a file this did not put there, so another mod
@@ -34,6 +35,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import sys
 import tempfile
 import time
@@ -58,8 +60,11 @@ ULTIMATE_ASI_LOADER = {
 }
 
 # appid -> fix. `exes` are the executables the patch was built for, by MD5 as
-# its author publishes them; only the ones present and matching get the DLL
-# override, and with none matching the fix is not applied at all. `files` maps
+# its author publishes them. Where the author publishes no hashes, `signatures`
+# are the patch's own build check instead -- the 32-bit value it compares at a
+# fixed address before it touches anything -- run here against every .exe in the
+# game folder. Only the executables that match get the DLL override, and with
+# none matching the fix is not applied at all. `files` maps
 # a zip member to where it goes in the game folder. `settings` files are the
 # patch's own ini: the player may edit them, so they are neither a conflict to
 # re-apply over nor deleted on remove once changed.
@@ -87,6 +92,34 @@ FIXES = {
             ULTIMATE_ASI_LOADER,
         ],
         "settings": ["scripts/EaglePatchAC1.ini"],
+        "dll_overrides": {"dinput8": "native,builtin"},
+    },
+    "33230": {
+        "id": "eaglepatch-ac2",
+        "name": "Assassin's Creed II",
+        "patch": "EaglePatchAC2 1.1",
+        "why": "the same engine as the first game: it reads only the input "
+               "device picked in its Controls menu and starts on the keyboard; "
+               "the patch reads the pad and keyboard together and takes any "
+               "XInput controller, hot-plugged too",
+        # EaglePatchAC2's DllMain: MEMCMP32(0x00414A54 + 1, 0x01CA6FC8) for the
+        # digital UPlay build, MEMCMP32(0x004149F4 + 1, 0x01CA4FA0) for retail
+        # 1.01. Its author lists no exe hashes, so this is the check it trusts.
+        "signatures": [
+            (0x00414A55, 0x01CA6FC8, "digital UPlay build"),
+            (0x004149F5, 0x01CA4FA0, "retail 1.01"),
+        ],
+        "downloads": [
+            {
+                "url": "https://github.com/Sergeanur/EaglePatch/releases/download/"
+                       "v1.1/EaglePatchAC2.zip",
+                "sha256": "4d60fe65bd1a5859155a05284d52703788ea3d036b9f9300487f80b0bbec3266",
+                "files": {"EaglePatchAC2.asi": "scripts/EaglePatchAC2.asi",
+                          "EaglePatchAC2.ini": "scripts/EaglePatchAC2.ini"},
+            },
+            ULTIMATE_ASI_LOADER,
+        ],
+        "settings": ["scripts/EaglePatchAC2.ini"],
         "dll_overrides": {"dinput8": "native,builtin"},
     },
 }
@@ -160,17 +193,72 @@ def sha256_file(path):
     return _digest(path, "sha256")
 
 
+def read_u32_at_va(path, va):
+    """The little-endian 32-bit value a 32-bit PE image holds at virtual
+    address `va` once loaded, read from the file, or None when the file is not
+    such an image or the address is not backed by file data."""
+    try:
+        with open(path, "rb") as fh:
+            dos = fh.read(64)
+            if len(dos) < 64 or dos[:2] != b"MZ":
+                return None
+            fh.seek(struct.unpack_from("<I", dos, 0x3C)[0])
+            coff = fh.read(24)
+            if len(coff) < 24 or coff[:4] != b"PE\0\0":
+                return None
+            nsec, = struct.unpack_from("<H", coff, 6)
+            optsz, = struct.unpack_from("<H", coff, 20)
+            opt = fh.read(optsz)
+            if len(opt) < 32 or struct.unpack_from("<H", opt, 0)[0] != 0x10B:
+                return None
+            rva = va - struct.unpack_from("<I", opt, 28)[0]
+            for _ in range(nsec):
+                sec = fh.read(40)
+                if len(sec) < 40:
+                    return None
+                vsize, vaddr, rsize, rptr = struct.unpack_from("<IIII", sec, 8)
+                if vaddr <= rva and rva + 4 <= vaddr + max(vsize, rsize):
+                    off = rva - vaddr
+                    if off + 4 > rsize:
+                        return None
+                    fh.seek(rptr + off)
+                    data = fh.read(4)
+                    return struct.unpack("<I", data)[0] if len(data) == 4 else None
+    except (OSError, struct.error):
+        return None
+    return None
+
+
 def matching_exes(fix, game):
     """The executables in the folder that are the exact build the patch is for."""
     out = []
-    for exe, md5 in fix["exes"].items():
+    for exe, md5 in fix.get("exes", {}).items():
         path = os.path.join(game, exe)
         try:
             if _digest(path, "md5") == md5:
                 out.append(exe)
         except OSError:
             continue
+    signatures = fix.get("signatures", [])
+    if signatures:
+        try:
+            names = sorted(os.listdir(game))
+        except OSError:
+            names = []
+        for name in names:
+            if not name.lower().endswith(".exe") or name in out:
+                continue
+            path = os.path.join(game, name)
+            if os.path.isfile(path) and any(read_u32_at_va(path, va) == want
+                                            for va, want, _ in signatures):
+                out.append(name)
     return out
+
+
+def supported_builds(fix):
+    if fix.get("exes"):
+        return "a different build of " + ", ".join(fix["exes"])
+    return "builds whose exe is the " + " or ".join(label for _, _, label in fix["signatures"])
 
 
 def game_running(appid, pfx):
@@ -364,8 +452,7 @@ def status(appid, fix):
     game, pfx = found
     exes = matching_exes(fix, game)
     if not exes:
-        return UNSUPPORTED, ("the patch is for a different build of "
-                             + ", ".join(fix["exes"]))
+        return UNSUPPORTED, "the patch is for " + supported_builds(fix)
     ours = expected_hashes(fix)
     settings = set(fix.get("settings", []))
     dests = [d for dl in fix["downloads"] for d in dl["files"].values()]
