@@ -15,6 +15,54 @@ your desktop carries on untouched.
 It is a mode you switch into, not a way to boot the machine. Nothing about your
 normal desktop changes.
 
+## Controller shortcuts
+
+The guide button is the Steam button on a Steam Controller, the PS button on a
+PlayStation pad, the Xbox button on an Xbox pad and Home on a Switch pad.
+
+**Console mode**
+
+| Do this | What happens |
+| --- | --- |
+| Press the guide button twice, from the desktop | Opens console mode on the TV. By default only the player-one kind of controller does this (`PRIMARY_CONTROLLER`, `GUIDE_PRIMARY_ONLY=off` lets any) |
+| Press the guide button twice with a game open on the desktop | Asks *Close all games?* first. A (✕ on PlayStation) closes them and opens console mode, B (○) goes back to the game |
+| Guide button → Power → **Switch to Desktop** | Leaves console mode |
+
+**Steam's guide-button chords:** hold the guide button, then press the second
+button.
+
+| Action | Steam Controller | PlayStation (DualSense, DualShock 4) | Xbox |
+| --- | --- | --- | --- |
+| Steam menu | Steam (press once) | PS (press once) | Xbox (press once) |
+| Quick Access menu | ⋯ button | PS + ✕ | Xbox + A |
+| **On-screen keyboard** | **Steam + X** | **PS + □** | **Xbox + X** |
+| Force-quit the game | Steam + hold B (2–3 s) | — (use Steam menu → Exit game) | Xbox + hold B (2–3 s) |
+| Turn the controller off | Steam + Y | PS + △ | Xbox + Y |
+| Screenshot | Steam + R1 | PS + R2 | Xbox + RT |
+| Magnifier | Steam + hold L1 | PS + L2 | Xbox + LT |
+| Move the mouse | Steam + right trackpad, or Steam + right stick | PS + touchpad, or PS + right stick | Xbox + right stick |
+| Left / right click | Steam + R2 / L2 (or click the trackpad) | PS + R1 / L1 (or click the touchpad) | Xbox + RB / LB |
+| Volume up / down | Steam + left stick up / down | PS + left stick up / down | Xbox + left stick up / down |
+| Switch window (Alt-Tab) | Steam + View | PS + Create (Share on DualShock 4) | Xbox + View |
+| Enter / Tab / Escape | Steam + D-pad right / down / left | — | — |
+| Recording: save clip | Steam + D-pad up | PS + D-pad right | Xbox + D-pad right |
+| Recording: start/stop, marker | Steam + upper / lower left back button | PS + D-pad down / up | Xbox + D-pad down / up |
+| Next / previous track, play/pause | — | PS + left stick right / left, L3 | Xbox + left stick right / left, LS click |
+
+Switch Pro and other pads use the Xbox column, by button position: the
+keyboard is the guide button plus the left face button. These are Steam's
+default chord layouts, read from `~/.local/share/Steam/controller_base/chord_*.vdf`.
+Change them in *Settings → Controller → Steam Button Chord Layout*.
+
+Chords work on any controller Steam reads. In console mode PlayStation pads always
+go through Steam Input, so they work in every game. If a chord does nothing on an
+Xbox or Switch pad inside a game, turn on Steam Input for that kind of controller
+in *Settings → Controller*.
+
+A game that has a text box but never opens the keyboard (Assassin's Creed's
+*Create Profile*, older games in general) still gets typing from the
+on-screen keyboard chord above.
+
 ## What you get
 
 - **Big Picture in gamescope**, so menus and the in-game overlay stay responsive
